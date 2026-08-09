@@ -131,9 +131,22 @@ AEAD effettiva cambia a ogni messaggio.
 - Vincolo tecnico obbligatorio: la forma **non deve essere riconosciuta dai
   linkifier** delle app di chat, altrimenti la piattaforma fa unfurl lato
   server e spedisce il blob a un terzo. In pratica: niente `://`, niente
-  `www.`, niente pattern `label.tld`. Da qui `kc/1/…`, con lo slash come
+  `www.`, niente pattern `label.tld`. Da qui `kc/`, con lo slash come
   separatore (non appartiene all'alfabeto z-base-32, quindi non è ambiguo).
 - Resta in chiaro per forza: serve a riconoscere il blob prima di decifrarlo.
+- **Il sentinel non contiene la versione.** Il numero di versione vive in un
+  solo posto, il primo byte del body. Metterlo anche nel sentinel sarebbe una
+  seconda fonte di verità, e avrebbe una conseguenza concreta: un blob prodotto
+  da una futura versione 2 non verrebbe riconosciuto come nostro, e l'utente
+  leggerebbe "questo testo non è cifrato" invece di "aggiorna l'app".
+- **Il riconoscimento tollera spazi e contesto.** `parse` non pretende il
+  sentinel a inizio stringa né il blob fino alla fine: cerca il sentinel nel
+  testo e prende la sequenza massima di caratteri dell'alfabeto che segue. Le
+  vie d'ingresso reali non consegnano mai testo pulito — clipboard e share
+  sheet aggiungono un newline, chi seleziona a mano si porta dietro un
+  "guarda: " davanti. Pretendere la stringa esatta significherebbe fallire nel
+  caso più comune, e fallire con l'errore sbagliato: un blob valido con un
+  `\n` in coda non è estraneo, è nostro.
 
 ### Primo contatto e scambio chiavi
 
@@ -264,6 +277,24 @@ chiede: cifrare per la persona sbagliata e' il fallimento peggiore possibile.
   framing. Chi legge un `ParsedEnvelope` non deve mai dedurne che il messaggio
   sia intatto. Il parser garantisce solo che l'header sia completo e che resti
   almeno la lunghezza di un tag.
+- **La identity card porta riempimento casuale in coda.** Senza, il suo body
+  avrebbe lunghezza fissa (39 byte, 68 caratteri) mentre il messaggio più corto
+  ne fa 127: una singola regex sulla lunghezza isolerebbe tutte e sole le
+  presentazioni, su tutto il traffico, a costo zero. Sarebbe esattamente il
+  marcatore "questo utente sta agganciando un nuovo contatto" che mettere
+  `kind` dentro il body doveva evitare — la decisione non avrebbe prodotto
+  l'effetto per cui è stata presa. Il riempimento porta la lunghezza in un
+  intervallo che ricade dentro quello dei messaggi. Conseguenza: una card
+  **non** ha rappresentazione testuale unica, al contrario di un messaggio. È
+  voluto, la variabilità è lo scopo.
+  *Residuo accettato*: su molti campioni le due distribuzioni restano
+  distinguibili (le card sono uniformi, i messaggi seguono la lunghezza dei
+  testi). Difende dalla regola cheap applicata a tappeto, non dall'analisi
+  statistica su un utente scelto.
+- *Residuo accettato*: la lunghezza del blob rivela la lunghezza del plaintext.
+  Non si aggiunge nulla a ciò che la piattaforma vede comunque — senza il
+  sistema vedrebbe direttamente il testo — quindi non si paga padding per
+  questo.
 - La identity card porta un checksum di 4 byte. Non e' autenticazione e non
   pretende di esserlo — una card puo' essere sostituita in transito, ed e'
   esattamente il rischio che il TOFU accetta. Serve contro la CORRUZIONE: una

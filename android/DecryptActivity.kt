@@ -27,6 +27,12 @@ class DecryptActivity : Activity() {
         )
         super.onCreate(savedInstanceState)
 
+        // TODO: con launchMode=singleTask un secondo intent verso un'istanza
+        //   gia' viva arriva in onNewIntent, non in onCreate. Senza
+        //   sovrascriverlo, la seconda decifratura viene ignorata e resta a
+        //   schermo il plaintext precedente. noHistory riduce la finestra ma
+        //   non la chiude: l'Activity vive finche' e' visibile.
+
         val incoming = extractText(intent)
         if (incoming == null) {
             finish()
@@ -91,6 +97,15 @@ class DecryptActivity : Activity() {
      * testo e' comunque in clipboard in chiaro, leggibile da chi ha il fuoco —
      * ma evita che compaia nel popup di anteprima davanti a chi guarda.
      */
+    // TRAPPOLA: la clipboard di sistema viene letta dall'IME predefinito —
+    // cioe' da QUESTA stessa tastiera, che tiene una cronologia clipboard. E'
+    // il motivo per cui la via 1 costa zero in privacy, e qui si ritorce
+    // contro: il testo decifrato entrerebbe in quella cronologia, che puo'
+    // essere persistita su disco. EXTRA_IS_SENSITIVE nasconde l'anteprima di
+    // sistema ma non impedisce alla nostra cronologia di raccoglierlo, e sotto
+    // Android 13 non esiste nemmeno.
+    // Prima di abilitare questa funzione va escluso esplicitamente questo
+    // contenuto dalla cronologia clipboard del fork.
     private fun copyPlaintext(text: CharSequence) {
         val clip = ClipData.newPlainText(null, text)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {

@@ -28,9 +28,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
-use crate::format::{
-    self, Header, Kind, ParsedEnvelope, Tier, NONCE_LEN, PROTOCOL_VERSION, TAG_LEN,
-};
+use crate::format::{self, Header, Kind, ParsedEnvelope, Tier, NONCE_LEN, TAG_LEN};
 use crate::keys::{Identity, PublicKey};
 
 /// Stringa di domain separation per la HKDF. Congelata: cambiarla cambia tutte
@@ -78,7 +76,6 @@ pub fn seal<R: RngCore + CryptoRng>(
     rng.fill_bytes(&mut nonce);
 
     let header = Header {
-        version: PROTOCOL_VERSION,
         tier: Tier::Baseline,
         sender_pub: Some(sender.public()),
         nonce,
@@ -378,5 +375,5 @@ mod tests {
         assert_eq!(apri(&bob, KAT_BASELINE).unwrap().as_bytes(), b"kat");
     }
 
-    const KAT_BASELINE: &str = "kc/1/yryyyym5j4ejzxu993nce3pnrybz4arqhpcjxwa69f3xy95wtrsmb739np5mtafpwdau5rnymiiqkwhgzwwm5wo3znoe55e43ubrw5w3bdyd9janhnsusijy4zkxmna";
+    const KAT_BASELINE: &str = "kc/yryyyym5j4ejzxu993nce3pnrybz4arqhpcjxwa69f3xy95wtrsmb739np5mtafpwdau5rnymiiqkwhgzwwm5wo3znoe55e43ubrw5w3bdyd9janhnsusijy4zkxmna";
 }

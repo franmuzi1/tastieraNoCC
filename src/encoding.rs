@@ -132,6 +132,15 @@ fn symbol(value: u8) -> char {
     char::from(ALPHABET[index])
 }
 
+/// Il byte appartiene all'alfabeto z-base-32?
+///
+/// Serve a chi deve isolare un blob dentro testo arbitrario: l'alfabeto e'
+/// tutto ASCII, quindi fermarsi al primo byte estraneo cade sempre su un
+/// confine di carattere valido.
+pub fn is_alphabet_byte(b: u8) -> bool {
+    value_of(b).is_ok()
+}
+
 /// Valore a 5 bit di un carattere, o [`Error::Decode`] se fuori alfabeto.
 fn value_of(c: u8) -> Result<u8> {
     // `c` e' un u8 e DECODE_TABLE ha 256 elementi: sempre in range.

@@ -26,6 +26,7 @@
 //! Overhead di un messaggio con `sender_pub` presente: 76 byte + plaintext,
 //! che diventano circa 1.6x in z-base-32.
 
+use rand_core::{CryptoRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use crate::encoding;
@@ -50,7 +51,38 @@ pub const PROTOCOL_VERSION: u8 = 1;
 ///
 /// Lo slash non appartiene all'alfabeto z-base-32, quindi e' un separatore
 /// non ambiguo rispetto al payload.
-pub const SENTINEL: &str = "kc/1/";
+///
+/// NON contiene la versione. Il numero di versione vive in un solo posto, il
+/// primo byte del body: averlo anche qui sarebbe una seconda fonte di verita'
+/// per lo stesso fatto. La conseguenza pratica e' che un blob prodotto da una
+/// futura versione 2 viene comunque RICONOSCIUTO come nostro e produce
+/// `UnsupportedVersion` — cioe' "aggiorna l'app" — invece di `NotOurBlob`,
+/// cioe' "questo testo non e' cifrato", che sarebbe il messaggio sbagliato.
+pub const SENTINEL: &str = "kc/";
+
+/// Sotto questa lunghezza una sequenza di caratteri dell'alfabeto dopo il
+/// sentinel e' quasi certamente una coincidenza dentro testo normale, non un
+/// blob troncato. Serve a non classificare come "nostro ma rotto" del testo
+/// che contiene per caso `kc/` seguito da qualche lettera.
+const MIN_PAYLOAD_CHARS: usize = 16;
+
+/// Intervallo entro cui viene portata, con riempimento casuale, la lunghezza
+/// del body di una identity card.
+///
+/// Senza questo una card avrebbe SEMPRE la stessa lunghezza (39 byte, 68
+/// caratteri), mentre il messaggio piu' corto ne fa 127: una singola regex
+/// sulla lunghezza isolerebbe tutte e sole le presentazioni, su tutto il
+/// traffico, a costo zero. Sarebbe esattamente il marcatore "questo utente sta
+/// agganciando un nuovo contatto" che mettere `kind` dentro il body doveva
+/// evitare — la decisione non produrrebbe l'effetto per cui e' stata presa.
+///
+/// L'intervallo copre le lunghezze dei messaggi con plaintext da 0 a 200 byte.
+/// Residuo accettato: su molti campioni la distribuzione resta distinguibile,
+/// perche' quella delle card e' uniforme e quella dei messaggi segue la
+/// lunghezza dei testi. Difende dalla regola cheap applicata a tappeto, non
+/// dall'analisi statistica su un utente scelto — coerentemente col threat model.
+const CARD_MIN_BODY: usize = 76;
+const CARD_MAX_BODY: usize = 276;
 
 /// Nonce XChaCha20-Poly1305.
 pub const NONCE_LEN: usize = 24;
@@ -146,7 +178,6 @@ impl Flags {
 /// opaco. Un solo posto in cui la presenza e' rappresentata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
-    pub version: u8,
     pub tier: Tier,
     pub sender_pub: Option<PublicKey>,
     pub nonce: [u8; NONCE_LEN],
@@ -174,7 +205,6 @@ pub struct ParsedEnvelope<'a> {
 /// Presentazione parsata.
 #[derive(Debug, PartialEq, Eq)]
 pub struct IdentityCard {
-    pub version: u8,
     pub public: PublicKey,
 }
 
@@ -195,7 +225,7 @@ pub enum ParsedBlob<'a> {
 /// dipendente da un ragionamento indiretto.
 pub fn build_aad(kind: Kind, header: &Header) -> Vec<u8> {
     let mut aad = Vec::with_capacity(4 + KEY_LEN);
-    aad.push(header.version);
+    aad.push(PROTOCOL_VERSION);
     aad.push(kind as u8);
     aad.push(header.tier as u8);
     aad.push(header.flags().0);
@@ -213,7 +243,7 @@ pub fn serialize_message(header: &Header, ciphertext: &[u8]) -> String {
         .saturating_add(NONCE_LEN)
         .saturating_add(ciphertext.len());
     let mut body = Vec::with_capacity(capacity);
-    body.push(header.version);
+    body.push(PROTOCOL_VERSION);
     body.push(Kind::Message as u8);
     body.push(header.tier as u8);
     body.push(header.flags().0);
@@ -228,14 +258,41 @@ pub fn serialize_message(header: &Header, ciphertext: &[u8]) -> String {
     out
 }
 
-/// Serializza una presentazione.
-pub fn serialize_identity_card(public: &PublicKey) -> String {
-    let mut body = Vec::with_capacity(CARD_PREFIX_LEN + KEY_LEN + CHECKSUM_LEN);
+/// Serializza una presentazione, con riempimento casuale in coda.
+///
+/// Il riempimento non e' decorativo: senza, ogni card avrebbe la stessa
+/// identica lunghezza e sarebbe isolabile con una regex su tutto il traffico
+/// (vedi [`CARD_MIN_BODY`]). E' anche il motivo per cui questa funzione vuole
+/// un RNG mentre il suo equivalente per i messaggi no.
+///
+/// I byte di riempimento non sono coperti dal checksum e non significano
+/// nulla: alterarli non cambia la chiave trasportata. Ne consegue che una card
+/// NON ha una rappresentazione testuale unica, al contrario di un messaggio.
+/// E' voluto — la variabilita' e' lo scopo.
+pub fn serialize_identity_card<R: RngCore + CryptoRng>(public: &PublicKey, rng: &mut R) -> String {
+    let base = CARD_PREFIX_LEN
+        .saturating_add(KEY_LEN)
+        .saturating_add(CHECKSUM_LEN);
+    let span = CARD_MAX_BODY
+        .saturating_sub(CARD_MIN_BODY)
+        .saturating_add(1);
+    let offset = usize::try_from(rng.next_u32())
+        .unwrap_or(0)
+        .checked_rem(span)
+        .unwrap_or(0);
+    let target = CARD_MIN_BODY.saturating_add(offset);
+    let pad_len = target.saturating_sub(base);
+
+    let mut body = Vec::with_capacity(target);
     body.push(PROTOCOL_VERSION);
     body.push(Kind::IdentityCard as u8);
     body.push(Flags::NONE.0);
     body.extend_from_slice(public.as_bytes());
     body.extend_from_slice(&identity_card_checksum(public));
+
+    let mut pad = vec![0u8; pad_len];
+    rng.fill_bytes(&mut pad);
+    body.extend_from_slice(&pad);
 
     let mut out = String::from(SENTINEL);
     out.push_str(&encoding::encode(&body));
@@ -275,7 +332,7 @@ pub fn identity_card_checksum(public: &PublicKey) -> [u8; CHECKSUM_LEN] {
 /// il ciphertext da li' invece di copiarlo, quindi la lifetime del risultato
 /// e' quella del buffer, non quella del testo.
 pub fn parse<'a>(text: &str, out: &'a mut Vec<u8>) -> Result<ParsedBlob<'a>> {
-    let payload = text.strip_prefix(SENTINEL).ok_or(Error::NotOurBlob)?;
+    let payload = extract_payload(text).ok_or(Error::NotOurBlob)?;
     *out = encoding::decode(payload)?;
 
     let mut cursor = Cursor::new(out);
@@ -286,12 +343,39 @@ pub fn parse<'a>(text: &str, out: &'a mut Vec<u8>) -> Result<ParsedBlob<'a>> {
     let kind = Kind::from_byte(cursor.take_u8()?)?;
 
     match kind {
-        Kind::Message => parse_message(version, cursor).map(ParsedBlob::Message),
-        Kind::IdentityCard => parse_identity_card(version, cursor).map(ParsedBlob::IdentityCard),
+        Kind::Message => parse_message(cursor).map(ParsedBlob::Message),
+        Kind::IdentityCard => parse_identity_card(cursor).map(ParsedBlob::IdentityCard),
     }
 }
 
-fn parse_message<'a>(version: u8, mut cursor: Cursor<'a>) -> Result<ParsedEnvelope<'a>> {
+/// Isola il blob dentro il testo che lo circonda.
+///
+/// Non pretende che il sentinel sia a inizio stringa ne' che il blob arrivi
+/// fino alla fine. Le vie d'ingresso reali non lo garantiscono: la clipboard e
+/// lo share sheet consegnano abitualmente un newline in coda, e chi seleziona
+/// a mano prende volentieri anche un "guarda: " davanti. Pretendere una
+/// stringa esatta significherebbe fallire nel caso piu' comune — e fallire con
+/// l'errore sbagliato, perche' un blob valido con un `\n` finale non e'
+/// "estraneo", e' nostro.
+///
+/// Il payload e' la sequenza massima di caratteri dell'alfabeto dopo il
+/// sentinel: il primo byte estraneo la chiude. Sotto [`MIN_PAYLOAD_CHARS`] si
+/// considera una coincidenza dentro testo normale, non un blob.
+fn extract_payload(text: &str) -> Option<&str> {
+    let start = text.find(SENTINEL)?;
+    let after = text.get(start.checked_add(SENTINEL.len())?..)?;
+    let end = after
+        .bytes()
+        .position(|b| !encoding::is_alphabet_byte(b))
+        .unwrap_or(after.len());
+    let payload = after.get(..end)?;
+    if payload.len() < MIN_PAYLOAD_CHARS {
+        return None;
+    }
+    Some(payload)
+}
+
+fn parse_message<'a>(mut cursor: Cursor<'a>) -> Result<ParsedEnvelope<'a>> {
     let tier = Tier::from_byte(cursor.take_u8()?)?;
     let flags = Flags(cursor.take_u8()?);
     if flags.has_unknown_bits() {
@@ -317,7 +401,6 @@ fn parse_message<'a>(version: u8, mut cursor: Cursor<'a>) -> Result<ParsedEnvelo
 
     Ok(ParsedEnvelope {
         header: Header {
-            version,
             tier,
             sender_pub,
             nonce,
@@ -326,7 +409,7 @@ fn parse_message<'a>(version: u8, mut cursor: Cursor<'a>) -> Result<ParsedEnvelo
     })
 }
 
-fn parse_identity_card(version: u8, mut cursor: Cursor<'_>) -> Result<IdentityCard> {
+fn parse_identity_card(mut cursor: Cursor<'_>) -> Result<IdentityCard> {
     let flags = Flags(cursor.take_u8()?);
     // Nessun flag e' definito per le card nella versione 1.
     if flags != Flags::NONE {
@@ -338,16 +421,18 @@ fn parse_identity_card(version: u8, mut cursor: Cursor<'_>) -> Result<IdentityCa
     let public = PublicKey::from_bytes(bytes);
 
     let checksum = cursor.take(CHECKSUM_LEN)?;
-    if !cursor.rest().is_empty() {
-        return Err(Error::Format("byte in eccesso dopo la identity card"));
-    }
+    // Quello che resta e' riempimento: si ignora. Non c'e' un controllo sui
+    // "byte in eccesso" perche' i byte in eccesso sono la funzione, non un
+    // difetto — sono cio' che impedisce alle card di avere tutte la stessa
+    // lunghezza.
+    //
     // Confronto non a tempo costante di proposito: non c'e' nessun segreto in
     // gioco, la card e' interamente pubblica.
     if checksum != identity_card_checksum(&public) {
         return Err(Error::Format("checksum della identity card non torna"));
     }
 
-    Ok(IdentityCard { version, public })
+    Ok(IdentityCard { public })
 }
 
 /// Lettore sequenziale che non puo' andare in panic: ogni prelievo oltre la
@@ -394,6 +479,12 @@ impl<'a> Cursor<'a> {
 #[allow(clippy::unwrap_used, clippy::panic, clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
+    use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    fn rng(seed: u8) -> ChaCha20Rng {
+        ChaCha20Rng::from_seed([seed; 32])
+    }
 
     fn pubkey(seed: u8) -> PublicKey {
         PublicKey::from_bytes([seed; KEY_LEN])
@@ -401,7 +492,6 @@ mod tests {
 
     fn header(sender: Option<PublicKey>) -> Header {
         Header {
-            version: PROTOCOL_VERSION,
             tier: Tier::Baseline,
             sender_pub: sender,
             nonce: [7u8; NONCE_LEN],
@@ -410,6 +500,10 @@ mod tests {
 
     fn ciphertext() -> Vec<u8> {
         (0..40u8).collect()
+    }
+
+    fn card_body_len() -> usize {
+        CARD_PREFIX_LEN + KEY_LEN + CHECKSUM_LEN
     }
 
     #[test]
@@ -444,14 +538,45 @@ mod tests {
     #[test]
     fn round_trip_identity_card() {
         let key = pubkey(0x5C);
-        let text = serialize_identity_card(&key);
+        let text = serialize_identity_card(&key, &mut rng(1));
 
         let mut buf = Vec::new();
         let ParsedBlob::IdentityCard(card) = parse(&text, &mut buf).unwrap() else {
             panic!("attesa una identity card");
         };
         assert_eq!(card.public, key);
-        assert_eq!(card.version, PROTOCOL_VERSION);
+    }
+
+    /// Il rilievo che ha motivato il riempimento: senza, ogni card era lunga
+    /// esattamente 68 caratteri e il messaggio piu' corto 127, quindi una
+    /// singola regex sulla lunghezza isolava tutte e sole le presentazioni.
+    ///
+    /// Qui si verifica che (a) le card non abbiano piu' una lunghezza fissa e
+    /// (b) il loro intervallo ricada dentro quello dei messaggi.
+    #[test]
+    fn le_card_non_hanno_lunghezza_fissa() {
+        let key = pubkey(0x77);
+        let mut r = rng(2);
+        let mut lunghezze = std::collections::BTreeSet::new();
+        for _ in 0..200 {
+            lunghezze.insert(serialize_identity_card(&key, &mut r).len());
+        }
+        assert!(
+            lunghezze.len() > 50,
+            "solo {} lunghezze distinte: il riempimento non sta variando",
+            lunghezze.len()
+        );
+
+        let msg_corto = serialize_message(&header(Some(pubkey(1))), &[0u8; TAG_LEN]).len();
+        let msg_lungo = serialize_message(&header(Some(pubkey(1))), &[0u8; 200 + TAG_LEN]).len();
+        let (min, max) = (
+            *lunghezze.iter().next().unwrap(),
+            *lunghezze.iter().next_back().unwrap(),
+        );
+        assert!(
+            min >= msg_corto && max <= msg_lungo,
+            "card in {min}..{max}, messaggi in {msg_corto}..{msg_lungo}: gli intervalli non si sovrappongono"
+        );
     }
 
     #[test]
@@ -463,7 +588,7 @@ mod tests {
             ParsedBlob::Message(_)
         ));
 
-        let card = serialize_identity_card(&pubkey(1));
+        let card = serialize_identity_card(&pubkey(1), &mut rng(3));
         assert!(matches!(
             parse(&card, &mut buf).unwrap(),
             ParsedBlob::IdentityCard(_)
@@ -473,7 +598,13 @@ mod tests {
     #[test]
     fn testo_qualunque_non_e_nostro() {
         let mut buf = Vec::new();
-        for testo in ["", "ciao", "https://esempio.it/x", "kc/2/yyyy", "KC/1/yyyy"] {
+        for testo in [
+            "",
+            "ciao",
+            "https://esempio.it/x",
+            "KC/1/yyyyyyyyyyyyyyyyyyyy",
+            "guarda qui kc/ e poi basta",
+        ] {
             assert!(
                 matches!(parse(testo, &mut buf), Err(Error::NotOurBlob)),
                 "non riconosciuto come estraneo: {testo}"
@@ -481,15 +612,61 @@ mod tests {
         }
     }
 
+    /// Il testo che arriva dalle vie reali non e' mai pulito: la clipboard e lo
+    /// share sheet aggiungono un newline, chi seleziona a mano si porta dietro
+    /// il contesto. Un blob valido dentro tutto questo resta valido.
     #[test]
-    fn sentinel_giusto_ma_payload_spazzatura() {
-        let mut buf = Vec::new();
-        // Caratteri fuori alfabeto z-base-32.
-        assert!(matches!(parse("kc/1/!!!!", &mut buf), Err(Error::Decode)));
+    fn tollera_spazi_e_contesto() {
+        let h = header(Some(pubkey(0x3D)));
+        let ct = ciphertext();
+        let blob = serialize_message(&h, &ct);
+
+        for testo in [
+            format!("{blob}\n"),
+            format!("{blob}\r\n"),
+            format!("{blob} "),
+            format!("  {blob}  "),
+            format!("guarda: {blob}"),
+            format!("{blob} che ne dici?"),
+            format!("[14:32] Marco:\n{blob}\n\n"),
+        ] {
+            let mut buf = Vec::new();
+            let ParsedBlob::Message(parsed) = parse(&testo, &mut buf).unwrap_or_else(|e| {
+                panic!("rifiutato con {e:?}: {testo:?}");
+            }) else {
+                panic!("atteso un messaggio");
+            };
+            assert_eq!(parsed.ciphertext, &ct[..]);
+        }
     }
 
+    /// Un blob troncato resta NOSTRO: puo' essere rotto, ma non deve mai
+    /// diventare "questo testo non e' cifrato". La distinzione conta perche' la
+    /// UI ci costruisce sopra due messaggi molto diversi, e il taglio in coda
+    /// e' il modo piu' comune in cui un incollaggio va storto.
+    ///
+    /// Nota: NON si asserisce che sia un errore. Tagliare la coda di un
+    /// messaggio accorcia il ciphertext e produce un blob ancora ben formato —
+    /// se ne accorge il tag Poly1305, non il parser.
     #[test]
-    fn versione_sconosciuta() {
+    fn blob_troncato_resta_riconoscibile() {
+        let blob = serialize_message(&header(Some(pubkey(2))), &ciphertext());
+
+        for taglio in 1..=8usize {
+            let tagliato = blob.get(..blob.len().saturating_sub(taglio)).unwrap();
+            let mut buf = Vec::new();
+            assert!(
+                !matches!(parse(tagliato, &mut buf), Err(Error::NotOurBlob)),
+                "taglio di {taglio} caratteri: classificato come non nostro"
+            );
+        }
+    }
+
+    /// Con il sentinel privo di versione, un blob di una versione futura viene
+    /// riconosciuto come nostro: l'utente deve leggere "aggiorna l'app", non
+    /// "questo testo non e' cifrato".
+    #[test]
+    fn versione_futura_riconosciuta_come_nostra() {
         let mut body = vec![2u8, Kind::Message as u8];
         body.extend_from_slice(&[0u8; 64]);
         let text = format!("{SENTINEL}{}", encoding::encode(&body));
@@ -504,9 +681,8 @@ mod tests {
     #[test]
     fn tier_riservato_si_parsa_il_rifiuto_arriva_dopo() {
         // Il parser riconosce ForwardSecret senza lamentarsi: e' `baseline` a
-        // dover ritornare TierUnsupported. Confondere i due livelli
-        // renderebbe impossibile distinguere "non lo so leggere" da "non lo so
-        // eseguire".
+        // dover ritornare TierUnsupported. Confondere i due livelli renderebbe
+        // impossibile distinguere "non lo so leggere" da "non lo so eseguire".
         let h = Header {
             tier: Tier::ForwardSecret,
             ..header(Some(pubkey(3)))
@@ -524,7 +700,8 @@ mod tests {
     fn kind_e_tier_sconosciuti() {
         let mut buf = Vec::new();
 
-        let body = vec![PROTOCOL_VERSION, 42u8];
+        let mut body = vec![PROTOCOL_VERSION, 42u8];
+        body.extend_from_slice(&[0u8; 64]);
         let text = format!("{SENTINEL}{}", encoding::encode(&body));
         assert!(matches!(parse(&text, &mut buf), Err(Error::Format(_))));
 
@@ -544,88 +721,124 @@ mod tests {
         assert!(matches!(parse(&text, &mut buf), Err(Error::Format(_))));
     }
 
+    /// Test negativo obbligatorio di CLAUDE.md: flag incoerenti con la
+    /// lunghezza. SENDER_PUB acceso ma nel body non c'e' spazio per i 32 byte.
     #[test]
-    fn ciphertext_piu_corto_del_tag() {
-        let h = header(Some(pubkey(9)));
-        // Un tag Poly1305 e' 16 byte: 15 non possono essere un messaggio.
-        let text = serialize_message(&h, &[0u8; TAG_LEN - 1]);
+    fn flag_sender_pub_incoerente_con_la_lunghezza() {
+        let mut body = vec![
+            PROTOCOL_VERSION,
+            Kind::Message as u8,
+            Tier::Baseline as u8,
+            Flags::SENDER_PUB.0,
+        ];
+        // Meno dei 32 byte di chiave, figurarsi nonce e ciphertext.
+        body.extend_from_slice(&[0u8; 20]);
+        let text = format!("{SENTINEL}{}", encoding::encode(&body));
 
         let mut buf = Vec::new();
         assert!(matches!(parse(&text, &mut buf), Err(Error::Format(_))));
     }
 
     #[test]
-    fn identity_card_corrotta() {
+    fn ciphertext_piu_corto_del_tag() {
+        let h = header(Some(pubkey(9)));
+        let text = serialize_message(&h, &[0u8; TAG_LEN - 1]);
+
+        let mut buf = Vec::new();
+        assert!(matches!(parse(&text, &mut buf), Err(Error::Format(_))));
+    }
+
+    /// Ogni bit della parte SIGNIFICATIVA di una card, ribaltato uno alla
+    /// volta, non deve mai produrre una card.
+    ///
+    /// L'asserzione e' su "nessuna card esce", non su "il risultato e' un
+    /// errore": ribaltare il bit di `kind` trasforma la card in un messaggio
+    /// sintatticamente valido, che pero' e' innocuo — nessuna chiave sbagliata
+    /// viene fissata. Cio' contro cui il checksum esiste e' esattamente che
+    /// venga fissata una chiave corrotta.
+    ///
+    /// Il riempimento e' escluso di proposito: non e' coperto dal checksum e
+    /// alterarlo non deve cambiare nulla. E' il test successivo a fissarlo.
+    #[test]
+    fn nessun_bit_flip_produce_una_card() {
         let key = pubkey(0x11);
-        let text = serialize_identity_card(&key);
+        let text = serialize_identity_card(&key, &mut rng(4));
         let payload = text.strip_prefix(SENTINEL).unwrap();
-        let mut body = encoding::decode(payload).unwrap();
+        let originale = encoding::decode(payload).unwrap();
 
-        // Un bit flip in ogni posizione del corpo deve essere intercettato.
-        for i in 0..body.len() {
-            let Some(slot) = body.get_mut(i) else { continue };
-            let original = *slot;
-            *slot ^= 0b0000_0001;
-            let mutated = format!("{SENTINEL}{}", encoding::encode(&body));
+        for i in 0..card_body_len() {
+            for bit in 0..8u8 {
+                let mut body = originale.clone();
+                let Some(slot) = body.get_mut(i) else { continue };
+                *slot ^= 1 << bit;
 
-            let mut buf = Vec::new();
-            let esito = parse(&mutated, &mut buf);
-            assert!(
-                !matches!(esito, Ok(ParsedBlob::IdentityCard(ref c)) if c.public == key),
-                "bit flip al byte {i} passato inosservato"
-            );
-            if let Some(slot) = body.get_mut(i) {
-                *slot = original;
+                let mutato = format!("{SENTINEL}{}", encoding::encode(&body));
+                let mut buf = Vec::new();
+                assert!(
+                    !matches!(parse(&mutato, &mut buf), Ok(ParsedBlob::IdentityCard(_))),
+                    "bit {bit} del byte {i} passato inosservato"
+                );
             }
         }
     }
 
-    /// Una identity card ha lunghezza fissa: ogni troncamento e' rilevabile.
     #[test]
-    fn troncamento_identity_card_sempre_rifiutato() {
-        let text = serialize_identity_card(&pubkey(0x22));
+    fn il_riempimento_non_influenza_la_chiave() {
+        let key = pubkey(0x12);
+        let text = serialize_identity_card(&key, &mut rng(5));
+        let payload = text.strip_prefix(SENTINEL).unwrap();
+        let mut body = encoding::decode(payload).unwrap();
+        assert!(body.len() > card_body_len(), "questa card non ha riempimento");
+
+        for i in card_body_len()..body.len() {
+            let Some(slot) = body.get_mut(i) else { continue };
+            *slot ^= 0xFF;
+        }
+        let mutato = format!("{SENTINEL}{}", encoding::encode(&body));
+
+        let mut buf = Vec::new();
+        let ParsedBlob::IdentityCard(card) = parse(&mutato, &mut buf).unwrap() else {
+            panic!("attesa una identity card");
+        };
+        assert_eq!(card.public, key);
+    }
+
+    #[test]
+    fn troncamento_card_sotto_la_parte_significativa() {
+        let text = serialize_identity_card(&pubkey(0x22), &mut rng(6));
         let payload = text.strip_prefix(SENTINEL).unwrap();
         let body = encoding::decode(payload).unwrap();
 
-        for len in 0..body.len() {
-            // `get` invece di slicing: la fetta esiste per costruzione, ma il
-            // divieto di indicizzare vale anche nei test.
+        for len in 0..card_body_len() {
             let troncato = body.get(..len).unwrap();
             let text = format!("{SENTINEL}{}", encoding::encode(troncato));
             let mut buf = Vec::new();
             assert!(
-                parse(&text, &mut buf).is_err(),
-                "troncamento a {len} byte accettato"
+                !matches!(parse(&text, &mut buf), Ok(ParsedBlob::IdentityCard(_))),
+                "troncamento a {len} byte accettato come card"
             );
         }
     }
 
-    /// Un messaggio invece ha ciphertext di lunghezza variabile, e questo
-    /// impone un limite che va capito bene: **il parser non puo' accorgersi
-    /// che un ciphertext e' stato troncato.**
+    /// Un messaggio ha ciphertext di lunghezza variabile, e questo impone un
+    /// limite che va capito bene: **il parser non puo' accorgersi che un
+    /// ciphertext e' stato troncato.**
     ///
     /// Tagliando gli ultimi byte si ottiene un messaggio perfettamente ben
-    /// formato, solo con un ciphertext piu' corto. Nessun campo di lunghezza
-    /// lo smentisce, e aggiungerne uno non aiuterebbe: sarebbe in chiaro e
+    /// formato, solo con un ciphertext piu' corto. Nessun campo di lunghezza lo
+    /// smentisce, e aggiungerne uno non aiuterebbe: sarebbe in chiaro e
     /// l'attaccante lo aggiusterebbe insieme al resto.
     ///
-    /// A intercettarlo e' il tag Poly1305, in fase di decifratura. E' il
-    /// posto giusto — l'integrita' del ciphertext e' competenza dell'AEAD, non
-    /// del framing — ma significa che `parse` che ritorna `Ok` non dice nulla
-    /// sull'integrita' del contenuto. Chi legge `ParsedEnvelope` non deve mai
-    /// dedurne che il messaggio sia intatto.
-    ///
-    /// Quello che il parser garantisce e' piu' ristretto: qualunque
-    /// troncamento che intacchi l'header, o che lasci meno byte del tag, viene
-    /// rifiutato.
+    /// A intercettarlo e' il tag Poly1305, in decifratura. E' il posto giusto,
+    /// ma significa che `parse` che ritorna `Ok` non dice nulla sull'integrita'
+    /// del contenuto.
     #[test]
     fn troncamento_messaggio_rifiutato_fino_al_tag() {
         let text = serialize_message(&header(Some(pubkey(4))), &ciphertext());
         let payload = text.strip_prefix(SENTINEL).unwrap();
         let body = encoding::decode(payload).unwrap();
 
-        let header_len = MESSAGE_PREFIX_LEN + KEY_LEN + NONCE_LEN;
-        let soglia = header_len + TAG_LEN;
+        let soglia = MESSAGE_PREFIX_LEN + KEY_LEN + NONCE_LEN + TAG_LEN;
 
         for len in 0..body.len() {
             let troncato = body.get(..len).unwrap();
@@ -636,38 +849,33 @@ mod tests {
             if len < soglia {
                 assert!(esito.is_err(), "troncamento a {len} byte accettato");
             } else {
-                // Ben formato, ma il contenuto e' mutilato: se ne accorgera'
-                // l'AEAD, non noi.
                 assert!(esito.is_ok(), "troncamento a {len} byte rifiutato");
             }
         }
     }
 
+    /// La versione non compare piu' fra i casi: non e' un campo libero di
+    /// `Header`, e' la costante del crate. Non e' costruibile un header con
+    /// versione incoerente.
     #[test]
     fn aad_cambia_con_ogni_campo() {
         let base = header(Some(pubkey(0x33)));
         let riferimento = build_aad(Kind::Message, &base);
 
-        // kind
         assert_ne!(build_aad(Kind::IdentityCard, &base), riferimento);
-        // tier
+
         let altro_tier = Header {
             tier: Tier::ForwardSecret,
             ..base.clone()
         };
         assert_ne!(build_aad(Kind::Message, &altro_tier), riferimento);
-        // version
-        let altra_versione = Header {
-            version: 2,
-            ..base.clone()
-        };
-        assert_ne!(build_aad(Kind::Message, &altra_versione), riferimento);
-        // sender_pub, sia il valore sia la presenza (che muove anche i flag)
+
         let altro_sender = Header {
             sender_pub: Some(pubkey(0x44)),
             ..base.clone()
         };
         assert_ne!(build_aad(Kind::Message, &altro_sender), riferimento);
+
         let senza_sender = Header {
             sender_pub: None,
             ..base.clone()
@@ -676,8 +884,8 @@ mod tests {
     }
 
     /// L'AAD non copre il nonce, ed e' voluto: il nonce e' gia' un ingresso
-    /// dell'AEAD, quindi alterarlo fa fallire l'autenticazione senza bisogno
-    /// di autenticarlo una seconda volta.
+    /// dell'AEAD, quindi alterarlo fa fallire l'autenticazione senza bisogno di
+    /// autenticarlo una seconda volta.
     #[test]
     fn aad_non_copre_il_nonce() {
         let base = header(Some(pubkey(0x55)));
@@ -697,7 +905,6 @@ mod tests {
     #[test]
     fn kat_formato() {
         let h = Header {
-            version: PROTOCOL_VERSION,
             tier: Tier::Baseline,
             sender_pub: Some(PublicKey::from_bytes([0x42; KEY_LEN])),
             nonce: [0x24; NONCE_LEN],
@@ -705,11 +912,10 @@ mod tests {
         let ct: Vec<u8> = (0..32u8).collect();
         assert_eq!(serialize_message(&h, &ct), KAT_MESSAGGIO);
 
-        let card = serialize_identity_card(&PublicKey::from_bytes([0x42; KEY_LEN]));
+        let card = serialize_identity_card(&PublicKey::from_bytes([0x42; KEY_LEN]), &mut rng(0));
         assert_eq!(card, KAT_IDENTITY_CARD);
     }
 
-    const KAT_MESSAGGIO: &str = "kc/1/yryyyyknejbrro1nejbrro1nejbrro1nejbrro1nejbrro1nejbrro1nee1nejbrro1nejbrro1nejbrro1nejbrro1nejbryyyoryarywdyqnyjbefoadeqbhebnrounoktcfaadrpbs8y7daxo";
-    const KAT_IDENTITY_CARD: &str =
-        "kc/1/yryoyo1nejbrro1nejbrro1nejbrro1nejbrro1nejbrro1nejbrro1nk9yhjwy";
+    const KAT_MESSAGGIO: &str = "kc/yryyyyknejbrro1nejbrro1nejbrro1nejbrro1nejbrro1nejbrro1nee1nejbrro1nejbrro1nejbrro1nejbrro1nejbryyyoryarywdyqnyjbefoadeqbhebnrounoktcfaadrpbs8y7daxo";
+    const KAT_IDENTITY_CARD: &str = "kc/yryoyo1nejbrro1nejbrro1nejbrro1nejbrro1nejbrro1nejbrro1nk9yhjwfy6r63yon7pm1i8bi7fn67rgpawng64gieg5zh3n5zbzd7wok3xteiq1rpqh1qyx7a5bfdq41dzd4bkgfbdubaxpujsmzgmbw9y9u5hikt8b7jtqwzxt314nyp3c81uenehp1s1rsgkc9df5u47ww5qemsuuurho6iqr35y7ga88kud5e9fbeoi64fiuoow84mxfgs6mejwduggjo";
 }
