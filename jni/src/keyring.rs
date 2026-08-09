@@ -13,11 +13,15 @@
 //! puo' cambiare fra versioni dell'app senza rompere niente.
 
 use keyboard_cipher_core::error::{Error, Result};
-use keyboard_cipher_core::keys::{Keyring, PeerRecord, PinOutcome, PublicKey, KEY_LEN};
+use keyboard_cipher_core::keys::{
+    Fingerprint, Keyring, LabelOutcome, PeerRecord, PinOutcome, PublicKey, KEY_LEN,
+};
 
 const STORAGE_VERSION: u8 = 1;
-/// pubkey + first_seen(i64) + verified(u8)
-const RECORD_LEN: usize = KEY_LEN + 8 + 1;
+/// pubkey + first_seen(i64) + verified(u8) + lunghezza etichetta(u16)
+const RECORD_LEN: usize = KEY_LEN + 8 + 1 + 2;
+/// Un'etichetta e' un nome scelto dall'utente, non un campo libero di rete.
+const MAX_LABEL_LEN: usize = 256;
 
 #[derive(Default)]
 pub struct MemoryKeyring {
@@ -44,6 +48,12 @@ impl MemoryKeyring {
             out.extend_from_slice(record.public.as_bytes());
             out.extend_from_slice(&record.first_seen_unix.to_le_bytes());
             out.push(u8::from(record.verified));
+            let etichetta = record.label.as_deref().unwrap_or("").as_bytes();
+            let len = u16::try_from(etichetta.len()).unwrap_or(0);
+            out.extend_from_slice(&len.to_le_bytes());
+            if len != 0 {
+                out.extend_from_slice(etichetta);
+            }
         }
         out
     }
@@ -79,8 +89,30 @@ impl MemoryKeyring {
             }
             let verified = cursor.next().ok_or(Error::Keyring)?;
 
+            let mut len_bytes = [0u8; 2];
+            for slot in len_bytes.iter_mut() {
+                *slot = cursor.next().ok_or(Error::Keyring)?;
+            }
+            let len = usize::from(u16::from_le_bytes(len_bytes));
+            if len > MAX_LABEL_LEN {
+                return Err(Error::Keyring);
+            }
+            let mut etichetta = Vec::with_capacity(len);
+            for _ in 0..len {
+                etichetta.push(cursor.next().ok_or(Error::Keyring)?);
+            }
+            // Un'etichetta non valida in UTF-8 e' storage corrotto, non un
+            // nome strano: meglio rifiutare che mostrare caratteri di
+            // sostituzione al posto del nome di un contatto.
+            let label = if len == 0 {
+                None
+            } else {
+                Some(String::from_utf8(etichetta).map_err(|_| Error::Keyring)?)
+            };
+
             peers.push(PeerRecord {
                 public: PublicKey::from_bytes(key),
+                label,
                 first_seen_unix: i64::from_le_bytes(seen),
                 verified: verified != 0,
             });
@@ -103,28 +135,59 @@ impl Keyring for MemoryKeyring {
         }
         self.peers.push(PeerRecord {
             public: peer.clone(),
+            label: None,
             first_seen_unix: now_unix,
             verified: false,
         });
         Ok(PinOutcome::Pinned)
     }
 
+    fn assign_label(&mut self, peer: &PublicKey, label: &str) -> Result<LabelOutcome> {
+        if label.is_empty() || label.len() > MAX_LABEL_LEN {
+            return Err(Error::Format("etichetta vuota o troppo lunga"));
+        }
+        if let Some(altro) = self
+            .peers
+            .iter()
+            .find(|record| record.label.as_deref() == Some(label) && &record.public != peer)
+        {
+            return Ok(LabelOutcome::Conflict {
+                existing: altro.public.clone(),
+                existing_fingerprint: Fingerprint::of(&altro.public),
+                incoming_fingerprint: Fingerprint::of(peer),
+            });
+        }
+        match self
+            .peers
+            .iter_mut()
+            .find(|record| &record.public == peer)
+        {
+            Some(record) => {
+                record.label = Some(label.to_owned());
+                Ok(LabelOutcome::Assigned)
+            }
+            None => Err(Error::UnknownPeer),
+        }
+    }
+
     fn replace_pinned(&mut self, old: &PublicKey, new: &PublicKey, now_unix: i64) -> Result<()> {
+        let etichetta = self
+            .find(old)
+            .and_then(|record| record.label.clone());
         self.peers.retain(|record| &record.public != old);
+        self.peers.retain(|record| &record.public != new);
         self.peers.push(PeerRecord {
             public: new.clone(),
+            label: etichetta,
             first_seen_unix: now_unix,
+            // Una chiave nuova non e' stata verificata fuori banda.
             verified: false,
         });
         Ok(())
     }
 
     fn get(&self, peer: &PublicKey) -> Result<Option<PeerRecord>> {
-        Ok(self.find(peer).map(|record| PeerRecord {
-            public: record.public.clone(),
-            first_seen_unix: record.first_seen_unix,
-            verified: record.verified,
-        }))
+        Ok(self.find(peer).cloned())
     }
 
     fn mark_verified(&mut self, peer: &PublicKey) -> Result<()> {
@@ -163,6 +226,7 @@ mod tests {
         let mut keyring = MemoryKeyring::new();
         keyring.tofu_pin(&key(1), 100).unwrap();
         keyring.tofu_pin(&key(2), 200).unwrap();
+        keyring.assign_label(&key(2), "Marco è qui ✓").unwrap();
         keyring.mark_verified(&key(2)).unwrap();
 
         let ricostruito = MemoryKeyring::import(&keyring.export()).unwrap();
@@ -171,6 +235,8 @@ mod tests {
         let secondo = ricostruito.get(&key(2)).unwrap().unwrap();
         assert!(secondo.verified);
         assert_eq!(secondo.first_seen_unix, 200);
+        // UTF-8 non ASCII deve sopravvivere al round-trip.
+        assert_eq!(secondo.label.as_deref(), Some("Marco è qui ✓"));
     }
 
     /// Un blob corrotto deve fallire, non degradare a keyring vuoto.
@@ -205,5 +271,36 @@ mod tests {
             let spazzatura: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31)) as u8).collect();
             let _ = MemoryKeyring::import(&spazzatura);
         }
+    }
+
+    #[test]
+    fn etichetta_duplicata_e_un_conflitto() {
+        let mut keyring = MemoryKeyring::new();
+        keyring.tofu_pin(&key(1), 1).unwrap();
+        keyring.tofu_pin(&key(2), 2).unwrap();
+        keyring.assign_label(&key(1), "Marco").unwrap();
+
+        let esito = keyring.assign_label(&key(2), "Marco").unwrap();
+        assert!(matches!(esito, LabelOutcome::Conflict { .. }));
+        // Niente e' cambiato.
+        assert_eq!(
+            keyring.get(&key(1)).unwrap().unwrap().label.as_deref(),
+            Some("Marco")
+        );
+        assert!(keyring.get(&key(2)).unwrap().unwrap().label.is_none());
+    }
+
+    #[test]
+    fn la_conferma_sposta_etichetta_e_azzera_la_verifica() {
+        let mut keyring = MemoryKeyring::new();
+        keyring.tofu_pin(&key(1), 1).unwrap();
+        keyring.assign_label(&key(1), "Marco").unwrap();
+        keyring.mark_verified(&key(1)).unwrap();
+
+        keyring.replace_pinned(&key(1), &key(2), 10).unwrap();
+        let record = keyring.get(&key(2)).unwrap().unwrap();
+        assert_eq!(record.label.as_deref(), Some("Marco"));
+        assert!(!record.verified, "la verifica non si eredita");
+        assert!(keyring.get(&key(1)).unwrap().is_none());
     }
 }

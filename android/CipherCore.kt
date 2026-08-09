@@ -38,11 +38,14 @@ object CipherCore {
     /** Sessione non inizializzata, errore JNI, o panic intercettato in Rust. */
     const val INTERNAL = 9
 
-    // Valori del campo `kind` di [IncomingResult], validi solo se il codice e' OK.
+    // Valori del campo `kind` di [IncomingResult] dopo nativeHandleIncomingText.
     const val KIND_MESSAGE = 0
     const val KIND_IDENTITY_CARD = 1
-    /** Chiave diversa da quella fissata: serve una decisione dell'utente. */
-    const val KIND_KEY_CONFLICT = 2
+
+    // Valori del campo `kind` dopo nativeAssignLabel.
+    const val LABEL_ASSIGNED = 0
+    /** L'etichetta appartiene gia' a un'altra chiave: "safety number changed". */
+    const val LABEL_CONFLICT = 1
 
     /**
      * Riempito dal lato Rust invece di essere costruito la': allocare oggetti
@@ -50,15 +53,23 @@ object CipherCore {
      * ogni errore diventa un'eccezione lanciata in mezzo a un'operazione
      * crypto. I campi sono `@JvmField` perche' JNI scrive sui campi, non
      * attraverso i setter.
+     *
+     * Quali campi siano valorizzati dipende da `kind`; gli altri restano null.
      */
     class IncomingResult {
         @JvmField var kind: Int = -1
+        /** 1 se il mittente e' stato verificato fuori banda. */
         @JvmField var verified: Int = 0
-        /** Valorizzato solo se [kind] e' [KIND_MESSAGE]. Da azzerare dopo l'uso. */
+        /** Solo per [KIND_MESSAGE]. Da azzerare dopo l'uso. */
         @JvmField var plaintext: ByteArray? = null
         @JvmField var senderFingerprint: String? = null
-        /** Valorizzato solo su [KIND_KEY_CONFLICT]. */
+        /** Nome dato dall'utente a questa chiave, null se mai nominata. */
+        @JvmField var senderLabel: String? = null
+        /** Pubkey del mittente: serve per etichettarlo o selezionarlo. */
+        @JvmField var senderKey: ByteArray? = null
+        /** Solo su [LABEL_CONFLICT]: la chiave che tiene gia' quel nome. */
         @JvmField var existingFingerprint: String? = null
+        @JvmField var existingKey: ByteArray? = null
     }
 
     /**
@@ -101,6 +112,18 @@ object CipherCore {
     external fun nativeEncryptForApp(appPackage: String, plaintext: ByteArray): String?
 
     external fun nativeSetCurrentPeer(appPackage: String, peer: ByteArray): Int
+
+    /**
+     * Attribuisce un nome a una chiave gia' fissata. E' il punto in cui il
+     * TOFU acquista la capacita' di dire "la chiave di Marco e' cambiata":
+     * senza un'identita' di contatto indipendente dalla chiave, due chiavi
+     * diverse sarebbero solo due peer diversi.
+     *
+     * Su [LABEL_CONFLICT] non modifica NULLA: riempie `existingFingerprint` e
+     * `existingKey`, e sta alla UI mostrare i due fingerprint. Solo se
+     * l'utente conferma si chiama [nativeConfirmKeyChange] — mai in automatico.
+     */
+    external fun nativeAssignLabel(peer: ByteArray, label: String, result: IncomingResult): Int
 
     /** Sostituisce un pin. SOLO dopo conferma esplicita dell'utente. */
     external fun nativeConfirmKeyChange(oldPeer: ByteArray, newPeer: ByteArray, nowUnix: Long): Int

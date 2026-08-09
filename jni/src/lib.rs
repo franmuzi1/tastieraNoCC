@@ -40,7 +40,7 @@ use rand_core::OsRng;
 
 use keyboard_cipher_core::api::{IncomingItem, SenderStatus, Session};
 use keyboard_cipher_core::error::Error;
-use keyboard_cipher_core::keys::{Identity, PinOutcome, PublicKey, KEY_LEN};
+use keyboard_cipher_core::keys::{Identity, LabelOutcome, PinOutcome, PublicKey, KEY_LEN};
 
 mod keyring;
 use keyring::MemoryKeyring;
@@ -65,7 +65,11 @@ mod code {
     /// Esiti di `handleIncomingText`, quando il codice e' OK.
     pub const ITEM_MESSAGE: jint = 0;
     pub const ITEM_IDENTITY_CARD: jint = 1;
-    pub const ITEM_KEY_CONFLICT: jint = 2;
+
+    /// Esiti di `assignLabel`.
+    pub const LABEL_ASSIGNED: jint = 0;
+    /// L'etichetta appartiene gia' a un'altra chiave: "safety number changed".
+    pub const LABEL_CONFLICT: jint = 1;
 }
 
 fn code_of(error: &Error) -> jint {
@@ -325,22 +329,34 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
 
         match item {
             IncomingItem::Message(message) => {
-                let (tipo, esistente) = match &message.sender_status {
-                    SenderStatus::Conflict { existing, .. } => {
-                        (code::ITEM_KEY_CONFLICT, Some(existing.display()))
-                    }
-                    _ => (code::ITEM_MESSAGE, None),
+                let (etichetta, verificato) = match &message.sender_status {
+                    SenderStatus::New => (None, false),
+                    SenderStatus::Known { label, verified } => (label.clone(), *verified),
                 };
-                let verificato = matches!(
-                    message.sender_status,
-                    SenderStatus::Known { verified: true }
-                );
 
-                if !set_int("kind", tipo) || !set_int("verified", jint::from(verificato)) {
+                if !set_int("kind", code::ITEM_MESSAGE)
+                    || !set_int("verified", jint::from(verificato))
+                {
                     return code::INTERNAL;
                 }
                 let fingerprint = keyboard_cipher_core::keys::Fingerprint::of(&message.sender);
-                if !fill_strings(&mut env, &result, &fingerprint.display(), esistente.as_deref()) {
+                if !fill_strings(
+                    &mut env,
+                    &result,
+                    &fingerprint.display(),
+                    etichetta.as_deref(),
+                ) {
+                    return code::INTERNAL;
+                }
+                // La pubkey serve al chiamante per etichettare il mittente o
+                // selezionarlo come destinatario.
+                let Ok(chiave) = env.byte_array_from_slice(message.sender.as_bytes()) else {
+                    return code::INTERNAL;
+                };
+                if env
+                    .set_field(&result, "senderKey", "[B", (&chiave).into())
+                    .is_err()
+                {
                     return code::INTERNAL;
                 }
                 // Il plaintext esce come byte[]: mai String.
@@ -356,20 +372,26 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
                 code::OK
             }
             IncomingItem::IdentityCard {
+                peer,
                 fingerprint,
                 outcome,
-                ..
             } => {
-                let (tipo, esistente) = match &outcome {
-                    PinOutcome::Conflict { existing, .. } => {
-                        (code::ITEM_KEY_CONFLICT, Some(existing.display()))
-                    }
-                    _ => (code::ITEM_IDENTITY_CARD, None),
-                };
-                if !set_int("kind", tipo) {
+                let nuovo = matches!(outcome, PinOutcome::Pinned);
+                if !set_int("kind", code::ITEM_IDENTITY_CARD)
+                    || !set_int("verified", jint::from(!nuovo))
+                {
                     return code::INTERNAL;
                 }
-                if !fill_strings(&mut env, &result, &fingerprint.display(), esistente.as_deref()) {
+                if !fill_strings(&mut env, &result, &fingerprint.display(), None) {
+                    return code::INTERNAL;
+                }
+                let Ok(chiave) = env.byte_array_from_slice(peer.as_bytes()) else {
+                    return code::INTERNAL;
+                };
+                if env
+                    .set_field(&result, "senderKey", "[B", (&chiave).into())
+                    .is_err()
+                {
                     return code::INTERNAL;
                 }
                 code::OK
@@ -378,11 +400,13 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
     })
 }
 
+/// Riempie i campi stringa del risultato: fingerprint del mittente e, se
+/// c'e', l'etichetta con cui l'utente lo ha nominato.
 fn fill_strings(
     env: &mut JNIEnv,
     result: &JObject,
     sender: &str,
-    existing: Option<&str>,
+    label: Option<&str>,
 ) -> bool {
     let Ok(sender_obj) = env.new_string(sender) else {
         return false;
@@ -398,16 +422,16 @@ fn fill_strings(
     {
         return false;
     }
-    if let Some(existing) = existing {
-        let Ok(existing_obj) = env.new_string(existing) else {
+    if let Some(label) = label {
+        let Ok(label_obj) = env.new_string(label) else {
             return false;
         };
         if env
             .set_field(
                 result,
-                "existingFingerprint",
+                "senderLabel",
                 "Ljava/lang/String;",
-                (&existing_obj).into(),
+                (&label_obj).into(),
             )
             .is_err()
         {
@@ -544,5 +568,92 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeFingerpri
             new_string(&env, &fingerprint.display())
         }
         Err(_) => std::ptr::null_mut(),
+    })
+}
+
+/// Attribuisce un nome a una chiave gia' fissata.
+///
+/// E' il punto in cui il TOFU acquista la capacita' di dire "la chiave di
+/// Marco e' cambiata": senza un'identita' di contatto indipendente dalla
+/// chiave, due chiavi diverse sarebbero solo due peer diversi.
+///
+/// Su conflitto NON modifica nulla e riempie `result` con i due fingerprint
+/// da mostrare. Solo se l'utente conferma si chiama
+/// `nativeConfirmKeyChange`; mai in automatico.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeAssignLabel(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer: JByteArray,
+    label: JString,
+    result: JObject,
+) -> jint {
+    guard(code::INTERNAL, || {
+        let key = match read_key(&mut env, &peer) {
+            Ok(key) => key,
+            Err(codice) => return codice,
+        };
+        let nome = match read_string(&mut env, &label) {
+            Ok(nome) => nome,
+            Err(codice) => return codice,
+        };
+
+        let esito = with_session(|session| session.assign_label(&key, &nome));
+        let esito = match esito {
+            Ok(esito) => esito,
+            Err(codice) => return codice,
+        };
+
+        match esito {
+            LabelOutcome::Assigned => {
+                if env
+                    .set_field(&result, "kind", "I", code::LABEL_ASSIGNED.into())
+                    .is_err()
+                {
+                    return code::INTERNAL;
+                }
+                code::OK
+            }
+            LabelOutcome::Conflict {
+                existing,
+                existing_fingerprint,
+                incoming_fingerprint,
+            } => {
+                if env
+                    .set_field(&result, "kind", "I", code::LABEL_CONFLICT.into())
+                    .is_err()
+                {
+                    return code::INTERNAL;
+                }
+                if !fill_strings(&mut env, &result, &incoming_fingerprint.display(), None) {
+                    return code::INTERNAL;
+                }
+                let Ok(esistente) = env.new_string(existing_fingerprint.display()) else {
+                    return code::INTERNAL;
+                };
+                if env
+                    .set_field(
+                        &result,
+                        "existingFingerprint",
+                        "Ljava/lang/String;",
+                        (&esistente).into(),
+                    )
+                    .is_err()
+                {
+                    return code::INTERNAL;
+                }
+                // La chiave gia' etichettata serve a `nativeConfirmKeyChange`.
+                let Ok(chiave) = env.byte_array_from_slice(existing.as_bytes()) else {
+                    return code::INTERNAL;
+                };
+                if env
+                    .set_field(&result, "existingKey", "[B", (&chiave).into())
+                    .is_err()
+                {
+                    return code::INTERNAL;
+                }
+                code::OK
+            }
+        }
     })
 }

@@ -161,29 +161,55 @@ impl Fingerprint {
 }
 
 /// Record TOFU per un peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerRecord {
     pub public: PublicKey,
+    /// Nome dato dall'utente. **E' l'identita' di contatto**: senza, due
+    /// chiavi diverse sono solo due peer diversi e "la chiave di Marco e'
+    /// cambiata" non e' una frase esprimibile.
+    ///
+    /// `None` finche' l'utente non si pronuncia: il sistema non puo' sapere
+    /// chi sia una chiave mai vista.
+    pub label: Option<String>,
     /// Solo per audit e UX. Non ha alcun ruolo di sicurezza.
     pub first_seen_unix: i64,
     /// `true` se l'utente ha confrontato il fingerprint fuori banda.
     pub verified: bool,
 }
 
-/// Esito di un tentativo di pin. Il conflitto NON e' un `Err`: e' uno stato
-/// legittimo che richiede una decisione dell'utente, quindi deve poter
-/// risalire alla UI senza passare per il canale d'errore.
+/// Esito di un tentativo di pin.
+///
+/// Non contiene un caso di conflitto, e non e' una dimenticanza: al momento in
+/// cui una chiave mai vista arriva, il sistema non ha modo di sapere se sia un
+/// contatto nuovo o un contatto noto che ha cambiato telefono. Solo l'utente
+/// lo sa. Il conflitto vive quindi in [`LabelOutcome`], cioe' nel momento in
+/// cui l'utente attribuisce un nome.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PinOutcome {
-    /// Peer mai visto prima: fissato ora.
+    /// Peer mai visto prima: fissato ora, senza etichetta.
     Pinned,
     /// Gia' presente con la stessa chiave: nessuna azione.
     AlreadyPinned,
-    /// Gia' presente con chiave DIVERSA. Possibile MITM, oppure il peer ha
-    /// semplicemente reinstallato. Modello "safety number changed" di Signal:
-    /// mostrare entrambi i fingerprint e chiedere conferma esplicita.
-    /// Finche' l'utente non conferma, la vecchia chiave resta quella fissata.
+}
+
+/// Esito dell'attribuzione di un'etichetta a una chiave.
+///
+/// Il conflitto NON e' un `Err`: e' uno stato legittimo che richiede una
+/// decisione dell'utente, quindi deve poter risalire alla UI senza passare per
+/// il canale d'errore.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabelOutcome {
+    /// Etichetta libera, o gia' di questa stessa chiave.
+    Assigned,
+    /// **Questa e' la "safety number changed" di Signal.** L'etichetta
+    /// appartiene gia' a un'altra chiave: o il contatto ha reinstallato, o
+    /// qualcuno si sta interponendo. Mostrare entrambi i fingerprint e chiedere
+    /// conferma esplicita. Finche' l'utente non si pronuncia, la vecchia chiave
+    /// resta quella etichettata e nulla viene sovrascritto.
     Conflict {
-        existing: Fingerprint,
-        incoming: Fingerprint,
+        existing: PublicKey,
+        existing_fingerprint: Fingerprint,
+        incoming_fingerprint: Fingerprint,
     },
 }
 
@@ -193,13 +219,23 @@ pub enum PinOutcome {
 /// Object-safe di proposito: il layer Android lo usera' dietro `dyn Keyring`.
 /// Niente `-> impl Iterator` nei metodi, che romperebbe la object safety.
 pub trait Keyring {
-    /// Registra il peer se nuovo. Non sovrascrive mai in silenzio: su chiave
-    /// diversa ritorna [`PinOutcome::Conflict`] e lascia intatto il record.
+    /// Registra il peer se nuovo, senza etichetta.
     fn tofu_pin(&mut self, peer: &PublicKey, now_unix: i64) -> Result<PinOutcome>;
 
-    /// Sostituisce la chiave fissata dopo una conferma ESPLICITA dell'utente.
-    /// Unico punto in cui un pin puo' essere sovrascritto. Non chiamarlo mai
-    /// in automatico dopo un [`PinOutcome::Conflict`].
+    /// Attribuisce un nome a una chiave gia' fissata.
+    ///
+    /// E' qui che il TOFU diventa capace di dire "la chiave di Marco e'
+    /// cambiata": se l'etichetta appartiene a un'altra chiave, ritorna
+    /// [`LabelOutcome::Conflict`] e **non modifica niente**.
+    fn assign_label(&mut self, peer: &PublicKey, label: &str) -> Result<LabelOutcome>;
+
+    /// Sposta etichetta e identita' di contatto dalla vecchia chiave alla
+    /// nuova, dopo conferma ESPLICITA dell'utente. Unico punto in cui un pin
+    /// puo' essere sovrascritto. Non chiamarlo mai in automatico dopo un
+    /// [`LabelOutcome::Conflict`].
+    ///
+    /// Il flag `verified` NON si eredita: una chiave nuova non e' stata
+    /// verificata fuori banda, per definizione.
     fn replace_pinned(&mut self, old: &PublicKey, new: &PublicKey, now_unix: i64) -> Result<()>;
 
     fn get(&self, peer: &PublicKey) -> Result<Option<PeerRecord>>;
@@ -213,6 +249,9 @@ mod tests {
     // - generate() con RNG a seme fisso e' riproducibile
     // - SecretKey non implementa Debug/Display/Serialize (test di compilazione)
     // - fingerprint stabile: vettore congelato pubkey -> stringa
-    // - tofu_pin: nuovo -> Pinned; stesso -> AlreadyPinned; diverso -> Conflict
+    // - tofu_pin: nuovo -> Pinned; stesso -> AlreadyPinned
+    // - assign_label su etichetta libera -> Assigned
+    // - assign_label su etichetta di un'altra chiave -> Conflict
     // - dopo un Conflict il record memorizzato NON e' cambiato
+    // - replace_pinned sposta l'etichetta e azzera `verified`
 }

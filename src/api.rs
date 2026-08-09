@@ -39,7 +39,7 @@ use rand_core::{CryptoRng, RngCore};
 use crate::baseline::{self, Plaintext};
 use crate::error::{Error, Result};
 use crate::format::{self, ParsedBlob};
-use crate::keys::{Fingerprint, Identity, Keyring, PinOutcome, PublicKey};
+use crate::keys::{Fingerprint, Identity, Keyring, LabelOutcome, PinOutcome, PublicKey};
 
 /// Stato vivo del core, posseduto dal layer JNI per la durata della sessione.
 pub struct Session<K: Keyring> {
@@ -56,16 +56,16 @@ pub struct Session<K: Keyring> {
 /// sia quello atteso.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SenderStatus {
-    /// Mai visto prima: e' stato fissato ora.
+    /// Chiave mai vista: fissata ora, **senza etichetta**. La UI dovrebbe
+    /// chiedere all'utente chi sia — ed e' li' che un eventuale cambio di
+    /// chiave viene alla luce, perche' attribuire un'etichetta gia' in uso
+    /// produce un [`LabelOutcome::Conflict`].
     New,
-    /// Corrisponde alla chiave gia' fissata.
-    Known { verified: bool },
-    /// Corrisponde a un peer noto ma con chiave DIVERSA da quella fissata.
-    /// La UI deve fermarsi qui e chiedere conferma mostrando entrambi i
-    /// fingerprint; il messaggio si mostra solo dopo la scelta dell'utente.
-    Conflict {
-        existing: Fingerprint,
-        incoming: Fingerprint,
+    /// Chiave gia' fissata. `label` è `None` se l'utente non l'ha mai
+    /// nominata.
+    Known {
+        label: Option<String>,
+        verified: bool,
     },
 }
 
@@ -166,13 +166,9 @@ impl<K: Keyring> Session<K> {
 
                 // Il mittente appena letto diventa il destinatario per questa
                 // app: e' la leva che rende automatico il caso dominante,
-                // leggo e rispondo. Non avviene in caso di conflitto: finche'
-                // l'utente non si pronuncia, dirottare la risposta sarebbe
-                // proprio quello che vuole chi ha iniettato la chiave nuova.
-                if !matches!(sender_status, SenderStatus::Conflict { .. }) {
-                    self.current_peer
-                        .insert(app_package.to_owned(), sender.clone());
-                }
+                // leggo e rispondo.
+                self.current_peer
+                    .insert(app_package.to_owned(), sender.clone());
 
                 Ok(IncomingItem::Message(DecryptedMessage {
                     sender,
@@ -182,10 +178,8 @@ impl<K: Keyring> Session<K> {
             }
             ParsedBlob::IdentityCard(card) => {
                 let outcome = self.keyring.tofu_pin(&card.public, now_unix)?;
-                if !matches!(outcome, PinOutcome::Conflict { .. }) {
-                    self.current_peer
-                        .insert(app_package.to_owned(), card.public.clone());
-                }
+                self.current_peer
+                    .insert(app_package.to_owned(), card.public.clone());
                 Ok(IncomingItem::IdentityCard {
                     fingerprint: Fingerprint::of(&card.public),
                     peer: card.public,
@@ -200,17 +194,23 @@ impl<K: Keyring> Session<K> {
         match self.keyring.tofu_pin(sender, now_unix)? {
             PinOutcome::Pinned => Ok(SenderStatus::New),
             PinOutcome::AlreadyPinned => {
-                let verified = self
-                    .keyring
-                    .get(sender)?
-                    .map(|record| record.verified)
-                    .unwrap_or(false);
-                Ok(SenderStatus::Known { verified })
-            }
-            PinOutcome::Conflict { existing, incoming } => {
-                Ok(SenderStatus::Conflict { existing, incoming })
+                let record = self.keyring.get(sender)?;
+                Ok(SenderStatus::Known {
+                    label: record.as_ref().and_then(|r| r.label.clone()),
+                    verified: record.map(|r| r.verified).unwrap_or(false),
+                })
             }
         }
+    }
+
+    /// Attribuisce un nome a una chiave: e' il punto in cui il TOFU acquista
+    /// la capacita' di dire "la chiave di Marco e' cambiata".
+    ///
+    /// Su [`LabelOutcome::Conflict`] non modifica nulla: sta alla UI mostrare
+    /// i due fingerprint e, solo se l'utente conferma, chiamare
+    /// [`Self::confirm_key_change`].
+    pub fn assign_label(&mut self, peer: &PublicKey, label: &str) -> Result<LabelOutcome> {
+        self.keyring.assign_label(peer, label)
     }
 
     /// Cifra un testo verso il destinatario corrente dell'app indicata.
@@ -276,7 +276,7 @@ impl<K: Keyring> Session<K> {
 #[allow(clippy::unwrap_used, clippy::panic, clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
-    use crate::keys::PeerRecord;
+    use crate::keys::{LabelOutcome, PeerRecord};
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -292,15 +292,34 @@ mod tests {
             if self.peers.iter().any(|r| &r.public == peer) {
                 return Ok(PinOutcome::AlreadyPinned);
             }
-            // Con un keyring reale il conflitto si rileva per identita' del
-            // contatto; qui non c'e' una rubrica, quindi ogni chiave nuova e'
-            // un peer nuovo. I conflitti li provoca esplicitamente il test.
             self.peers.push(PeerRecord {
                 public: peer.clone(),
+                label: None,
                 first_seen_unix: now_unix,
                 verified: false,
             });
             Ok(PinOutcome::Pinned)
+        }
+
+        fn assign_label(&mut self, peer: &PublicKey, label: &str) -> Result<LabelOutcome> {
+            if let Some(altro) = self
+                .peers
+                .iter()
+                .find(|r| r.label.as_deref() == Some(label) && &r.public != peer)
+            {
+                return Ok(LabelOutcome::Conflict {
+                    existing: altro.public.clone(),
+                    existing_fingerprint: Fingerprint::of(&altro.public),
+                    incoming_fingerprint: Fingerprint::of(peer),
+                });
+            }
+            match self.peers.iter_mut().find(|r| &r.public == peer) {
+                Some(record) => {
+                    record.label = Some(label.to_owned());
+                    Ok(LabelOutcome::Assigned)
+                }
+                None => Err(Error::UnknownPeer),
+            }
         }
 
         fn replace_pinned(
@@ -309,23 +328,25 @@ mod tests {
             new: &PublicKey,
             now_unix: i64,
         ) -> Result<()> {
+            let etichetta = self
+                .peers
+                .iter()
+                .find(|r| &r.public == old)
+                .and_then(|r| r.label.clone());
             self.peers.retain(|r| &r.public != old);
+            self.peers.retain(|r| &r.public != new);
             self.peers.push(PeerRecord {
                 public: new.clone(),
+                label: etichetta,
                 first_seen_unix: now_unix,
+                // Una chiave nuova non e' stata verificata fuori banda.
                 verified: false,
             });
             Ok(())
         }
 
         fn get(&self, peer: &PublicKey) -> Result<Option<PeerRecord>> {
-            Ok(self.peers.iter().find(|r| &r.public == peer).map(|r| {
-                PeerRecord {
-                    public: r.public.clone(),
-                    first_seen_unix: r.first_seen_unix,
-                    verified: r.verified,
-                }
-            }))
+            Ok(self.peers.iter().find(|r| &r.public == peer).cloned())
         }
 
         fn mark_verified(&mut self, peer: &PublicKey) -> Result<()> {
@@ -406,7 +427,13 @@ mod tests {
         else {
             panic!("atteso un messaggio");
         };
-        assert_eq!(msg.sender_status, SenderStatus::Known { verified: false });
+        assert_eq!(
+            msg.sender_status,
+            SenderStatus::Known {
+                label: None,
+                verified: false
+            }
+        );
     }
 
     /// Il destinatario e' per app, non globale: chi tiene un contatto per app
@@ -592,7 +619,85 @@ mod tests {
         else {
             panic!("atteso un messaggio");
         };
-        assert_eq!(msg.sender_status, SenderStatus::Known { verified: true });
+        assert_eq!(
+            msg.sender_status,
+            SenderStatus::Known {
+                label: None,
+                verified: true
+            }
+        );
+    }
+
+    /// L'etichetta e' l'identita' di contatto, e attribuirla e' il momento in
+    /// cui il TOFU acquista la capacita' di dire "la chiave di Marco e'
+    /// cambiata". Prima di questa scelta il conflitto non era esprimibile:
+    /// due chiavi diverse erano semplicemente due peer diversi.
+    #[test]
+    fn etichetta_duplicata_e_un_conflitto() {
+        let mut bob = sessione(2);
+        let marco = Identity::from_secret_bytes([1; 32]).unwrap().public();
+        let finto_marco = Identity::from_secret_bytes([9; 32]).unwrap().public();
+
+        bob.keyring.tofu_pin(&marco, 1).unwrap();
+        bob.keyring.tofu_pin(&finto_marco, 2).unwrap();
+
+        assert_eq!(bob.assign_label(&marco, "Marco").unwrap(), LabelOutcome::Assigned);
+
+        let esito = bob.assign_label(&finto_marco, "Marco").unwrap();
+        let LabelOutcome::Conflict {
+            existing,
+            existing_fingerprint,
+            incoming_fingerprint,
+        } = esito
+        else {
+            panic!("atteso un conflitto");
+        };
+        assert_eq!(existing, marco);
+        assert_eq!(existing_fingerprint, Fingerprint::of(&marco));
+        assert_eq!(incoming_fingerprint, Fingerprint::of(&finto_marco));
+
+        // Nulla e' stato modificato: la vecchia chiave tiene ancora il nome.
+        assert_eq!(
+            bob.keyring.get(&marco).unwrap().unwrap().label.as_deref(),
+            Some("Marco")
+        );
+        assert!(bob.keyring.get(&finto_marco).unwrap().unwrap().label.is_none());
+    }
+
+    #[test]
+    fn rietichettare_la_stessa_chiave_non_e_un_conflitto() {
+        let mut bob = sessione(2);
+        let marco = Identity::from_secret_bytes([1; 32]).unwrap().public();
+        bob.keyring.tofu_pin(&marco, 1).unwrap();
+
+        assert_eq!(bob.assign_label(&marco, "Marco").unwrap(), LabelOutcome::Assigned);
+        assert_eq!(bob.assign_label(&marco, "Marco").unwrap(), LabelOutcome::Assigned);
+        assert_eq!(
+            bob.assign_label(&marco, "Marco R.").unwrap(),
+            LabelOutcome::Assigned
+        );
+    }
+
+    /// La conferma sposta il nome sulla chiave nuova e NON eredita la
+    /// verifica: una chiave nuova non e' stata confrontata fuori banda.
+    #[test]
+    fn la_conferma_sposta_etichetta_e_azzera_la_verifica() {
+        let mut bob = sessione(2);
+        let vecchia = Identity::from_secret_bytes([1; 32]).unwrap().public();
+        let nuova = Identity::from_secret_bytes([9; 32]).unwrap().public();
+
+        bob.keyring.tofu_pin(&vecchia, 1).unwrap();
+        bob.assign_label(&vecchia, "Marco").unwrap();
+        bob.mark_verified(&vecchia).unwrap();
+        bob.set_current_peer(WHATSAPP, &vecchia).unwrap();
+
+        bob.confirm_key_change(&vecchia, &nuova, 10).unwrap();
+
+        let record = bob.keyring.get(&nuova).unwrap().unwrap();
+        assert_eq!(record.label.as_deref(), Some("Marco"));
+        assert!(!record.verified, "la verifica non si eredita");
+        assert!(bob.keyring.get(&vecchia).unwrap().is_none());
+        assert_eq!(bob.current_peer(WHATSAPP), Some(&nuova));
     }
 
     /// Il fingerprint e' stabile per sempre: 24 caratteri in 6 gruppi da 4.

@@ -142,13 +142,30 @@ occhio.
 
 ### Identità e TOFU
 
-- Alla prima comparsa di un peer: pin della sua pubkey.
-- Se ricompare con chiave **diversa** da quella fissata: **non** sovrascrivere
-  in silenzio, **non** rifiutare seccamente. Segnalare e chiedere conferma
-  all'utente mostrando il fingerprint (modello "safety number changed" di
-  Signal). La conferma è una decisione dell'utente, mai automatica.
-- Per questo il conflitto è modellato come **esito** (`PinOutcome::Conflict`),
-  non come `Err`: non è un fallimento, è uno stato che richiede la UI.
+- Alla prima comparsa di un peer: pin della sua pubkey, **senza etichetta**.
+- **L'identità di contatto è un'etichetta locale assegnata dall'utente**
+  (decisione F, chiusa). Senza, due chiavi diverse sono solo due peer diversi e
+  "la chiave di Marco è cambiata" non è una frase esprimibile: il keyring è
+  indicizzato sulla pubkey.
+- Ne segue che **il pin non può mai essere un conflitto**. Quando arriva una
+  chiave mai vista, il sistema non ha modo di sapere se sia un contatto nuovo o
+  un contatto noto che ha cambiato telefono — lo sa solo l'utente. Perciò
+  `PinOutcome` ha due soli casi, e il conflitto vive in `LabelOutcome`.
+- Il conflitto scatta **quando si attribuisce un nome già in uso da un'altra
+  chiave**: è il modello "safety number changed" di Signal, ed è anche il
+  momento giusto per mostrare i due fingerprint, perché è l'unico in cui
+  l'utente sta dichiarando di chi si tratta. Su conflitto **non si modifica
+  nulla**: la vecchia chiave tiene il nome finché non arriva una conferma
+  esplicita.
+- Il conflitto è modellato come **esito** (`LabelOutcome::Conflict`), non come
+  `Err`: non è un fallimento, è uno stato che richiede la UI.
+- `replace_pinned` sposta l'etichetta sulla chiave nuova e **azzera
+  `verified`**: una chiave nuova non è stata confrontata fuori banda, per
+  definizione.
+- *Residuo*: il cambio chiave non viene rilevato **automaticamente** all'arrivo
+  del messaggio, ma solo quando l'utente nomina il nuovo peer. Un rilevamento
+  automatico richiederebbe di dedurre l'identità dal contesto dell'app, che è
+  rumoroso nel multi-contatto.
 
 ### Sentinel
 
@@ -368,20 +385,6 @@ chiede: cifrare per la persona sbagliata e' il fallimento peggiore possibile.
 
 Se una sessione le trova aperte, si ferma e chiede. Non sceglie per conto
 proprio.
-
-- **F. Identita' di contatto — il conflitto TOFU oggi non puo' scattare.**
-  Emersa scrivendo il keyring del crate JNI. `PinOutcome::Conflict` esiste,
-  la UI e i test lo gestiscono, ma **nessun keyring realistico puo'
-  produrlo**: il keyring e' indicizzato *sulla pubkey*, quindi due chiavi
-  diverse sono semplicemente due peer diversi, non un peer che ha cambiato
-  chiave. Non esiste un'identita' di contatto indipendente dalla chiave a cui
-  agganciare il "safety number changed" che questo documento richiede.
-  Opzioni: (a) etichetta locale assegnata dall'utente, e il conflitto e' "due
-  chiavi per la stessa etichetta"; (b) conflitto per package, cioe' "in
-  com.whatsapp parlavi con la chiave X e ora ne arriva un'altra" — gratis ma
-  rumoroso in un'app multi-contatto; (c) accettare che il TOFU qui non protegga
-  dal cambio chiave e dirlo nel threat model. Finche' resta aperta, il ramo
-  Conflict e' codice non raggiungibile.
 
 - **C. Anti-replay.** Oggi un attaccante può ripubblicare un blob vecchio: resta
   valido per sempre. Opzioni: timestamp nel plaintext mostrato in UI, finestra
