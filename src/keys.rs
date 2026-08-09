@@ -1,5 +1,6 @@
 //! Identita', chiavi, keyring TOFU.
 
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -75,7 +76,7 @@ impl Identity {
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        todo!()
+        Fingerprint::of(&self.public)
     }
 
     /// Segreto condiviso X25519 con `peer`.
@@ -99,24 +100,63 @@ impl Identity {
     }
 }
 
+/// Domain separation del fingerprint. Congelato.
+const FINGERPRINT_DOMAIN: &[u8] = b"keyboard-cipher/v1/fingerprint";
+
+/// 120 bit, cioe' 24 caratteri z-base-32 in 6 gruppi da 4.
+pub const FINGERPRINT_LEN: usize = 15;
+
 /// Impronta stabile di una pubkey, per la verifica manuale fuori banda.
 ///
-/// DECISIONE D (aperta, vedi CLAUDE.md): proposta corrente SHA-256 con domain
-/// separation, troncata a 96 bit, resa in z-base-32 a gruppi di 4 caratteri.
-/// 96 bit sta sopra il minimo ragionevole per un confronto a voce o a occhio.
+/// SHA-256 con domain separation, troncata a 120 bit, resa in z-base-32 a
+/// gruppi di 4. **Una volta rilasciato questo formato non cambia piu'**: e' cio'
+/// che due persone si leggono a voce o confrontano a schermo, e cambiarlo
+/// invaliderebbe ogni verifica gia' fatta.
+///
+/// Perche' 120 e non 96. La proprieta' vincolante e' la resistenza alla
+/// SECONDA PREIMMAGINE: per farsi passare per Bob, un attaccante deve produrre
+/// una chiave il cui fingerprint eguagli quello di Bob, che e' fisso e non
+/// scelto da lui. La' 96 bit sono gia' abbondanti. Ma la resistenza alle
+/// COLLISIONI e' meta' della lunghezza, e 48 bit sono alla portata di chiunque
+/// abbia delle GPU. Oggi nessun flusso dipende dalle collisioni, perche' il pin
+/// memorizza la chiave intera e non il fingerprint — ma il formato e' per
+/// sempre e una UI futura potrebbe appoggiarcisi senza accorgersene. Il margine
+/// costa quattro caratteri.
+///
 /// Niente wordlist: manutenzione, localizzazione e ambiguita' fonetiche non
-/// valgono il guadagno. Una volta rilasciato, questo formato non cambia piu'.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Fingerprint(/* [u8; 12] */);
+/// valgono il guadagno, e l'alfabeto z-base-32 e' gia' scelto per non essere
+/// ambiguo a occhio.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Fingerprint([u8; FINGERPRINT_LEN]);
 
 impl Fingerprint {
     pub fn of(public: &PublicKey) -> Self {
-        todo!()
+        let mut hasher = Sha256::new();
+        hasher.update(FINGERPRINT_DOMAIN);
+        hasher.update(public.as_bytes());
+        let digest = hasher.finalize();
+
+        let mut out = [0u8; FINGERPRINT_LEN];
+        // SHA-256 produce 32 byte e FINGERPRINT_LEN e' 15: il taglio esiste.
+        if let Some(head) = digest.get(..FINGERPRINT_LEN) {
+            out.copy_from_slice(head);
+        }
+        Self(out)
     }
 
-    /// Rappresentazione da mostrare all'utente, gia' raggruppata.
+    /// Rappresentazione da mostrare all'utente: 24 caratteri in 6 gruppi da 4.
+    /// I gruppi servono a rendere possibile il confronto a occhio, che senza
+    /// non si fa.
     pub fn display(&self) -> String {
-        todo!()
+        let encoded = crate::encoding::encode(&self.0);
+        let mut out = String::with_capacity(encoded.len().saturating_add(5));
+        for (i, c) in encoded.chars().enumerate() {
+            if i != 0 && i.checked_rem(4) == Some(0) {
+                out.push(' ');
+            }
+            out.push(c);
+        }
+        out
     }
 }
 

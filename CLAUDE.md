@@ -112,6 +112,26 @@ il riuso di keystream. Quindi: mai contatori, mai nonce corti, mai nonce
 derivati dal contenuto. Il nonce è anche il salt della HKDF, così la chiave
 AEAD effettiva cambia a ogni messaggio.
 
+### Fingerprint (decisione D, chiusa)
+
+SHA-256 con domain separation sulla pubkey, troncata a **120 bit**, resa in
+z-base-32 a gruppi di 4: **24 caratteri in 6 gruppi**. Congelato — è ciò che
+due persone si leggono a voce o confrontano a schermo, e cambiarlo
+invaliderebbe ogni verifica già fatta.
+
+Perché 120 e non 96, che era la proposta iniziale: la proprietà vincolante è la
+resistenza alla **seconda preimmagine** (per farsi passare per Bob serve una
+chiave il cui fingerprint eguagli quello di Bob, che è fisso e non scelto
+dall'attaccante), e lì 96 bit bastano. Ma la resistenza alle **collisioni** è
+metà della lunghezza, e 48 bit sono alla portata di chiunque abbia delle GPU.
+Oggi nessun flusso dipende dalle collisioni, perché il pin memorizza la chiave
+intera e non il fingerprint — ma il formato è per sempre e una UI futura
+potrebbe appoggiarcisi senza accorgersene. Il margine costa quattro caratteri.
+
+Niente wordlist: manutenzione, localizzazione e ambiguità fonetiche non valgono
+il guadagno, e l'alfabeto z-base-32 è già scelto per non essere ambiguo a
+occhio.
+
 ### Identità e TOFU
 
 - Alla prima comparsa di un peer: pin della sua pubkey.
@@ -249,6 +269,18 @@ Il destinatario si stabilisce in quest'ordine:
    interazione;
 3. **esplicitamente, dalla toolbar** — fallback per il multi-contatto nella
    stessa app. Se viene usato spesso, i primi due non stanno funzionando.
+   Si può selezionare solo un peer già fissato nel keyring.
+
+Dentro la stessa app vince l'**ultimo mittente letto**. È la regola che rende
+automatico il caso comune ed è anche l'unica che può sorprendere l'utente,
+quindi ha un test dedicato.
+
+**Ordine critico in `handle_incoming_text`: si decifra PRIMA di toccare il
+keyring.** La decifratura riuscita è la prova che chi ha scritto possiede
+davvero la privata dichiarata e che il messaggio era per noi. Fissare prima
+permetterebbe a chiunque di riempire il keyring di peer inventati, o di far
+comparire all'utente un falso "la chiave di Marco è cambiata" spedendo
+spazzatura.
 
 Mai indovinare. In assenza di destinatario si ritorna `UnknownPeer` e si
 chiede: cifrare per la persona sbagliata e' il fallimento peggiore possibile.
@@ -333,9 +365,7 @@ proprio.
   valido per sempre. Opzioni: timestamp nel plaintext mostrato in UI, finestra
   di validità nell'AAD, oppure niente documentando il buco. Se serve il tempo,
   va **iniettato**, non letto dal sistema dentro questo crate.
-- **D. Formato del fingerprint.** Stabile per sempre una volta rilasciato.
-  Proposta corrente nel codice: SHA-256 con domain separation, troncata a 96
-  bit, resa in z-base-32 a gruppi di 4 (20 caratteri). Da confermare.
+*(La decisione D sul fingerprint è chiusa: vedi sotto.)*
 *(La decisione E su z-base-32 è chiusa: vedi sotto.)*
 
 ## Regole di implementazione
@@ -344,11 +374,9 @@ proprio.
 - Nessun panic in produzione: deny su `unwrap_used`, `expect_used`, `panic`,
   `indexing_slicing`, `arithmetic_side_effects`. `todo!()` è ammesso **solo**
   in fase scheletro.
-- Attenzione: `clippy::panic` NON scatta su `todo!()`, quindi il deny attuale
-  non impedisce a un `todo!()` di finire in release. Prima del rilascio
-  aggiungere `todo = "deny"` a `[lints.clippy]`: oggi sparerebbe una
-  quarantina di volte, ed è il segnale che lo scheletro non è ancora
-  implementato.
+- `clippy::panic` NON scatta su `todo!()`, quindi da solo non impedirebbe a un
+  `todo!()` di arrivare in release. Per questo `[lints.clippy]` ha anche
+  `todo = "deny"`, attivato alla fine della fase scheletro.
 - Un solo `Error` pubblico per il crate (thiserror).
 - Nessuna dipendenza che porti codice C se esiste alternativa pura-Rust.
 - Il formato è per sempre: una volta rilasciata la versione 1, si aggiunge una
