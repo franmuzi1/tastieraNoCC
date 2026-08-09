@@ -221,10 +221,11 @@ impl<K: Keyring> Session<K> {
         &self,
         app_package: &str,
         plaintext: &[u8],
+        now_unix: i64,
         rng: &mut R,
     ) -> Result<String> {
         let peer = self.current_peer.get(app_package).ok_or(Error::UnknownPeer)?;
-        baseline::seal(&self.identity, peer, plaintext, rng)
+        baseline::seal(&self.identity, peer, plaintext, now_unix, rng)
     }
 
     pub fn current_peer(&self, app_package: &str) -> Option<&PublicKey> {
@@ -394,6 +395,7 @@ mod tests {
             &Identity::from_secret_bytes([1; 32]).unwrap(),
             &bob.identity.public(),
             b"primo contatto",
+            1_700_000_000,
             &mut rng(9),
         )
         .unwrap();
@@ -417,12 +419,12 @@ mod tests {
 
         for _ in 0..2 {
             let blob =
-                crate::baseline::seal(&alice_id, &bob.identity.public(), b"x", &mut rng(9)).unwrap();
+                crate::baseline::seal(&alice_id, &bob.identity.public(), b"x", 1_700_000_000, &mut rng(9)).unwrap();
             let _ = bob.handle_incoming_text(WHATSAPP, &blob, 100).unwrap();
         }
 
         let blob =
-            crate::baseline::seal(&alice_id, &bob.identity.public(), b"y", &mut rng(8)).unwrap();
+            crate::baseline::seal(&alice_id, &bob.identity.public(), b"y", 1_700_000_000, &mut rng(8)).unwrap();
         let IncomingItem::Message(msg) = bob.handle_incoming_text(WHATSAPP, &blob, 200).unwrap()
         else {
             panic!("atteso un messaggio");
@@ -445,9 +447,9 @@ mod tests {
         let carol = Identity::from_secret_bytes([3; 32]).unwrap();
 
         let da_alice =
-            crate::baseline::seal(&alice, &bob.identity.public(), b"a", &mut rng(1)).unwrap();
+            crate::baseline::seal(&alice, &bob.identity.public(), b"a", 1_700_000_000, &mut rng(1)).unwrap();
         let da_carol =
-            crate::baseline::seal(&carol, &bob.identity.public(), b"c", &mut rng(2)).unwrap();
+            crate::baseline::seal(&carol, &bob.identity.public(), b"c", 1_700_000_000, &mut rng(2)).unwrap();
 
         bob.handle_incoming_text(WHATSAPP, &da_alice, 1).unwrap();
         bob.handle_incoming_text(SIGNAL, &da_carol, 2).unwrap();
@@ -466,9 +468,9 @@ mod tests {
         let carol = Identity::from_secret_bytes([3; 32]).unwrap();
 
         let da_alice =
-            crate::baseline::seal(&alice, &bob.identity.public(), b"a", &mut rng(1)).unwrap();
+            crate::baseline::seal(&alice, &bob.identity.public(), b"a", 1_700_000_000, &mut rng(1)).unwrap();
         let da_carol =
-            crate::baseline::seal(&carol, &bob.identity.public(), b"c", &mut rng(2)).unwrap();
+            crate::baseline::seal(&carol, &bob.identity.public(), b"c", 1_700_000_000, &mut rng(2)).unwrap();
 
         bob.handle_incoming_text(WHATSAPP, &da_alice, 1).unwrap();
         assert_eq!(bob.current_peer(WHATSAPP), Some(&alice.public()));
@@ -508,7 +510,7 @@ mod tests {
         bob.handle_incoming_text(WHATSAPP, &card, 1).unwrap();
 
         let risposta = bob
-            .encrypt_for_app(WHATSAPP, b"ricevuto", &mut rng(4))
+            .encrypt_for_app(WHATSAPP, b"ricevuto", 1_700_000_000, &mut rng(4))
             .unwrap();
 
         let IncomingItem::Message(msg) = alice
@@ -527,7 +529,7 @@ mod tests {
     fn senza_destinatario_non_si_indovina() {
         let bob = sessione(2);
         assert!(matches!(
-            bob.encrypt_for_app(WHATSAPP, b"per chi?", &mut rng(1)),
+            bob.encrypt_for_app(WHATSAPP, b"per chi?", 1_700_000_000, &mut rng(1)),
             Err(Error::UnknownPeer)
         ));
     }
@@ -560,7 +562,7 @@ mod tests {
         let carol_pub = Identity::from_secret_bytes([3; 32]).unwrap().public();
 
         // Messaggio di Alice destinato a Carol: Bob non lo puo' aprire.
-        let blob = crate::baseline::seal(&alice, &carol_pub, b"non per bob", &mut rng(5)).unwrap();
+        let blob = crate::baseline::seal(&alice, &carol_pub, b"non per bob", 1_700_000_000, &mut rng(5)).unwrap();
 
         assert!(matches!(
             bob.handle_incoming_text(WHATSAPP, &blob, 1),
@@ -575,7 +577,7 @@ mod tests {
         let mut bob = sessione(2);
         let alice = Identity::from_secret_bytes([1; 32]).unwrap();
         let blob =
-            crate::baseline::seal(&alice, &bob.identity.public(), b"x", &mut rng(6)).unwrap();
+            crate::baseline::seal(&alice, &bob.identity.public(), b"x", 1_700_000_000, &mut rng(6)).unwrap();
 
         // Alza il byte di tier a ForwardSecret.
         let payload = blob.strip_prefix(format::SENTINEL).unwrap();
@@ -609,12 +611,12 @@ mod tests {
         let alice_id = Identity::from_secret_bytes([1; 32]).unwrap();
 
         let blob =
-            crate::baseline::seal(&alice_id, &bob.identity.public(), b"x", &mut rng(9)).unwrap();
+            crate::baseline::seal(&alice_id, &bob.identity.public(), b"x", 1_700_000_000, &mut rng(9)).unwrap();
         bob.handle_incoming_text(WHATSAPP, &blob, 1).unwrap();
         bob.mark_verified(&alice_id.public()).unwrap();
 
         let blob2 =
-            crate::baseline::seal(&alice_id, &bob.identity.public(), b"y", &mut rng(8)).unwrap();
+            crate::baseline::seal(&alice_id, &bob.identity.public(), b"y", 1_700_000_000, &mut rng(8)).unwrap();
         let IncomingItem::Message(msg) = bob.handle_incoming_text(WHATSAPP, &blob2, 2).unwrap()
         else {
             panic!("atteso un messaggio");

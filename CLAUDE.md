@@ -60,9 +60,11 @@ NON protegge da — per scelta esplicita, non per dimenticanza:
   in blocco fa maturare nel tempo: archivio conservato oggi + chiavi
   compromesse domani = decifratura retroattiva. **È la ragione per cui il tier
   forward-secrecy esiste nel formato**, anche se non è ancora implementato;
-- **replay** di un blob valido: vedi Decisioni aperte. Priorità bassa in questo
-  threat model, perché il replay è un'azione attiva e mirata, non qualcosa che
-  emerge dallo scanning di massa.
+- **replay** di un blob valido. Un blob resta valido per sempre e ripubblicarlo
+  funziona. Priorità bassa in questo threat model, perché il replay è un'azione
+  attiva e mirata, non qualcosa che emerge dallo scanning di massa. Mitigazione
+  scelta (decisione C, chiusa): **timestamp di composizione dentro il cifrato**,
+  mostrato in UI. Non impedisce il replay, lo rende *visibile a un umano*.
 
 ## Decisioni ferme (con motivo — non reinventare)
 
@@ -358,6 +360,23 @@ chiede: cifrare per la persona sbagliata e' il fallimento peggiore possibile.
   card troncata verrebbe fissata come chiave valida, e da quel momento ogni
   messaggio verso quel contatto fallirebbe in modo opaco senza che nessuno
   capisca perche'.
+- **Timestamp di composizione in testa al plaintext, dentro il cifrato**
+  (decisione C, chiusa). 8 byte, autenticati dall'AEAD senza bisogno di stare
+  nell'AAD, invisibili alla piattaforma — che l'ora del messaggio la conosce
+  già comunque.
+  *Perché non una finestra di validità nell'AAD*, che il replay lo negherebbe
+  davvero: farebbe fallire la decifratura di messaggi legittimi letti in
+  ritardo, e in un sistema dove il destinatario compie un gesto deliberato per
+  ogni messaggio leggere tre giorni dopo è normale. Richiederebbe inoltre un
+  clock nel core, che non c'è per scelta.
+  *Perché non una cache dei nonce visti*, che il replay lo bloccherebbe:
+  richiede stato persistente che cresce senza limiti, e il core è stateless per
+  costruzione.
+  Il timestamp è **autenticato ma non verificabile**: nessuno può dimostrare
+  che l'orologio del mittente fosse giusto. Va mostrato, mai usato per
+  decisioni automatiche — un timestamp assurdo non è un errore, e rifiutare un
+  messaggio per una data strana renderebbe il sistema inutilizzabile a chi ha
+  l'ora sbagliata sul telefono.
 - Byte di versione in testa.
 - Marcatore di tier dentro la parte **autenticata** (AAD), per impedire
   downgrade forzato da un attaccante attivo.
@@ -386,11 +405,9 @@ chiede: cifrare per la persona sbagliata e' il fallimento peggiore possibile.
 Se una sessione le trova aperte, si ferma e chiede. Non sceglie per conto
 proprio.
 
-- **C. Anti-replay.** Oggi un attaccante può ripubblicare un blob vecchio: resta
-  valido per sempre. Opzioni: timestamp nel plaintext mostrato in UI, finestra
-  di validità nell'AAD, oppure niente documentando il buco. Se serve il tempo,
-  va **iniettato**, non letto dal sistema dentro questo crate.
-*(La decisione D sul fingerprint è chiusa: vedi sotto.)*
+**Al momento non ce ne sono di aperte.** C, D, E e F sono chiuse; le loro
+motivazioni stanno nelle sezioni sopra.
+
 *(La decisione E su z-base-32 è chiusa: vedi sotto.)*
 
 ## Regole di implementazione

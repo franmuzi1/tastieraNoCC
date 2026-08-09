@@ -267,6 +267,7 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFo
     _class: JClass,
     app_package: JString,
     plaintext: JByteArray,
+    now_unix: jlong,
 ) -> jstring {
     guard(std::ptr::null_mut(), || {
         let nullo: jstring = std::ptr::null_mut();
@@ -277,7 +278,8 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFo
             return nullo;
         };
 
-        let esito = with_session(|session| session.encrypt_for_app(&package, &bytes, &mut OsRng));
+        let esito =
+            with_session(|session| session.encrypt_for_app(&package, &bytes, now_unix, &mut OsRng));
         // La copia Rust del plaintext sparisce subito; quella Java la azzera
         // il chiamante.
         use zeroize::Zeroize;
@@ -346,6 +348,20 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
                     &fingerprint.display(),
                     etichetta.as_deref(),
                 ) {
+                    return code::INTERNAL;
+                }
+                // Data di composizione dichiarata dal mittente. Autenticata ma
+                // NON verificabile: serve a far notare all'utente un blob
+                // ripubblicato, non a decidere niente in automatico.
+                if env
+                    .set_field(
+                        &result,
+                        "sentAtUnix",
+                        "J",
+                        jni::objects::JValue::Long(message.plaintext.sent_at_unix()),
+                    )
+                    .is_err()
+                {
                     return code::INTERNAL;
                 }
                 // La pubkey serve al chiamante per etichettare il mittente o

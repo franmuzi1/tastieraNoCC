@@ -38,23 +38,58 @@ const KDF_DOMAIN: &[u8] = b"keyboard-cipher/v1/baseline";
 /// Lunghezza della chiave XChaCha20-Poly1305.
 const AEAD_KEY_LEN: usize = 32;
 
+/// Timestamp di composizione, in testa al plaintext DENTRO il cifrato.
+///
+/// E' la risposta al replay (decisione C). Non lo impedisce — un blob valido
+/// resta valido per sempre — ma lo rende VISIBILE: chi riceve vede la data in
+/// cui il messaggio e' stato scritto accanto a una conversazione in cui
+/// compare oggi.
+///
+/// Perche' non una finestra di validita' nell'AAD, che il replay lo negherebbe
+/// davvero: farebbe fallire la decifratura di messaggi legittimi letti in
+/// ritardo. In un sistema dove il destinatario compie un gesto deliberato per
+/// ogni messaggio, leggere tre giorni dopo e' normale, non un attacco. E
+/// richiederebbe un clock nel core, che non c'e' per scelta.
+///
+/// Sta DENTRO il cifrato, quindi non aggiunge metadati alla piattaforma — che
+/// l'ora del messaggio la conosce gia' — ed e' autenticato dall'AEAD senza
+/// bisogno di finire nell'AAD.
+///
+/// Scartata anche una cache dei nonce gia' visti, che il replay lo bloccherebbe
+/// per davvero: richiede stato persistente che cresce senza limiti, e il core
+/// e' stateless per costruzione.
+const TIMESTAMP_LEN: usize = 8;
+
 /// Plaintext appena decifrato. Zeroize on drop, mai loggato, mai convertito in
 /// `String` sul confine JNI (una `java.lang.String` non e' azzerabile).
 ///
 /// L'assenza di `Debug`, `Display` e `Clone` e' deliberata.
-pub struct Plaintext(Zeroizing<Vec<u8>>);
+pub struct Plaintext {
+    testo: Zeroizing<Vec<u8>>,
+    sent_at_unix: i64,
+}
 
 impl Plaintext {
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.testo
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.testo.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.testo.is_empty()
+    }
+
+    /// Quando il mittente ha composto il messaggio, secondo il suo orologio.
+    ///
+    /// E' autenticato — sta dentro il cifrato — ma **non e' verificato**:
+    /// nessuno puo' dimostrare che l'orologio del mittente fosse giusto. Serve
+    /// a mostrare all'utente una data accanto al messaggio, cosi' un blob
+    /// ripubblicato mesi dopo si nota. Non usarlo per decisioni automatiche.
+    pub fn sent_at_unix(&self) -> i64 {
+        self.sent_at_unix
     }
 }
 
@@ -70,6 +105,7 @@ pub fn seal<R: RngCore + CryptoRng>(
     sender: &Identity,
     recipient: &PublicKey,
     plaintext: &[u8],
+    now_unix: i64,
     rng: &mut R,
 ) -> Result<String> {
     let mut nonce = [0u8; NONCE_LEN];
@@ -85,11 +121,18 @@ pub fn seal<R: RngCore + CryptoRng>(
     let shared = sender.diffie_hellman(recipient)?;
     let key = derive_key(&shared, &nonce, &aad, recipient)?;
 
+    // Il timestamp viaggia in testa al plaintext, quindi dentro il cifrato.
+    let mut inner = Zeroizing::new(Vec::with_capacity(
+        TIMESTAMP_LEN.saturating_add(plaintext.len()),
+    ));
+    inner.extend_from_slice(&now_unix.to_le_bytes());
+    inner.extend_from_slice(plaintext);
+
     let ciphertext = XChaCha20Poly1305::new((&*key).into())
         .encrypt(
             XNonce::from_slice(&nonce),
             Payload {
-                msg: plaintext,
+                msg: &inner,
                 aad: &aad,
             },
         )
@@ -132,17 +175,31 @@ pub fn open(
     let shared = recipient.diffie_hellman(sender_pub)?;
     let key = derive_key(&shared, &parsed.header.nonce, &aad, &recipient.public())?;
 
-    let plaintext = XChaCha20Poly1305::new((&*key).into())
-        .decrypt(
-            XNonce::from_slice(&parsed.header.nonce),
-            Payload {
-                msg: parsed.ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| Error::Crypto)?;
+    let inner = Zeroizing::new(
+        XChaCha20Poly1305::new((&*key).into())
+            .decrypt(
+                XNonce::from_slice(&parsed.header.nonce),
+                Payload {
+                    msg: parsed.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::Crypto)?,
+    );
 
-    Ok(Plaintext(Zeroizing::new(plaintext)))
+    // Il tag ha gia' autenticato tutto: se qui manca il timestamp, e' il
+    // mittente ad aver prodotto un plaintext malformato, non un attacco.
+    let stampa = inner.get(..TIMESTAMP_LEN).ok_or(Error::Format(
+        "plaintext senza timestamp: mittente malformato",
+    ))?;
+    let mut bytes = [0u8; TIMESTAMP_LEN];
+    bytes.copy_from_slice(stampa);
+    let testo = inner.get(TIMESTAMP_LEN..).unwrap_or(&[]).to_vec();
+
+    Ok(Plaintext {
+        testo: Zeroizing::new(testo),
+        sent_at_unix: i64::from_le_bytes(bytes),
+    })
 }
 
 /// Deriva la chiave AEAD dal segreto ECDH.
@@ -219,7 +276,7 @@ mod tests {
         let bob = identita(2);
         let messaggio = b"ciao, questo non lo legge la piattaforma";
 
-        let testo = seal(&alice, &bob.public(), messaggio, &mut rng(9)).unwrap();
+        let testo = seal(&alice, &bob.public(), messaggio, 1_700_000_000, &mut rng(9)).unwrap();
         assert!(testo.starts_with(SENTINEL));
         assert_eq!(apri(&bob, &testo).unwrap().as_bytes(), messaggio);
     }
@@ -230,7 +287,7 @@ mod tests {
         let bob = identita(4);
 
         for messaggio in [vec![], vec![0xAAu8; 4096]] {
-            let testo = seal(&alice, &bob.public(), &messaggio, &mut rng(1)).unwrap();
+            let testo = seal(&alice, &bob.public(), &messaggio, 1_700_000_000, &mut rng(1)).unwrap();
             assert_eq!(apri(&bob, &testo).unwrap().as_bytes(), &messaggio[..]);
         }
     }
@@ -244,8 +301,8 @@ mod tests {
         let bob = identita(6);
         let mut r = rng(42);
 
-        let uno = seal(&alice, &bob.public(), b"stesso testo", &mut r).unwrap();
-        let due = seal(&alice, &bob.public(), b"stesso testo", &mut r).unwrap();
+        let uno = seal(&alice, &bob.public(), b"stesso testo", 1_700_000_000, &mut r).unwrap();
+        let due = seal(&alice, &bob.public(), b"stesso testo", 1_700_000_000, &mut r).unwrap();
         assert_ne!(uno, due);
     }
 
@@ -255,7 +312,7 @@ mod tests {
         let bob = identita(8);
         let carol = identita(9);
 
-        let testo = seal(&alice, &bob.public(), b"per bob", &mut rng(3)).unwrap();
+        let testo = seal(&alice, &bob.public(), b"per bob", 1_700_000_000, &mut rng(3)).unwrap();
         assert!(matches!(apri(&carol, &testo), Err(Error::Crypto)));
     }
 
@@ -265,7 +322,7 @@ mod tests {
         let bob = identita(11);
         let mallory = identita(12);
 
-        let testo = seal(&alice, &bob.public(), b"da alice", &mut rng(4)).unwrap();
+        let testo = seal(&alice, &bob.public(), b"da alice", 1_700_000_000, &mut rng(4)).unwrap();
         let mut buf = Vec::new();
         let ParsedBlob::Message(parsed) = format::parse(&testo, &mut buf).unwrap() else {
             panic!("atteso un messaggio");
@@ -283,7 +340,7 @@ mod tests {
     fn ogni_bit_flip_e_intercettato() {
         let alice = identita(13);
         let bob = identita(14);
-        let testo = seal(&alice, &bob.public(), b"integro", &mut rng(5)).unwrap();
+        let testo = seal(&alice, &bob.public(), b"integro", 1_700_000_000, &mut rng(5)).unwrap();
 
         let payload = testo.strip_prefix(SENTINEL).unwrap();
         let originale = crate::encoding::decode(payload).unwrap();
@@ -318,7 +375,7 @@ mod tests {
     fn downgrade_del_tier_rifiutato() {
         let alice = identita(15);
         let bob = identita(16);
-        let testo = seal(&alice, &bob.public(), b"tier baseline", &mut rng(6)).unwrap();
+        let testo = seal(&alice, &bob.public(), b"tier baseline", 1_700_000_000, &mut rng(6)).unwrap();
 
         let payload = testo.strip_prefix(SENTINEL).unwrap();
         let mut body = crate::encoding::decode(payload).unwrap();
@@ -357,9 +414,57 @@ mod tests {
         for bytes in degeneri {
             let peer = PublicKey::from_bytes(bytes);
             assert!(
-                matches!(seal(&alice, &peer, b"x", &mut rng(7)), Err(Error::Crypto)),
+                matches!(seal(&alice, &peer, b"x", 1_700_000_000, &mut rng(7)), Err(Error::Crypto)),
                 "pubkey degenere accettata: {bytes:02x?}"
             );
+        }
+    }
+
+    /// Il timestamp sopravvive al giro ed e' autenticato: alterarlo richiede
+    /// alterare il ciphertext, che il tag intercetta.
+    #[test]
+    fn timestamp_autenticato_e_recuperato() {
+        let alice = identita(20);
+        let bob = identita(21);
+        let quando = 1_735_689_600i64; // 2025-01-01
+
+        let testo = seal(&alice, &bob.public(), b"con data", quando, &mut rng(11)).unwrap();
+        let aperto = apri(&bob, &testo).unwrap();
+        assert_eq!(aperto.as_bytes(), b"con data");
+        assert_eq!(aperto.sent_at_unix(), quando);
+    }
+
+    /// Il timestamp non allunga il blob piu' di quanto dichiara: 8 byte, non
+    /// un campo a lunghezza variabile che sposterebbe le lunghezze in modo
+    /// dipendente dal contenuto.
+    #[test]
+    fn il_timestamp_costa_otto_byte() {
+        let alice = identita(22);
+        let bob = identita(23);
+
+        let corto = seal(&alice, &bob.public(), b"", 0, &mut rng(12)).unwrap();
+        let payload = corto.strip_prefix(SENTINEL).unwrap();
+        let body = crate::encoding::decode(payload).unwrap();
+        let atteso = crate::format::MESSAGE_PREFIX_LEN
+            + crate::keys::KEY_LEN
+            + NONCE_LEN
+            + TIMESTAMP_LEN
+            + TAG_LEN;
+        assert_eq!(body.len(), atteso);
+    }
+
+    /// Un timestamp assurdo non e' un errore: nessuno puo' dimostrare che
+    /// l'orologio del mittente fosse giusto, e rifiutare un messaggio per una
+    /// data strana significherebbe rendere il sistema inutilizzabile a chi ha
+    /// l'ora sbagliata sul telefono.
+    #[test]
+    fn timestamp_assurdo_non_e_un_errore() {
+        let alice = identita(24);
+        let bob = identita(25);
+
+        for quando in [i64::MIN, -1, 0, i64::MAX] {
+            let testo = seal(&alice, &bob.public(), b"x", quando, &mut rng(13)).unwrap();
+            assert_eq!(apri(&bob, &testo).unwrap().sent_at_unix(), quando);
         }
     }
 
@@ -370,10 +475,10 @@ mod tests {
     fn kat_baseline() {
         let alice = Identity::from_secret_bytes([0x11; 32]).unwrap();
         let bob = Identity::from_secret_bytes([0x22; 32]).unwrap();
-        let testo = seal(&alice, &bob.public(), b"kat", &mut rng(0)).unwrap();
+        let testo = seal(&alice, &bob.public(), b"kat", 1_700_000_000, &mut rng(0)).unwrap();
         assert_eq!(testo, KAT_BASELINE);
         assert_eq!(apri(&bob, KAT_BASELINE).unwrap().as_bytes(), b"kat");
     }
 
-    const KAT_BASELINE: &str = "kc/yryyyym5j4ejzxu993nce3pnrybz4arqhpcjxwa69f3xy95wtrsmb739np5mtafpwdau5rnymiiqkwhgzwwm5wo3znoe55e43ubrw5w3bdyd9janhnsusijy4zkxmna";
+    const KAT_BASELINE: &str = "kc/yryyyym5j4ejzxu993nce3pnrybz4arqhpcjxwa69f3xy95wtrsmb739np5mtafpwdau5rnymiiqkwhgzwwm5wo3znoe55e4w7jg53deymgkw548czgbcg9oe759w8g6shbp8mx46g5y";
 }

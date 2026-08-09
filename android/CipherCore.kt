@@ -62,6 +62,15 @@ object CipherCore {
         @JvmField var verified: Int = 0
         /** Solo per [KIND_MESSAGE]. Da azzerare dopo l'uso. */
         @JvmField var plaintext: ByteArray? = null
+        /**
+         * Quando il mittente dichiara di aver composto il messaggio.
+         *
+         * E' autenticato — sta dentro il cifrato — ma NON verificabile:
+         * nessuno puo' dimostrare che il suo orologio fosse giusto. Va
+         * mostrato accanto al messaggio, cosi' un blob ripubblicato mesi dopo
+         * si nota. Non usarlo per decisioni automatiche.
+         */
+        @JvmField var sentAtUnix: Long = 0
         @JvmField var senderFingerprint: String? = null
         /** Nome dato dall'utente a questa chiave, null se mai nominata. */
         @JvmField var senderLabel: String? = null
@@ -109,7 +118,11 @@ object CipherCore {
     ): Int
 
     /** Ritorna il blob cifrato, o null se per quell'app non c'e' un destinatario. */
-    external fun nativeEncryptForApp(appPackage: String, plaintext: ByteArray): String?
+    external fun nativeEncryptForApp(
+        appPackage: String,
+        plaintext: ByteArray,
+        nowUnix: Long,
+    ): String?
 
     external fun nativeSetCurrentPeer(appPackage: String, peer: ByteArray): Int
 
