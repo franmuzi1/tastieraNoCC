@@ -392,7 +392,22 @@ proprio.
 - Test negativi obbligatori: bit flip nel ciphertext, nell'AAD, nel byte di
   tier; versione sconosciuta; sentinel assente; input troncato; flag
   incoerenti con la lunghezza.
-- Ogni parser va esercitato su input ostile (fuzzing se possibile).
+- Ogni parser va esercitato su input ostile. **Fatto**: `fuzz/` contiene tre
+  target cargo-fuzz (richiede nightly, che c'è).
+  - `decode` — `encoding::decode` non deve mai andare in panic, e se decodifica
+    deve valere `encode(decode(s)) == s`.
+  - `parse` — `format::parse` non deve mai andare in panic. Metà degli input
+    viene prefissata col sentinel, altrimenti il fuzzer resterebbe quasi sempre
+    sul ramo `NotOurBlob` senza entrare nel parsing vero.
+  - `roundtrip` — costruisce blob **validi** per costruzione dall'input, li
+    ri-parsa (deve tornare identico), poi li corrompe e li tronca. È il target
+    che conta: raggiunge una copertura tripla rispetto a `parse`, perché quel
+    target da solo dovrebbe indovinare l'encoding per arrivare ai rami
+    profondi.
+  - Ultima esecuzione: ~136M input complessivi, nessun crash.
+  - Il corpus è in `.gitignore` (rigenerabile, cresce senza limiti); gli
+    **artefatti di crash no**: quelli vanno versionati, sono la riproduzione
+    di un bug.
 
 ## Stile
 
@@ -407,4 +422,9 @@ proprio.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build --target aarch64-linux-android --release
+
+# Fuzzing (nightly; il crate in fuzz/ è fuori dal workspace del core)
+cargo +nightly fuzz run decode    -- -max_total_time=150
+cargo +nightly fuzz run parse     -- -max_total_time=150
+cargo +nightly fuzz run roundtrip -- -max_total_time=150
 ```

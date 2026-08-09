@@ -19,3 +19,9 @@ Thumbs.db
 # Configurazione locale di macchina (e i suoi file temporanei)
 .claude/settings.local.json
 .claude/settings.local.json.tmp.*
+
+# Fuzzing
+fuzz/target
+# Il corpus e' rigenerabile e cresce senza limiti; gli artefatti di crash NO:
+# quelli vanno versionati, sono la riproduzione di un bug.
+fuzz/corpus
