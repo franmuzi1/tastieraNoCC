@@ -1,0 +1,36 @@
+[package]
+name = "keyboard-cipher-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Core crypto/formato per tastiera Android con cifratura E2E stateless"
+publish = false
+
+[dependencies]
+# Tutte pura-Rust: nessun `cc`, nessun link a codice C.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+# XChaCha20Poly1305 e' esportato senza feature dedicata in 0.10.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+hkdf = "0.12"
+sha2 = { version = "0.10", default-features = false }
+zeroize = { version = "1", features = ["derive"] }
+rand_core = "0.6"
+subtle = "2"
+thiserror = "2"
+
+[dev-dependencies]
+# RNG deterministico per i KAT del formato: i vettori di test devono essere
+# riproducibili, quindi il seme e' fisso e l'RNG e' iniettato.
+rand_chacha = "0.3"
+hex-literal = "0.4"
+zbase32 = "0.1.2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"

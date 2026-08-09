@@ -1,0 +1,351 @@
+# keyboard-cipher — core crypto/formato
+
+Crate Rust: cifratura e formato messaggio per una tastiera Android (fork
+HeliBoard). Esposto alla JVM da un crate JNI **separato**, che non esiste ancora.
+
+## Cosa fa e cosa non fa
+
+- Fa: derivazione chiavi, AEAD, serializzazione del formato, encoding di
+  superficie, keyring TOFU (come astrazione).
+- NON fa: I/O, filesystem, rete, storage, JNI, clock di sistema, UI.
+- RNG e tempo sono **iniettati** dal chiamante come parametri, mai presi da
+  globali. Motivo: senza questo i vettori di test del formato non sono
+  scrivibili e i test non sono deterministici.
+
+## Modello d'uso
+
+Messaggi one-shot, copiati e incollati dentro app di chat di terze parti.
+Nessun canale di ritorno, nessun handshake, nessuno stato condiviso fra le
+parti. Qualunque assunzione di interattività è sbagliata per costruzione.
+
+## Threat model
+
+L'avversario di riferimento è lo **scanning di massa lato piattaforma** (tipo
+Chat Control / CSAR): analisi automatica e indiscriminata dei contenuti di
+tutti gli utenti, con ritenzione in blocco. **Non** è un avversario mirato che
+investe risorse su uno specifico utente. Questa distinzione decide gran parte
+del design: difendersi da un classificatore che gira su tutto il traffico è un
+problema diverso dal difendersi da un analista che guarda te.
+
+Protegge da: chi legge il testo dentro la chat (piattaforma, server, backup
+cloud, scanning automatico dei contenuti), e da manomissione del ciphertext.
+Il testo in chiaro non raggiunge mai l'app di chat: la cifratura avviene nella
+tastiera, prima che il contenuto entri nell'app.
+
+NON protegge da — per scelta esplicita, non per dimenticanza:
+
+- endpoint compromesso (keylogger, root, screenshot, accessibility service) e
+  scanning a livello di OS anziché di app;
+- metadati sociali: chi parla con chi resta comunque visibile alla
+  piattaforma, e resterebbe visibile con qualunque design;
+- il fatto stesso che si stia cifrando. **Residuo accettato**: sotto scanning
+  automatico il sentinel è l'unico elemento del formato catturabile con una
+  singola regex su tutto il traffico. Il pseudo-link difende dall'occhio umano,
+  non da un classificatore. L'alternativa (nessun sentinel, riconoscimento per
+  tentativo di decifratura) è stata valutata e scartata a favore della UX;
+- correlazione fra messaggi dello stesso mittente tramite la `sender_pub` in
+  chiaro. **Costo quasi nullo in questo modello**: la piattaforma conosce già
+  l'identità dell'account mittente, quindi una pubkey pseudonima non le
+  aggiunge informazione. Contro un avversario mirato la valutazione sarebbe
+  diversa;
+- compromissione futura delle chiavi long-term. È il rischio che la ritenzione
+  in blocco fa maturare nel tempo: archivio conservato oggi + chiavi
+  compromesse domani = decifratura retroattiva. **È la ragione per cui il tier
+  forward-secrecy esiste nel formato**, anche se non è ancora implementato;
+- **replay** di un blob valido: vedi Decisioni aperte. Priorità bassa in questo
+  threat model, perché il replay è un'azione attiva e mirata, non qualcosa che
+  emerge dallo scanning di massa.
+
+## Decisioni ferme (con motivo — non reinventare)
+
+### Primitive
+
+- **X25519** per l'ECDH. Diffuso, implementazioni pura-Rust mature, 32 byte.
+- **XChaCha20-Poly1305** come AEAD. Nessun requisito di AES hardware, tempo
+  costante in software puro. Nonce a 192 bit: obbligatorio qui, perché il
+  segreto ECDH è statico per coppia (vedi sotto).
+- **HKDF** per derivare la chiave AEAD dal segreto ECDH. Il segreto grezzo non
+  si usa mai direttamente come chiave.
+- **z-base-32** minuscolo per l'encoding di superficie. Sopravvive
+  all'autocorrect: niente maiuscole, niente punteggiatura, niente caratteri
+  visivamente ambigui. **Implementato in casa** (`src/encoding.rs`), non da
+  crate: la spec è orientata ai bit e a noi serve solo il caso allineato ai
+  byte, quindi la semantica dei bit di riempimento va decisa da noi e congelata.
+- **Decodifica stretta**: si rifiutano i caratteri fuori alfabeto (maiuscole
+  comprese), le lunghezze che non possono venire da byte interi, e i bit di
+  riempimento finali non nulli. Motivo: senza, lo stesso blob avrebbe più
+  rappresentazioni testuali distinte, e due messaggi identici potrebbero non
+  risultare uguali a un confronto per stringa.
+- **Vettori z-base-32.** La tabella EXAMPLES della specifica ha dieci righe, ma
+  solo due sono allineate ai byte (24 bit): `F0 BF C7 -> "6n9hq"` e
+  `D4 7A 04 -> "4t7ye"`. Le altre codificano quantità sub-ottetto che questa
+  API non esprime. La riga a 30 bit è inoltre **difettosa nella specifica
+  stessa**: la sua colonna base32 ha 7 caratteri dove 30 bit ne richiedono 6, e
+  la sua z-base-32 (`6im5sd`) non corrisponde alla propria colonna base-2, che
+  dà `6im54d`. Confermato indipendentemente: l'implementazione Go
+  `corvus-ch/zbase32` calcola `6im54d` e annota nei propri test *"this test
+  varies from what's in the spec by one character!"*. La spec non è un repo —
+  è un `.txt` statico su philzimmermann.com, senza versionamento né
+  manutentore — quindi non c'è un upstream da correggere.
+  Non usare quella riga, in nessuna forma. La copertura sulle altre lunghezze
+  viene da differential testing contro la crate `zbase32` (dev-dependency), non
+  da vettori inventati.
+
+### Autenticazione mittente (baseline)
+
+- `crypto_box` statico-statico: ECDH fra il nostro segreto e la pubkey del
+  destinatario.
+- La pubkey del **mittente** sta nell'Header **in chiaro**: serve al primo
+  contatto TOFU. La correlabilità che ne deriva è **accettata**, coerentemente
+  con il threat model sopra.
+- L'Header deve poter migrare in futuro a "mittente effimero + claim
+  d'identità firmato dentro il cifrato" **senza rompere il formato**:
+  `sender_pub` è un campo **opzionale segnalato da un bit di flag**, non un
+  campo assunto presente ovunque. Nessun codice deve dare per scontato che ci
+  sia.
+
+### Conseguenza operativa del segreto statico
+
+La stessa coppia di identità produce sempre lo stesso segreto ECDH. Il nonce a
+192 bit, generato a caso per ogni messaggio, è **l'unica** cosa che impedisce
+il riuso di keystream. Quindi: mai contatori, mai nonce corti, mai nonce
+derivati dal contenuto. Il nonce è anche il salt della HKDF, così la chiave
+AEAD effettiva cambia a ogni messaggio.
+
+### Identità e TOFU
+
+- Alla prima comparsa di un peer: pin della sua pubkey.
+- Se ricompare con chiave **diversa** da quella fissata: **non** sovrascrivere
+  in silenzio, **non** rifiutare seccamente. Segnalare e chiedere conferma
+  all'utente mostrando il fingerprint (modello "safety number changed" di
+  Signal). La conferma è una decisione dell'utente, mai automatica.
+- Per questo il conflitto è modellato come **esito** (`PinOutcome::Conflict`),
+  non come `Err`: non è un fallimento, è uno stato che richiede la UI.
+
+### Sentinel
+
+- Forma: pseudo-link cosmetico, non stringa nuda.
+- È **solo** estetica e plausibilità sociale a occhio umano. Non è una
+  proprietà di sicurezza. Mai cliccabile, mai un dominio reale, mai una
+  richiesta di rete.
+- Vincolo tecnico obbligatorio: la forma **non deve essere riconosciuta dai
+  linkifier** delle app di chat, altrimenti la piattaforma fa unfurl lato
+  server e spedisce il blob a un terzo. In pratica: niente `://`, niente
+  `www.`, niente pattern `label.tld`. Da qui `kc/1/…`, con lo slash come
+  separatore (non appartiene all'alfabeto z-base-32, quindi non è ambiguo).
+- Resta in chiaro per forza: serve a riconoscere il blob prima di decifrarlo.
+
+### Primo contatto e scambio chiavi
+
+- L'identita' e' UNA e vale per tutti i destinatari. Non esiste una chiave per
+  contatto: il segreto per coppia si calcola, non si scambia. Qualunque UI che
+  faccia sembrare il contrario e' sbagliata.
+- Ogni messaggio cifrato porta gia' `sender_pub` in chiaro, quindi ricevere un
+  messaggio fissa automaticamente la chiave del mittente. Resta scoperto solo
+  il primissimo contatto in una sola direzione.
+- Per quel caso esiste il blob **identity card**: la tastiera lo scrive
+  direttamente nel campo di testo con `commitText`, l'utente preme invio.
+  Niente clipboard. Asimmetria da tenere presente in tutto il progetto:
+  **inserire nel campo e' nativo per un IME, leggere no** — la tastiera vede
+  il campo di input, mai la cronologia della chat. Per questo la cifratura non
+  passa dalla clipboard e la decifratura si'.
+- Costo di bootstrap risultante: un tocco, una volta per contatto, in una sola
+  direzione.
+- Il QR di persona resta la via ad alta assicurazione: e' l'unica cosa che
+  chiude il MITM al primo contatto, che il TOFU da solo non chiude.
+
+### Come un blob raggiunge la tastiera
+
+Quattro vie, tutte equivalenti per il core: consegnano una stringa, e
+`handle_incoming_text` non sa da quale arriva.
+
+1. **Clipboard** — la base, funziona ovunque. L'IME predefinito e'
+   esplicitamente autorizzato a leggere la clipboard su Android 10+ ("unless
+   your app is the default IME or is the app that currently has focus, your app
+   cannot access clipboard data"). HeliBoard la legge gia' per la cronologia,
+   quindi il costo marginale in privacy e' nullo.
+   Sul toast di Android 12: compare la PRIMA volta che un'app legge dati messi
+   in clipboard da un'altra app, non a ogni lettura, e
+   `getPrimaryClipDescription()` non lo fa comparire mai. Quindi: polling
+   passivo con `getPrimaryClipDescription()`, lettura del contenuto solo su
+   gesto esplicito dell'utente.
+2. **`ACTION_PROCESS_TEXT`** — un'Activity companion nello stesso APK mette
+   "Decifra" nella barra di selezione del testo. Un tocco, niente clipboard.
+   Funziona solo dove l'app usa la barra di selezione standard: le app con
+   menu di long-press proprietario (WhatsApp) non la mostrano. Ottima dove
+   c'e', inaffidabile come unica via.
+3. **Share sheet (`ACTION_SEND`)** — fallback universale, piu' tocchi. Il
+   testo decifrato compare in un'Activity nostra e non tocca l'app di chat.
+4. **Campo di input** — se il blob e' nel campo servito dall'IME. Gratis,
+   marginale in chat, utile per mail e note.
+
+**Escluso: `NotificationListenerService`.** Darebbe decifratura automatica dei
+messaggi in arrivo, ma richiede accesso a TUTTE le notifiche del dispositivo,
+il che demolisce la premessa del progetto; e comunque le notifiche troncano il
+testo lungo, quindi sui blob non funzionerebbe.
+
+**Limite architetturale da mettere in conto come vincolo di prodotto:** nessuna
+via da' decifratura automatica di cio' che scorre nella chat. La tastiera vede
+il campo di input, mai la cronologia. Il destinatario compie un gesto
+deliberato per ogni messaggio ricevuto.
+
+### Activity companion (fork Android, non questo crate)
+
+Le vie 2 e 3 sono intent di sistema: un `InputMethodService` non puo'
+riceverli, serve un'Activity. Sta nello **stesso APK** dell'IME — stesso
+processo, stessa identita', stesso keyring. Due APK significherebbero due copie
+della chiave privata o un IPC su cui far viaggiare segreti.
+
+Scheletro in `android/`, non compilato.
+
+**Trappola da non ripetere.** Il contratto di `ACTION_PROCESS_TEXT` prevede che
+l'Activity possa restituire al chiamante un testo sostitutivo via
+`setResult(RESULT_OK, ... EXTRA_PROCESS_TEXT ...)`. E' l'implementazione
+naturale di quell'intent ed e' la peggiore possibile qui: restituire il
+plaintext lo consegna all'app di chat da cui e' partita la selezione, cioe'
+proprio all'applicazione da cui il progetto esiste per tenerlo lontano. Non si
+chiama mai `setResult` con dati; si esce senza risultato e il testo nell'app
+chiamante resta cifrato.
+
+Attributi obbligatori sull'Activity che mostra plaintext: `FLAG_SECURE` (prima
+di qualunque `setContentView`), `noHistory`, `excludeFromRecents`,
+`taskAffinity=""`, `launchMode=singleTask`. Senza `excludeFromRecents` /
+`FLAG_SECURE` il sistema salva su disco uno screenshot del testo decifrato per
+la schermata Recenti.
+
+Nessun permesso nuovo. Il fork non ha `INTERNET` ed e' la sua proprieta'
+principale. Se servira' `CAMERA` per il QR: a runtime, all'apertura dello
+scanner, mai come permesso di installazione.
+
+La UI contatti non e' nel launcher: ci si arriva dalle impostazioni della
+tastiera. Un'icona sarebbe un secondo marcatore visibile del sistema e non fa
+nulla che una voce nelle impostazioni non faccia gia'.
+
+### Destinatario corrente (per app, non globale)
+
+Una tastiera non sa con chi stai parlando. `EditorInfo` da' il package
+dell'app, non la conversazione, e non esiste API per saperlo. Un accessibility
+service che legge lo schermo lo direbbe ed e' **escluso**: distruggerebbe la
+premessa del progetto e i permessi di HeliBoard.
+
+Il destinatario si stabilisce in quest'ordine:
+
+1. **implicitamente, decifrando** — chi legge e poi risponde ha gia' scelto
+   leggendo. E' la leva che rende automatico il caso dominante;
+2. **per memoria, per package** — un contatto per app significa zero
+   interazione;
+3. **esplicitamente, dalla toolbar** — fallback per il multi-contatto nella
+   stessa app. Se viene usato spesso, i primi due non stanno funzionando.
+
+Mai indovinare. In assenza di destinatario si ritorna `UnknownPeer` e si
+chiede: cifrare per la persona sbagliata e' il fallimento peggiore possibile.
+
+### Formato
+
+- Due tipi di blob (`Message`, `IdentityCard`) distinti da un byte `kind`
+  DENTRO il body, non da sentinel diversi: dall'esterno devono essere
+  indistinguibili. Un sentinel dedicato alle presentazioni sarebbe un
+  marcatore in chiaro di "utente che aggancia un nuovo contatto", raccolto a
+  costo zero da uno scanning di massa.
+- `kind` entra nell'AAD: un messaggio non deve poter essere reinterpretato
+  come blob di tipo diverso.
+- I **flag non sono un campo** di `Header`: sono una funzione di
+  `sender_pub.is_some()`. Due fonti di verità per lo stesso fatto
+  permetterebbero di costruire un header incoerente, e un header incoerente
+  fallisce l'autenticazione in modo opaco, cioè nel modo più difficile da
+  diagnosticare. Perché la derivazione resti valida, `parse` **rifiuta i bit di
+  flag non definiti** invece di ignorarli.
+- **`parse` che ritorna `Ok` non dice nulla sull'integrità del contenuto.** Il
+  ciphertext ha lunghezza variabile, quindi troncarlo produce un messaggio
+  perfettamente ben formato con un ciphertext più corto, e nessun campo di
+  lunghezza può smentirlo: sarebbe in chiaro, e un attaccante lo aggiusterebbe
+  insieme al resto. A intercettarlo è il tag Poly1305 in decifratura, che è il
+  posto giusto — l'integrità del ciphertext è competenza dell'AEAD, non del
+  framing. Chi legge un `ParsedEnvelope` non deve mai dedurne che il messaggio
+  sia intatto. Il parser garantisce solo che l'header sia completo e che resti
+  almeno la lunghezza di un tag.
+- La identity card porta un checksum di 4 byte. Non e' autenticazione e non
+  pretende di esserlo — una card puo' essere sostituita in transito, ed e'
+  esattamente il rischio che il TOFU accetta. Serve contro la CORRUZIONE: una
+  card troncata verrebbe fissata come chiave valida, e da quel momento ogni
+  messaggio verso quel contatto fallirebbe in modo opaco senza che nessuno
+  capisca perche'.
+- Byte di versione in testa.
+- Marcatore di tier dentro la parte **autenticata** (AAD), per impedire
+  downgrade forzato da un attaccante attivo.
+- Il tier forward-secrecy è previsto nel formato ma **non implementato**:
+  parsing riconosciuto, esecuzione → `TierUnsupported`.
+
+### Errori
+
+- Fallimento AEAD → un unico `Error::Crypto` opaco. **Mai** distinguere "tag
+  non valido" da "chiave sbagliata" da "nonce corrotto": è un canale che aiuta
+  l'attaccante. Nessuna sessione futura deve "migliorare la diagnostica" qui.
+- Sentinel che non combacia → `NotOurBlob`, trattato come **esito normale**,
+  non come errore grave: la tastiera lo usa per decidere se offrire l'azione
+  "decifra".
+
+### Segreti in memoria
+
+- Chiavi private e plaintext: zeroize on drop, mai `Debug`/`Display`/
+  `Serialize`.
+- La garanzia si ferma al confine JNI: una `java.lang.String` è immutabile e
+  non azzerabile. Verso la JVM si passa **`byte[]`**, mai `String`. Per questo
+  l'API pubblica restituisce `Plaintext`, non `String`.
+
+## Decisioni aperte — non implementare prima di chiuderle
+
+Se una sessione le trova aperte, si ferma e chiede. Non sceglie per conto
+proprio.
+
+- **C. Anti-replay.** Oggi un attaccante può ripubblicare un blob vecchio: resta
+  valido per sempre. Opzioni: timestamp nel plaintext mostrato in UI, finestra
+  di validità nell'AAD, oppure niente documentando il buco. Se serve il tempo,
+  va **iniettato**, non letto dal sistema dentro questo crate.
+- **D. Formato del fingerprint.** Stabile per sempre una volta rilasciato.
+  Proposta corrente nel codice: SHA-256 con domain separation, troncata a 96
+  bit, resa in z-base-32 a gruppi di 4 (20 caratteri). Da confermare.
+*(La decisione E su z-base-32 è chiusa: vedi sotto.)*
+
+## Regole di implementazione
+
+- `#![forbid(unsafe_code)]`.
+- Nessun panic in produzione: deny su `unwrap_used`, `expect_used`, `panic`,
+  `indexing_slicing`, `arithmetic_side_effects`. `todo!()` è ammesso **solo**
+  in fase scheletro.
+- Attenzione: `clippy::panic` NON scatta su `todo!()`, quindi il deny attuale
+  non impedisce a un `todo!()` di finire in release. Prima del rilascio
+  aggiungere `todo = "deny"` a `[lints.clippy]`: oggi sparerebbe una
+  quarantina di volte, ed è il segnale che lo scheletro non è ancora
+  implementato.
+- Un solo `Error` pubblico per il crate (thiserror).
+- Nessuna dipendenza che porti codice C se esiste alternativa pura-Rust.
+- Il formato è per sempre: una volta rilasciata la versione 1, si aggiunge una
+  versione nuova, non si modifica la 1.
+
+## Test
+
+- Vettori noti delle **primitive**: presi dalle crate upstream, non riscritti.
+- Vettori del **nostro formato**: prodotti con RNG fisso e congelati come KAT.
+  Un cambiamento che li rompe è un cambiamento di formato, non un refactor.
+- Vettori z-base-32: presi dalla spec. **Non inventarli**: un vettore di test
+  sbagliato è peggio di nessun vettore.
+- Test negativi obbligatori: bit flip nel ciphertext, nell'AAD, nel byte di
+  tier; versione sconosciuta; sentinel assente; input troncato; flag
+  incoerenti con la lunghezza.
+- Ogni parser va esercitato su input ostile (fuzzing se possibile).
+
+## Stile
+
+- Prima scheletro (moduli, firme, error types), poi implementazione. Non
+  blocchi monolitici.
+- Test unitari accanto a ogni funzione crypto.
+- Commenti e commit in italiano.
+
+## Comandi
+
+```
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --target aarch64-linux-android --release
+```

@@ -1,0 +1,21 @@
+# Artefatti di build Rust
+/target
+
+# NOTA: Cargo.lock E' versionato di proposito. Progetto crypto: le build
+# devono essere riproducibili e le versioni delle dipendenze bloccate.
+
+# File di editor / IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# File di sistema
+.DS_Store
+Thumbs.db
+
+# Configurazione locale di macchina (e i suoi file temporanei)
+.claude/settings.local.json
+.claude/settings.local.json.tmp.*
