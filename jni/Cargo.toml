@@ -1,0 +1,34 @@
+# Crate separato, fuori dal workspace del core.
+#
+# Non e' una scelta organizzativa: qui `unsafe` e' inevitabile — i simboli
+# esportati verso la JVM sono `extern "system"` e la loro correttezza dipende
+# dal contratto JNI, non dal type system. Il core invece e' e resta
+# `#![forbid(unsafe_code)]`, e tenerli nello stesso crate significherebbe
+# rinunciare a quella garanzia proprio dove serve di piu'.
+[workspace]
+
+[package]
+name = "keyboard-cipher-jni"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Ponte JNI fra keyboard-cipher-core e la JVM Android"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+keyboard-cipher-core = { path = ".." }
+jni = "0.21"
+# OsRng: l'entropia viene dall'OS, mai da un PRNG seedato in-app.
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"

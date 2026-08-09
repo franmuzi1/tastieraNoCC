@@ -1,7 +1,15 @@
 # keyboard-cipher — core crypto/formato
 
 Crate Rust: cifratura e formato messaggio per una tastiera Android (fork
-HeliBoard). Esposto alla JVM da un crate JNI **separato**, che non esiste ancora.
+HeliBoard). Esposto alla JVM dal crate **separato** in `jni/`.
+
+La separazione non è organizzativa: nel ponte JNI `unsafe` è inevitabile — i
+simboli `extern "system"` dipendono dal contratto JNI, non dal type system —
+mentre il core è e resta `#![forbid(unsafe_code)]`. Tenerli insieme
+significherebbe rinunciare a quella garanzia proprio dove serve di più.
+Regola aggiuntiva del ponte: **nessun panic può attraversare il confine**, un
+unwind dentro una funzione `extern` è UB e non un crash pulito, quindi ogni
+punto d'ingresso è avvolto in `catch_unwind`.
 
 ## Cosa fa e cosa non fa
 
@@ -361,6 +369,20 @@ chiede: cifrare per la persona sbagliata e' il fallimento peggiore possibile.
 Se una sessione le trova aperte, si ferma e chiede. Non sceglie per conto
 proprio.
 
+- **F. Identita' di contatto — il conflitto TOFU oggi non puo' scattare.**
+  Emersa scrivendo il keyring del crate JNI. `PinOutcome::Conflict` esiste,
+  la UI e i test lo gestiscono, ma **nessun keyring realistico puo'
+  produrlo**: il keyring e' indicizzato *sulla pubkey*, quindi due chiavi
+  diverse sono semplicemente due peer diversi, non un peer che ha cambiato
+  chiave. Non esiste un'identita' di contatto indipendente dalla chiave a cui
+  agganciare il "safety number changed" che questo documento richiede.
+  Opzioni: (a) etichetta locale assegnata dall'utente, e il conflitto e' "due
+  chiavi per la stessa etichetta"; (b) conflitto per package, cioe' "in
+  com.whatsapp parlavi con la chiave X e ora ne arriva un'altra" — gratis ma
+  rumoroso in un'app multi-contatto; (c) accettare che il TOFU qui non protegga
+  dal cambio chiave e dirlo nel threat model. Finche' resta aperta, il ramo
+  Conflict e' codice non raggiungibile.
+
 - **C. Anti-replay.** Oggi un attaccante può ripubblicare un blob vecchio: resta
   valido per sempre. Opzioni: timestamp nel plaintext mostrato in UI, finestra
   di validità nell'AAD, oppure niente documentando il buco. Se serve il tempo,
@@ -422,6 +444,10 @@ proprio.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build --target aarch64-linux-android --release
+
+# Crate JNI (cdylib per la JVM; fuori dal workspace del core perché usa unsafe)
+cd jni && cargo build --release
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o ../android/jniLibs build --release
 
 # Fuzzing (nightly; il crate in fuzz/ è fuori dal workspace del core)
 cargo +nightly fuzz run decode    -- -max_total_time=150

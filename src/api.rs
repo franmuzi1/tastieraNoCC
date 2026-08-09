@@ -115,6 +115,14 @@ impl<K: Keyring> Session<K> {
         self.identity.fingerprint()
     }
 
+    /// Accesso in sola lettura al keyring, per chi deve persisterlo o
+    /// mostrarne il contenuto. La mutazione passa solo dai metodi di
+    /// [`Session`], cosi' il pin non puo' essere modificato scavalcando le
+    /// regole TOFU.
+    pub fn keyring(&self) -> &K {
+        &self.keyring
+    }
+
     /// Riconosce e gestisce un testo arbitrario in arrivo.
     ///
     /// Volutamente neutra rispetto al trasporto: le quattro vie con cui un
