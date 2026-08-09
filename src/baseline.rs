@@ -186,6 +186,7 @@ fn derive_key(
 mod tests {
     use super::*;
     use crate::format::{ParsedBlob, SENTINEL};
+    use hex_literal::hex;
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -204,7 +205,14 @@ mod tests {
         let ParsedBlob::Message(parsed) = format::parse(testo, &mut buf)? else {
             panic!("atteso un messaggio");
         };
-        let sender = parsed.header.sender_pub.clone().expect("sender_pub assente");
+        // Se il flag SENDER_PUB e' stato spento da una manomissione, il
+        // mittente non c'e' e non c'e' niente da tentare: e' un errore, non un
+        // motivo per andare in panic.
+        let sender = parsed
+            .header
+            .sender_pub
+            .clone()
+            .ok_or(Error::Format("sender_pub assente"))?;
         open(destinatario, &sender, &parsed)
     }
 
@@ -325,31 +333,35 @@ mod tests {
     }
 
     /// Una pubkey di ordine basso produce un segreto condiviso tutto zero,
-    /// uguale per chiunque. Va rifiutata prima di derivare qualsiasi chiave.
+    /// uguale per chiunque la usi: chi la riceve come `sender_pub` deriverebbe
+    /// una chiave AEAD che qualsiasi altro puo' ricalcolare. Va rifiutata
+    /// prima di derivare qualsiasi cosa.
+    ///
+    /// I sette punti sotto sono l'insieme completo dei punti di ordine piccolo
+    /// della curva25519, nella forma usata dai test di libsodium.
+    ///
+    /// Nota per chi verra' dopo: `[0xFF; 32]` NON appartiene a questo insieme,
+    /// per quanto sembri degenere. X25519 azzera il bit piu' alto della
+    /// coordinata, quindi quei byte valgono 2^255-1, cioe' 18 modulo p: un
+    /// punto di ordine pieno e perfettamente valido.
     #[test]
     fn pubkey_di_ordine_basso_rifiutata() {
         let alice = identita(17);
-        // Punti di ordine basso noti della curva25519.
-        let degeneri: [[u8; 32]; 3] = [
-            [0u8; 32],
-            {
-                let mut k = [0u8; 32];
-                if let Some(first) = k.get_mut(0) {
-                    *first = 1;
-                }
-                k
-            },
-            [0xFFu8; 32],
+        let degeneri: [[u8; 32]; 7] = [
+            hex!("0000000000000000000000000000000000000000000000000000000000000000"),
+            hex!("0100000000000000000000000000000000000000000000000000000000000000"),
+            hex!("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+            hex!("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+            hex!("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            hex!("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            hex!("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
         ];
 
         for bytes in degeneri {
             let peer = PublicKey::from_bytes(bytes);
             assert!(
-                matches!(
-                    seal(&alice, &peer, b"x", &mut rng(7)),
-                    Err(Error::Crypto)
-                ),
-                "pubkey degenere accettata: {bytes:?}"
+                matches!(seal(&alice, &peer, b"x", &mut rng(7)), Err(Error::Crypto)),
+                "pubkey degenere accettata: {bytes:02x?}"
             );
         }
     }
@@ -366,5 +378,5 @@ mod tests {
         assert_eq!(apri(&bob, KAT_BASELINE).unwrap().as_bytes(), b"kat");
     }
 
-    const KAT_BASELINE: &str = "";
+    const KAT_BASELINE: &str = "kc/1/yryyyym5j4ejzxu993nce3pnrybz4arqhpcjxwa69f3xy95wtrsmb739np5mtafpwdau5rnymiiqkwhgzwwm5wo3znoe55e43ubrw5w3bdyd9janhnsusijy4zkxmna";
 }
