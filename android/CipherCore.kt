@@ -139,9 +139,13 @@ object CipherCore {
     external fun nativeExportKeyring(): ByteArray?
 
     /**
-     * Stesso formato di [nativeExportKeyring]: record a lunghezza fissa,
-     * 32 byte di pubkey + 8 di timestamp + 1 di "verificato", dopo un'intestazione
-     * di 5 byte. Kotlin li scorre senza bisogno di un parser.
+     * Stesso formato di [nativeExportKeyring]. Intestazione di 5 byte
+     * (1 versione + 4 di conteggio little-endian), poi un record per peer:
+     *
+     *     pubkey(32) | firstSeenUnix(8, LE) | verified(1) | labelLen(2, LE) | label(labelLen, UTF-8)
+     *
+     * I record NON hanno lunghezza fissa: l'etichetta e' variabile. Scorrerli
+     * assumendo un passo costante e' sbagliato.
      */
     external fun nativeListPeers(): ByteArray?
 
