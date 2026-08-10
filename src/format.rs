@@ -109,6 +109,12 @@ pub enum Kind {
     /// autenticata — non puo' esserlo, e' il primo contatto. Serve solo a
     /// trasportare una pubkey in un formato che la tastiera riconosca.
     IdentityCard = 1,
+    /// File cifrato: foto, audio, qualunque cosa. **Non** viaggia come testo —
+    /// z-base-32 gonfierebbe di 1,6x — ma come byte grezzi dentro un allegato.
+    /// Il resto dell'envelope e' identico a quello di un messaggio, cosi' il
+    /// parser resta uno solo e `kind` sta gia' nell'AAD: un file non puo'
+    /// essere fatto passare per un messaggio, ne' viceversa.
+    File = 2,
 }
 
 impl Kind {
@@ -116,6 +122,7 @@ impl Kind {
         match b {
             0 => Ok(Kind::Message),
             1 => Ok(Kind::IdentityCard),
+            2 => Ok(Kind::File),
             _ => Err(Error::Format("kind sconosciuto")),
         }
     }
@@ -365,6 +372,55 @@ pub fn parse<'a>(text: &str, out: &'a mut Vec<u8>) -> Result<ParsedBlob<'a>> {
     match kind {
         Kind::Message => parse_message(cursor).map(ParsedBlob::Message),
         Kind::IdentityCard => parse_identity_card(cursor).map(ParsedBlob::IdentityCard),
+        // Un file non arriva mai per questa via: e' un allegato, non testo.
+        // Qualcuno potrebbe comunque codificarne uno in z-base-32 e incollarlo,
+        // e allora e' meglio dirgli che il blob non e' di questo tipo piuttosto
+        // che tentare una decifratura che l'AAD farebbe fallire come "crypto".
+        Kind::File => Err(Error::Format("un file non si incolla come testo")),
+    }
+}
+
+/// Serializza un file: stesso corpo di un messaggio, **senza** sentinel e
+/// senza z-base-32.
+///
+/// Niente marcatore in testa, di nessun tipo. Un magic number servirebbe solo
+/// a farlo riconoscere da chi scansiona i file: i primi due byte — versione e
+/// `kind` — bastano a chi lo apre davvero, e non annunciano niente a chi si
+/// limita a guardare.
+pub fn serialize_file(header: &Header, ciphertext: &[u8]) -> Vec<u8> {
+    let capacity = MESSAGE_PREFIX_LEN
+        .saturating_add(KEY_LEN)
+        .saturating_add(NONCE_LEN)
+        .saturating_add(ciphertext.len());
+    let mut body = Vec::with_capacity(capacity);
+    body.push(PROTOCOL_VERSION);
+    body.push(Kind::File as u8);
+    body.push(header.tier as u8);
+    body.push(header.flags().0);
+    if let Some(sender) = &header.sender_pub {
+        body.extend_from_slice(sender.as_bytes());
+    }
+    body.extend_from_slice(&header.nonce);
+    body.extend_from_slice(ciphertext);
+    body
+}
+
+/// Inverte [`serialize_file`].
+///
+/// Come per i messaggi, un `Ok` **non** dice niente sull'integrita' del
+/// contenuto: il ciphertext ha lunghezza variabile e troncarlo produce un file
+/// perfettamente ben formato. A intercettarlo e' il tag in decifratura.
+pub fn parse_file(bytes: &[u8]) -> Result<ParsedEnvelope<'_>> {
+    let mut cursor = Cursor::new(bytes);
+    let version = cursor.take_u8()?;
+    if version != PROTOCOL_VERSION {
+        return Err(Error::UnsupportedVersion(version));
+    }
+    match Kind::from_byte(cursor.take_u8()?)? {
+        Kind::File => parse_message(cursor),
+        // Non e' un file. Non e' nemmeno un errore di formato del contenuto:
+        // e' un blob di un altro tipo passato dalla porta sbagliata.
+        _ => Err(Error::Format("questo allegato non e' un file cifrato")),
     }
 }
 

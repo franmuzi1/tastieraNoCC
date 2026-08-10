@@ -108,6 +108,35 @@ pub fn seal<R: RngCore + CryptoRng>(
     now_unix: i64,
     rng: &mut R,
 ) -> Result<String> {
+    let (header, ciphertext) = seal_inner(Kind::Message, sender, recipient, plaintext, now_unix, rng)?;
+    Ok(format::serialize_message(&header, &ciphertext))
+}
+
+/// Come [`seal`] ma per un file: stesso schema, `kind` diverso, e il risultato
+/// sono byte grezzi invece di testo.
+///
+/// `kind` entra nell'AAD, quindi un file non puo' essere riaperto come
+/// messaggio nemmeno da chi possiede la chiave giusta: la separazione non
+/// dipende dal contenitore, e' autenticata.
+pub fn seal_file<R: RngCore + CryptoRng>(
+    sender: &Identity,
+    recipient: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<Vec<u8>> {
+    let (header, ciphertext) = seal_inner(Kind::File, sender, recipient, plaintext, now_unix, rng)?;
+    Ok(format::serialize_file(&header, &ciphertext))
+}
+
+fn seal_inner<R: RngCore + CryptoRng>(
+    kind: Kind,
+    sender: &Identity,
+    recipient: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<(Header, Vec<u8>)> {
     let mut nonce = [0u8; NONCE_LEN];
     rng.fill_bytes(&mut nonce);
 
@@ -116,7 +145,7 @@ pub fn seal<R: RngCore + CryptoRng>(
         sender_pub: Some(sender.public()),
         nonce,
     };
-    let aad = format::build_aad(Kind::Message, &header);
+    let aad = format::build_aad(kind, &header);
 
     let shared = sender.diffie_hellman(recipient)?;
     let key = derive_key(&shared, &nonce, &aad, recipient)?;
@@ -138,7 +167,7 @@ pub fn seal<R: RngCore + CryptoRng>(
         )
         .map_err(|_| Error::Crypto)?;
 
-    Ok(format::serialize_message(&header, &ciphertext))
+    Ok((header, ciphertext))
 }
 
 /// Inverte [`seal`].
@@ -161,6 +190,25 @@ pub fn open(
     sender_pub: &PublicKey,
     parsed: &ParsedEnvelope<'_>,
 ) -> Result<Plaintext> {
+    open_inner(Kind::Message, recipient, sender_pub, parsed)
+}
+
+/// Inverte [`seal_file`]. Vedi [`open`] per tutto il resto: cambia solo il
+/// `kind`, che essendo nell'AAD rende i due percorsi non intercambiabili.
+pub fn open_file(
+    recipient: &Identity,
+    sender_pub: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<Plaintext> {
+    open_inner(Kind::File, recipient, sender_pub, parsed)
+}
+
+fn open_inner(
+    kind: Kind,
+    recipient: &Identity,
+    sender_pub: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<Plaintext> {
     // Il rifiuto del tier riservato sta qui e non nel parser: "non lo so
     // leggere" e "non lo so eseguire" sono due cose diverse, e il chiamante
     // deve poterle distinguere per dire all'utente la cosa giusta.
@@ -171,7 +219,7 @@ pub fn open(
         return Err(Error::Crypto);
     }
 
-    let aad = format::build_aad(Kind::Message, &parsed.header);
+    let aad = format::build_aad(kind, &parsed.header);
     let shared = recipient.diffie_hellman(sender_pub)?;
     let key = derive_key(&shared, &parsed.header.nonce, &aad, &recipient.public())?;
 

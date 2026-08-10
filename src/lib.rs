@@ -27,6 +27,7 @@ pub mod backup;
 pub mod baseline;
 pub mod encoding;
 pub mod error;
+pub mod file;
 pub mod format;
 pub mod keys;
 

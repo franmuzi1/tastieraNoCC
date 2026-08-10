@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use rand_core::{CryptoRng, RngCore};
 
 use crate::baseline::{self, Plaintext};
+use crate::file::{self, DecryptedFile, FileMeta};
 use crate::error::{Error, Result};
 use crate::format::{self, ParsedBlob};
 use crate::keys::{Fingerprint, Identity, Keyring, LabelOutcome, PinOutcome, PublicKey};
@@ -74,6 +75,13 @@ pub struct DecryptedMessage {
     pub sender: PublicKey,
     pub sender_status: SenderStatus,
     pub plaintext: Plaintext,
+}
+
+/// Un allegato decifrato, con lo stato TOFU di chi l'ha mandato.
+pub struct IncomingFile {
+    pub sender: PublicKey,
+    pub sender_status: SenderStatus,
+    pub file: DecryptedFile,
 }
 
 /// Cosa e' risultato essere il testo in arrivo.
@@ -251,6 +259,57 @@ impl<K: Keyring> Session<K> {
     ) -> Result<String> {
         let peer = self.current_peer.get(app_package).ok_or(Error::UnknownPeer)?;
         baseline::seal(&self.identity, peer, plaintext, now_unix, rng)
+    }
+
+    /// Cifra un file per un peer **scelto esplicitamente** (decisione G4).
+    ///
+    /// Niente `app_package` e niente destinatario implicito: questo percorso
+    /// parte da una schermata, non dalla tastiera, quindi il contesto da cui
+    /// dedurre con chi si sta parlando non esiste. Ed e' anche il verso giusto
+    /// in cui sbagliare — un file mandato alla persona sbagliata non si ritira.
+    ///
+    /// Il peer deve essere gia' nel keyring: non si cifra verso una chiave mai
+    /// vista, che e' la stessa regola di [`Self::set_current_peer`].
+    pub fn encrypt_file<R: RngCore + CryptoRng>(
+        &self,
+        peer: &PublicKey,
+        meta: &FileMeta,
+        content: &[u8],
+        now_unix: i64,
+        rng: &mut R,
+    ) -> Result<Vec<u8>> {
+        if self.keyring.get(peer)?.is_none() {
+            return Err(Error::UnknownPeer);
+        }
+        file::seal_file(&self.identity, peer, meta, content, now_unix, rng)
+    }
+
+    /// Apre un allegato ricevuto.
+    ///
+    /// Stesso ordine critico dei messaggi: **si decifra prima di toccare il
+    /// keyring**. La decifratura riuscita e' la prova che chi ha mandato il
+    /// file possiede la privata dichiarata; fissare prima permetterebbe a
+    /// chiunque di riempire il keyring spedendo un allegato qualsiasi.
+    ///
+    /// A differenza di un messaggio **non sceglie nessun destinatario**: qui
+    /// non c'e' un'app di provenienza a cui attribuirlo, e indovinarla sarebbe
+    /// il modo per far cifrare il messaggio successivo alla persona sbagliata.
+    pub fn handle_incoming_file(&mut self, bytes: &[u8], now_unix: i64) -> Result<IncomingFile> {
+        let parsed = file::parse_file(bytes)?;
+        let sender = parsed
+            .header
+            .sender_pub
+            .clone()
+            .ok_or(Error::Format("allegato senza pubkey del mittente"))?;
+
+        let decrypted = file::open_file(&self.identity, &sender, &parsed)?;
+        let sender_status = self.pin_and_classify(&sender, now_unix)?;
+
+        Ok(IncomingFile {
+            sender,
+            sender_status,
+            file: decrypted,
+        })
     }
 
     pub fn current_peer(&self, app_package: &str) -> Option<&PublicKey> {
