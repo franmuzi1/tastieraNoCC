@@ -1,0 +1,36 @@
+# Crate separato, fuori dal workspace del core — come `jni/`, e per lo stesso
+# tipo di ragione: il core non fa I/O, e questo binario non fa altro. Tenerli
+# insieme significherebbe mettere `std::fs` in un crate la cui proprieta'
+# dichiarata e' di non toccare il disco.
+#
+# A cosa serve: avere una SECONDA parte con cui parlare. Con la sola tastiera
+# si puo' solo cifrare verso se stessi — che prova il giro cifra/decifra e non
+# prova niente di cio' che richiede due identita' distinte: presentazione,
+# primo contatto, cambio chiave, conflitto di etichetta, destinatario sbagliato.
+[workspace]
+
+[package]
+name = "keyboard-cipher-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Riga di comando per provare keyboard-cipher da PC: seconda identita', cifra e decifra"
+publish = false
+
+[[bin]]
+name = "kc"
+path = "src/main.rs"
+
+[dependencies]
+keyboard-cipher-core = { path = ".." }
+# OsRng: l'entropia viene dall'OS, mai da un PRNG seedato in-app.
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"

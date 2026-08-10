@@ -25,12 +25,13 @@ Nemmeno per sbaglio: generatore casuale e tempo sono **parametri**, mai presi
 da variabili globali. Senza questo i vettori di test del formato non sarebbero
 scrivibili e i test non sarebbero deterministici.
 
-## Due crate, e non è organizzazione
+## Tre crate, e non è organizzazione
 
 | | |
 |---|---|
-| `src/` — `keyboard-cipher-core` | `#![forbid(unsafe_code)]` |
+| `src/` — `keyboard-cipher-core` | `#![forbid(unsafe_code)]`, nessun I/O |
 | `jni/` — `keyboard-cipher-jni` | il ponte verso la JVM, dove `unsafe` è inevitabile |
+| `cli/` — `keyboard-cipher-cli` | il binario `kc`: l'altra parte, da PC |
 
 I simboli esportati verso Java sono `extern "system"` e la loro correttezza
 dipende dal contratto JNI, non dal type system. Tenerli nello stesso crate
@@ -40,6 +41,39 @@ proprio per colpa delle poche righe in cui serve di più.
 Regola aggiuntiva del ponte: **nessun panic attraversa il confine.** Un unwind
 dentro una funzione `extern` non è un crash pulito, è comportamento non
 definito — quindi ogni punto d'ingresso è avvolto in `catch_unwind`.
+
+## `kc`, l'altra parte
+
+Con il solo telefono si può cifrare verso se stessi. Prova il giro
+cifra/decifra e non prova **niente** di ciò che richiede due identità distinte:
+presentazione, primo contatto, cambio chiave, conflitto di etichetta,
+destinatario sbagliato — che sono anche i percorsi dove i guasti fanno più
+danno.
+
+```
+cd cli && cargo build --release
+
+kc init                          # crea l'identità
+kc card                          # la presentazione, da incollare in chat
+kc decrypt "<blob>"              # decifra, o fissa una presentazione
+kc name 0 marco                  # dà un nome a una chiave
+kc encrypt --to marco "ciao"     # cifra
+kc contacts
+```
+
+`KC_HOME` sposta lo stato, quindi si possono tenere più identità affiancate —
+che è esattamente ciò che serve per provare un conflitto di chiave senza
+distruggere la propria.
+
+Non parla con il telefono e non sa che esista: l'unico canale fra le due parti
+è chi copia e incolla. Provato in entrambi i sensi contro la tastiera vera —
+card della CLI riconosciuta dall'app con lo stesso fingerprint, messaggio
+dell'app decifrato da `kc`, messaggio di `kc` decifrato dall'app.
+
+*Limite dichiarato:* la chiave privata sta **in chiaro** nel file di stato,
+protetta dai soli permessi Unix. Sul telefono la avvolge Android Keystore, qui
+non c'è niente di equivalente. È uno strumento per provare, e quell'identità non
+vale quanto quella del telefono.
 
 ## Primitive
 
