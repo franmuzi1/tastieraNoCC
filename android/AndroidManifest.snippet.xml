@@ -8,6 +8,16 @@
 -->
 
 <!--
+  NOMI ASSOLUTI, non relativi. Il namespace del modulo e'
+  `helium314.keyboard.latin`, quindi `.cipher.DecryptActivity` risolverebbe in
+  `helium314.keyboard.latin.cipher.DecryptActivity`, che non esiste.
+  Il guasto non si vede al build: il manifest accetta il nome, R8 non trova
+  riferimenti alle classi e le rimuove dal dex. L'APK compila, e la
+  funzionalita' non c'e'. HeliBoard usa nomi assoluti per le proprie Activity
+  fuori da `.latin` esattamente per questo.
+-->
+
+<!--
   Riceve il testo selezionato in un'altra app (barra di selezione standard) e
   il testo condiviso via share sheet.
 
@@ -33,7 +43,7 @@
   =singleTask        plaintext in memoria contemporaneamente.
 -->
 <activity
-    android:name=".cipher.DecryptActivity"
+    android:name="helium314.keyboard.cipher.DecryptActivity"
     android:label="@string/cipher_decrypt_action"
     android:exported="true"
     android:noHistory="true"
@@ -68,6 +78,6 @@
   una voce nelle impostazioni non faccia gia'.
 -->
 <activity
-    android:name=".cipher.ContactsActivity"
+    android:name="helium314.keyboard.cipher.ContactsActivity"
     android:exported="false"
     android:excludeFromRecents="true" />
