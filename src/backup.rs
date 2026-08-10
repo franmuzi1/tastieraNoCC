@@ -191,7 +191,15 @@ pub fn import(blob: &[u8], passphrase: &[u8]) -> Result<Backup> {
     // Il tetto e' generoso rispetto a quello che scriviamo noi, cosi' resta
     // spazio per alzare i costi in futuro senza rendere illeggibili i file
     // vecchi.
-    if m_cost > 1_048_576 || t_cost > 16 || p_cost == 0 || p_cost > 16 {
+    // 256 MiB, cioe' quattro volte quanto scriviamo: c'e' margine per alzare
+    // i costi in futuro senza rendere illeggibili i file vecchi, e non c'e'
+    // margine per far morire il processo.
+    //
+    // Il tetto non e' teorico. In Rust un fallimento di allocazione e' un
+    // abort, e questo codice gira nello stesso processo della tastiera: un
+    // file costruito ad arte con m_cost enorme non sarebbe un attacco
+    // crittografico, sarebbe un modo per spegnere la tastiera a chi lo apre.
+    if m_cost > 262_144 || t_cost > 8 || p_cost == 0 || p_cost > 4 {
         return Err(Error::Format("parametri di derivazione fuori scala"));
     }
 
@@ -246,7 +254,10 @@ fn header_bytes(salt: &[u8; SALT_LEN], m: u32, t: u32, p: u32) -> Vec<u8> {
     header.extend_from_slice(salt);
     header.extend_from_slice(&m.to_be_bytes());
     header.extend_from_slice(&t.to_be_bytes());
-    header.push(p as u8);
+    // `try_from` e non `as`: con `p` maggiore di 255 il cast scriverebbe un
+    // valore diverso da quello usato per derivare, e produrrebbe un backup
+    // valido all'apparenza e permanentemente inapribile.
+    header.push(u8::try_from(p).unwrap_or(u8::MAX));
     header
 }
 

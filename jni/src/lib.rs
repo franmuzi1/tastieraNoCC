@@ -361,12 +361,21 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeImportBac
         // Il segreto esce PRIMA di sostituire la sessione: se la scrittura
         // nell'array fallisce, meglio lasciare tutto com'era che ritrovarsi
         // un'identita' viva in memoria e nessun modo di persisterla.
+        // Lunghezza controllata prima di scrivere: un array piu' corto
+        // farebbe sollevare un'eccezione JNI che resterebbe pendente sul
+        // thread e verrebbe lanciata al ritorno in Java, dove il chiamante si
+        // aspetta un codice di ritorno.
+        if env.get_array_length(&secret_out).unwrap_or(0) != KEY_LEN as jint {
+            return code::FORMAT;
+        }
+        // Zeroizing: e' una copia dei 32 byte della chiave privata, e senza
+        // resterebbe in heap fino al riuso dell'allocazione. Ovunque altro in
+        // questo file la disciplina e' rispettata; qui mancava.
+        let temporaneo = zeroize::Zeroizing::new(
+            aperto.secret.iter().map(|b| *b as i8).collect::<Vec<i8>>(),
+        );
         if env
-            .set_byte_array_region(
-                &secret_out,
-                0,
-                &aperto.secret.iter().map(|b| *b as i8).collect::<Vec<i8>>(),
-            )
+            .set_byte_array_region(&secret_out, 0, &temporaneo)
             .is_err()
         {
             return code::INTERNAL;
@@ -539,8 +548,14 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
                 outcome,
             } => {
                 let nuovo = matches!(outcome, PinOutcome::Pinned);
+                // `verified` resta 0. Significa "confrontato di persona", ed e'
+                // l'unico segnale anti-MITM del sistema: accenderlo perche' la
+                // chiave era gia' fissata lo renderebbe ottenibile a comando —
+                // basterebbe mandare la stessa card due volte per far comparire
+                // il segno di spunta accanto a una chiave mai verificata.
                 if !set_int("kind", code::ITEM_IDENTITY_CARD)
-                    || !set_int("verified", jint::from(!nuovo))
+                    || !set_int("alreadyPinned", jint::from(!nuovo))
+                    || !set_int("verified", 0)
                 {
                     return code::INTERNAL;
                 }

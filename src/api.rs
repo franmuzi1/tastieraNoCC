@@ -186,9 +186,25 @@ impl<K: Keyring> Session<K> {
                 }))
             }
             ParsedBlob::IdentityCard(card) => {
+                // Si fissa la chiave, e NIENTE ALTRO.
+                //
+                // In particolare non si tocca il destinatario corrente, anche
+                // se sarebbe comodo. Una identity card non e' autenticata — per
+                // costruzione, e' il primo contatto — quindi chiunque puo'
+                // fabbricarne una con la propria chiave e farla arrivare alla
+                // vittima: dall'esterno e' indistinguibile da un messaggio.
+                // Se bastasse decifrarla per diventare il destinatario, un
+                // estraneo deciderebbe per chi la vittima cifra, e il messaggio
+                // successivo andrebbe a lui.
+                //
+                // La regola che autorizza la selezione implicita e' un'altra:
+                // la decifratura RIUSCITA di un messaggio prova che chi ha
+                // scritto possiede la privata dichiarata. Una card non prova
+                // niente, quindi non decide niente. Il pin resta, perche' e' il
+                // TOFU e il suo rischio e' quello dichiarato; la scelta del
+                // destinatario passa da un gesto esplicito dell'utente
+                // (`set_current_peer`).
                 let outcome = self.keyring.tofu_pin(&card.public, now_unix)?;
-                self.current_peer
-                    .insert(app_package.to_owned(), card.public.clone());
                 Ok(IncomingItem::IdentityCard {
                     fingerprint: Fingerprint::of(&card.public),
                     peer: card.public,
@@ -488,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_card_fissa_la_chiave_e_sceglie_il_destinatario() {
+    fn identity_card_fissa_la_chiave_ma_non_sceglie_il_destinatario() {
         let alice = sessione(1);
         let mut bob = sessione(2);
 
@@ -505,11 +521,50 @@ mod tests {
         assert_eq!(peer, alice.identity.public());
         assert_eq!(fingerprint, alice.my_fingerprint());
         assert!(matches!(outcome, PinOutcome::Pinned));
+
+        // LA RIGA CHE CONTA. Una card non e' autenticata: chiunque puo'
+        // fabbricarne una con la propria chiave e farla arrivare alla vittima.
+        // Se bastasse decifrarla per diventare il destinatario, un estraneo
+        // deciderebbe per chi la vittima cifra.
+        assert_eq!(bob.current_peer(WHATSAPP), None);
+    }
+
+    /// Un estraneo non deve poter dirottare una conversazione gia' stabilita
+    /// mandando la propria presentazione.
+    #[test]
+    fn una_card_non_dirotta_il_destinatario_gia_scelto() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let estraneo = sessione(9);
+
+        // Bob e Alice si parlano gia': Bob ha letto un messaggio di Alice, e
+        // questo — la decifratura riuscita — e' cio' che autorizza la scelta
+        // automatica del destinatario.
+        alice.keyring.tofu_pin(&bob.identity.public(), 5).unwrap();
+        alice
+            .set_current_peer(WHATSAPP, &bob.identity.public())
+            .unwrap();
+        let msg = alice
+            .encrypt_for_app(WHATSAPP, b"ciao", 10, &mut rng(3))
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &msg, 11).unwrap();
+        assert_eq!(bob.current_peer(WHATSAPP), Some(&alice.identity.public()));
+
+        // Arriva la card di uno sconosciuto e Bob la decifra.
+        let card = estraneo.identity_card(&mut rng(8));
+        bob.handle_incoming_text(WHATSAPP, &card, 12).unwrap();
+
+        // Il destinatario deve essere ancora Alice.
         assert_eq!(bob.current_peer(WHATSAPP), Some(&alice.identity.public()));
     }
 
-    /// Il ciclo completo di bootstrap: Alice si presenta, Bob la fissa e
-    /// risponde cifrato senza scegliere nulla, Alice legge.
+    /// Il ciclo completo di bootstrap: Alice si presenta, Bob la fissa,
+    /// SCEGLIE di rispondere a lei, e Alice legge.
+    ///
+    /// Quella scelta e' un gesto dell'utente e non un automatismo: una card non
+    /// e' autenticata, quindi non puo' decidere per chi si cifra. Da qui in poi
+    /// pero' l'automatismo vale, perche' Alice stabilisce il destinatario
+    /// decifrando un messaggio vero.
     #[test]
     fn bootstrap_completo() {
         let mut alice = sessione(1);
@@ -517,6 +572,10 @@ mod tests {
 
         let card = alice.identity_card(&mut rng(7));
         bob.handle_incoming_text(WHATSAPP, &card, 1).unwrap();
+
+        // Il gesto esplicito che la card non fa al posto suo.
+        bob.set_current_peer(WHATSAPP, &alice.identity.public())
+            .unwrap();
 
         let risposta = bob
             .encrypt_for_app(WHATSAPP, b"ricevuto", 1_700_000_000, &mut rng(4))
