@@ -71,6 +71,20 @@ impl Identity {
         }
     }
 
+    /// I byte grezzi del segreto, per il **solo** backup cifrato.
+    ///
+    /// `pub(crate)` e non `pub`, ed e' una distinzione che vale la pena
+    /// difendere: fuori da questo crate non esiste alcun modo di estrarre la
+    /// chiave privata da un'`Identity`. Chi la persiste l'ha ricevuta alla
+    /// generazione e se l'e' tenuta; da qui in poi non esce piu'.
+    ///
+    /// L'unico chiamante e' [`crate::backup`], che la cifra con una passphrase
+    /// prima che tocchi qualunque cosa. Se un giorno servisse un secondo
+    /// chiamante, e' il momento di chiedersi perche'.
+    pub(crate) fn secret_bytes(&self) -> Zeroizing<[u8; KEY_LEN]> {
+        Zeroizing::new(self.secret.0.to_bytes())
+    }
+
     pub fn public(&self) -> PublicKey {
         self.public.clone()
     }

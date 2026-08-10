@@ -17,6 +17,12 @@ zeroize = { version = "1", features = ["derive"] }
 rand_core = "0.6"
 subtle = "2"
 thiserror = "2"
+# Argon2id per derivare la chiave del backup da una passphrase.
+# Serve una KDF LENTA: il backup esce dal dispositivo, quindi chi lo
+# ottiene puo' provare passphrase quante ne vuole, offline e in parallelo.
+# HKDF, che usiamo per i messaggi, e' veloce apposta ed e' esattamente
+# cio' che qui non va bene.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 
 [dev-dependencies]
 # RNG deterministico per i KAT del formato: i vettori di test devono essere

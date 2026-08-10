@@ -23,6 +23,7 @@
 )]
 
 pub mod api;
+pub mod backup;
 pub mod baseline;
 pub mod encoding;
 pub mod error;
