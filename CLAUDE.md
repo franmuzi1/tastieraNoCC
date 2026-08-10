@@ -420,9 +420,19 @@ C, D, E e F sono chiuse; le loro motivazioni stanno nelle sezioni sopra.
 
 *(La decisione E su z-base-32 è chiusa: vedi sotto.)*
 
-### Decisione G — file cifrati (immagini e audio). **APERTA**
+### Decisione G — file cifrati (immagini e audio). **G1 CHIUSA, il resto aperto**
 
-Domanda: si possono mandare foto e note vocali cifrate?
+**G1, chiusa: sì, come documento allegato.** Si sceglie il file dall'Activity
+contatti, si cifra in un contenitore binario, si consegna alla chat con lo share
+sheet — che lo manda come *documento*, e i documenti Telegram e WhatsApp non li
+ricomprimono. Chi riceve lo passa alla nostra app dallo share sheet.
+
+**Residuo accettato con la chiusura di G1:** in chat si vede un allegato che non
+si apre con nient'altro, ed è un marcatore molto più forte del blob di testo.
+Accettato perché l'alternativa osservata è peggiore: senza questa via le foto si
+mandano lo stesso, in chiaro, nella stessa conversazione.
+
+Il resto della decisione (G2–G6) resta aperto.
 
 **Cosa è già risolto e non è in discussione.** Il core cifra byte, non testo:
 `seal` prende `&[u8]`. La crittografia non è il problema.
