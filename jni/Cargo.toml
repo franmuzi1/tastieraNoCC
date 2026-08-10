@@ -23,7 +23,8 @@ keyboard-cipher-core = { path = ".." }
 jni = "0.21"
 # OsRng: l'entropia viene dall'OS, mai da un PRNG seedato in-app.
 rand_core = { version = "0.6", features = ["getrandom"] }
-zeroize = { version = "1", features = ["derive"] }
+# `alloc` serve per azzerare i Vec: le passphrase arrivano come Vec<u8>.
+zeroize = { version = "1", features = ["derive", "alloc"] }
 
 [profile.release]
 # Toglie le informazioni di debug, che sono il grosso di cio' che incorpora

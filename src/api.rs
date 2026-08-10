@@ -123,6 +123,15 @@ impl<K: Keyring> Session<K> {
         &self.keyring
     }
 
+    /// L'identita' della sessione, per il backup cifrato.
+    ///
+    /// Esporla non apre buchi: da fuori dal crate un'[`Identity`] non lascia
+    /// estrarre la chiave privata — l'accessore ai byte grezzi e'
+    /// `pub(crate)` e ha un solo chiamante, [`crate::backup`].
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
     /// Riconosce e gestisce un testo arbitrario in arrivo.
     ///
     /// Volutamente neutra rispetto al trasporto: le quattro vie con cui un

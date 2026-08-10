@@ -260,6 +260,117 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeMyFingerp
     })
 }
 
+/// Esporta identita' e portachiavi cifrati con una passphrase.
+///
+/// La passphrase arriva come `byte[]` e **non** come `String`: una
+/// `java.lang.String` e' immutabile, non azzerabile, e resta in heap fino alla
+/// GC. Chi chiama azzera l'array appena ha finito.
+///
+/// Ritorna il blob del backup, oppure `null`. Il `null` copre tutti i
+/// fallimenti insieme, ed e' voluto: qui non c'e' niente di utile da
+/// distinguere per il chiamante.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeExportBackup(
+    mut env: JNIEnv,
+    _class: JClass,
+    passphrase: JByteArray,
+) -> jbyteArray {
+    guard(std::ptr::null_mut(), || {
+        let mut pass = match read_bytes(&mut env, &passphrase) {
+            Ok(bytes) => bytes,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let esito = with_session(|session| {
+            let keyring = session.keyring().export();
+            keyboard_cipher_core::backup::export(
+                session.identity(),
+                &keyring,
+                &pass,
+                &mut OsRng,
+            )
+        });
+        // La copia della passphrase che vive in questo stack e' nostra: la
+        // azzeriamo noi, senza aspettare il chiamante.
+        pass.zeroize();
+        match esito {
+            Ok(blob) => new_byte_array(&env, &blob),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Apre un backup e **sostituisce** identita' e portachiavi correnti.
+///
+/// Distruttivo: da qui in poi l'identita' precedente non e' piu' raggiungibile
+/// da questa sessione. Chi chiama deve aver gia' chiesto conferma all'utente e
+/// deve persistere subito il risultato, altrimenti alla morte del processo si
+/// ritrova la vecchia identita' su disco e la nuova in memoria — cioe' due
+/// stati diversi della stessa cosa.
+///
+/// I 32 byte del segreto vengono scritti in `secretOut`, che il chiamante
+/// alloca e azzera appena l'ha cifrato per lo storage. Non esiste un modo di
+/// far uscire il segreto senza che qualcuno lo tenga in mano: la scelta e' fra
+/// questo e non avere backup.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeImportBackup(
+    mut env: JNIEnv,
+    _class: JClass,
+    blob: JByteArray,
+    passphrase: JByteArray,
+    secret_out: JByteArray,
+) -> jint {
+    guard(code::INTERNAL, || {
+        let dati = match read_bytes(&mut env, &blob) {
+            Ok(bytes) => bytes,
+            Err(codice) => return codice,
+        };
+        let mut pass = match read_bytes(&mut env, &passphrase) {
+            Ok(bytes) => bytes,
+            Err(codice) => return codice,
+        };
+        let aperto = keyboard_cipher_core::backup::import(&dati, &pass);
+        pass.zeroize();
+        let aperto = match aperto {
+            Ok(aperto) => aperto,
+            Err(error) => return code_of(&error),
+        };
+
+        let identity = match Identity::from_secret_bytes(*aperto.secret) {
+            Ok(identity) => identity,
+            Err(error) => return code_of(&error),
+        };
+        let keyring = if aperto.keyring.is_empty() {
+            MemoryKeyring::new()
+        } else {
+            match MemoryKeyring::import(&aperto.keyring) {
+                Ok(keyring) => keyring,
+                Err(error) => return code_of(&error),
+            }
+        };
+
+        // Il segreto esce PRIMA di sostituire la sessione: se la scrittura
+        // nell'array fallisce, meglio lasciare tutto com'era che ritrovarsi
+        // un'identita' viva in memoria e nessun modo di persisterla.
+        if env
+            .set_byte_array_region(
+                &secret_out,
+                0,
+                &aperto.secret.iter().map(|b| *b as i8).collect::<Vec<i8>>(),
+            )
+            .is_err()
+        {
+            return code::INTERNAL;
+        }
+
+        let mut guard = match session_slot().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(Session::new(identity, keyring));
+        code::OK
+    })
+}
+
 /// Dice se il testo *sembra* contenere un nostro blob. Nessuna decifratura,
 /// nessun accesso al keyring, nessun effetto collaterale.
 ///
