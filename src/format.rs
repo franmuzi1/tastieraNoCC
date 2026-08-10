@@ -322,6 +322,26 @@ pub fn identity_card_checksum(public: &PublicKey) -> [u8; CHECKSUM_LEN] {
     out
 }
 
+/// Dice se il testo *sembra* contenere un nostro blob, senza decodificarlo.
+///
+/// Serve a una cosa sola: decidere se vale la pena offrire l'azione
+/// "decifra". Guarda il sentinel e la lunghezza minima della sequenza di
+/// caratteri dell'alfabeto che segue, e si ferma li'.
+///
+/// **Non e' una verifica.** `true` non dice che il blob sia integro, ne' che
+/// sia per noi, ne' che sia della versione giusta: un `kc/` seguito da
+/// abbastanza spazzatura basta. Chi lo usa per decidere una UI va bene; chi lo
+/// usasse per saltare controlli a valle si sbaglia.
+///
+/// Esiste come funzione separata perche' il chiamante Android deve poterlo
+/// chiedere **senza effetti collaterali**: [`parse`] non ne ha, ma il gradino
+/// successivo — decifrare — fissa peer nel keyring, e una funzione che risponde
+/// "sembra nostro" non deve avere nessuna possibilita' di arrivarci.
+#[must_use]
+pub fn looks_like_blob(text: &str) -> bool {
+    extract_payload(text).is_some()
+}
+
 /// Verifica il sentinel, decodifica, controlla versione e kind, estrae i
 /// campi. NON decifra.
 ///
@@ -484,6 +504,27 @@ mod tests {
 
     fn rng(seed: u8) -> ChaCha20Rng {
         ChaCha20Rng::from_seed([seed; 32])
+    }
+
+    #[test]
+    fn looks_like_blob_riconosce_senza_promettere() {
+        // Sentinel piu' abbastanza caratteri dell'alfabeto: basta.
+        assert!(looks_like_blob("kc/ybndrfg8ejkmcpqx"));
+        // Tollera il contesto, come parse: le vie d'ingresso reali non
+        // consegnano mai testo pulito.
+        assert!(looks_like_blob("guarda: kc/ybndrfg8ejkmcpqx\n"));
+
+        // Niente sentinel.
+        assert!(!looks_like_blob("un messaggio qualunque"));
+        // Sentinel ma coda troppo corta per essere un blob.
+        assert!(!looks_like_blob("kc/ybnd"));
+        // Sentinel seguito da caratteri fuori alfabeto.
+        assert!(!looks_like_blob("kc/MAIUSCOLE"));
+
+        // NON e' una verifica: spazzatura di lunghezza sufficiente passa.
+        // E' voluto — serve solo a decidere se offrire l'azione "decifra" —
+        // e questo test esiste perche' nessuno lo scambi per un controllo.
+        assert!(looks_like_blob("kc/yyyyyyyyyyyyyyyyyyyy"));
     }
 
     fn pubkey(seed: u8) -> PublicKey {

@@ -34,7 +34,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 
 use jni::objects::{JByteArray, JClass, JObject, JString};
-use jni::sys::{jbyteArray, jint, jlong, jstring};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 use rand_core::OsRng;
 
@@ -257,6 +257,31 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeMyFingerp
             Ok(fingerprint) => new_string(&env, &fingerprint),
             Err(_) => std::ptr::null_mut(),
         }
+    })
+}
+
+/// Dice se il testo *sembra* contenere un nostro blob. Nessuna decifratura,
+/// nessun accesso al keyring, nessun effetto collaterale.
+///
+/// Esiste per la UI: serve a decidere se accendere un indizio o offrire
+/// l'azione "decifra". NON e' una verifica — `true` non dice che il blob sia
+/// integro, ne' che sia per noi.
+///
+/// A differenza di tutte le altre entry, questa NON richiede una sessione
+/// inizializzata: guarda solo la forma del testo. Cosi' la si puo' chiamare
+/// prima di generare l'identita', che e' esattamente quando serve.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeLooksLikeOurBlob(
+    mut env: JNIEnv,
+    _class: JClass,
+    text: JString,
+) -> jboolean {
+    guard(0, || {
+        let testo = match read_string(&mut env, &text) {
+            Ok(testo) => testo,
+            Err(_) => return 0,
+        };
+        u8::from(keyboard_cipher_core::format::looks_like_blob(&testo))
     })
 }
 
