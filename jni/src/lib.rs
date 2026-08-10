@@ -276,6 +276,7 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeExportBac
     passphrase: JByteArray,
 ) -> jbyteArray {
     guard(std::ptr::null_mut(), || {
+        use zeroize::Zeroize;
         let mut pass = match read_bytes(&mut env, &passphrase) {
             Ok(bytes) => bytes,
             Err(_) => return std::ptr::null_mut(),
@@ -291,7 +292,11 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeExportBac
         });
         // La copia della passphrase che vive in questo stack e' nostra: la
         // azzeriamo noi, senza aspettare il chiamante.
-        pass.zeroize();
+        // `as_mut_slice()` e non `pass.zeroize()`: l'impl di Zeroize per Vec
+        // dipende dalla feature `alloc`, quella per gli slice no. Il risultato
+        // e' identico — e resta una scrittura che il compilatore non puo'
+        // eliminare, che e' il motivo per cui non si usa `fill(0)`.
+        pass.as_mut_slice().zeroize();
         match esito {
             Ok(blob) => new_byte_array(&env, &blob),
             Err(_) => std::ptr::null_mut(),
@@ -324,12 +329,17 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeImportBac
             Ok(bytes) => bytes,
             Err(codice) => return codice,
         };
+        use zeroize::Zeroize;
         let mut pass = match read_bytes(&mut env, &passphrase) {
             Ok(bytes) => bytes,
             Err(codice) => return codice,
         };
         let aperto = keyboard_cipher_core::backup::import(&dati, &pass);
-        pass.zeroize();
+        // `as_mut_slice()` e non `pass.zeroize()`: l'impl di Zeroize per Vec
+        // dipende dalla feature `alloc`, quella per gli slice no. Il risultato
+        // e' identico — e resta una scrittura che il compilatore non puo'
+        // eliminare, che e' il motivo per cui non si usa `fill(0)`.
+        pass.as_mut_slice().zeroize();
         let aperto = match aperto {
             Ok(aperto) => aperto,
             Err(error) => return code_of(&error),
