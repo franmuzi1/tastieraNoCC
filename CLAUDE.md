@@ -273,9 +273,20 @@ di qualunque `setContentView`), `noHistory`, `excludeFromRecents`,
 `FLAG_SECURE` il sistema salva su disco uno screenshot del testo decifrato per
 la schermata Recenti.
 
-Nessun permesso nuovo. Il fork non ha `INTERNET` ed e' la sua proprieta'
-principale. Se servira' `CAMERA` per il QR: a runtime, all'apertura dello
-scanner, mai come permesso di installazione.
+**Zero permessi. Decisione chiusa, e vale anche per `CAMERA`.** Il fork non ha
+`INTERNET` ed e' la sua proprieta' principale; non ne acquista altri.
+
+Conseguenza sul QR: **si mostra, non si scansiona.** Generare un codice non
+costa permessi, leggerne uno richiede `CAMERA`, e quel permesso non si prende.
+Non e' un residuo in attesa di essere colmato: e' la scelta.
+
+Il primo contatto di persona resta comunque chiuso, perche' basta che UNO dei
+due scansioni: l'altro inquadra il codice con un lettore QR qualunque, ottiene
+la stringa `kc/...` e la consegna all'app dallo share sheet. Il MITM al primo
+contatto si chiude lo stesso, e la tastiera resta senza permessi.
+
+Se una sessione futura trova comodo aggiungere lo scanner: non e' una svista da
+correggere, e va lasciata stare.
 
 La UI contatti non e' nel launcher: ci si arriva dalle impostazioni della
 tastiera. Un'icona sarebbe un secondo marcatore visibile del sistema e non fa

@@ -2,9 +2,10 @@
   Da unire al manifest del fork HeliBoard, dentro <application>.
 
   Nessun permesso nuovo. Il fork non ha INTERNET ed e' la sua proprieta'
-  principale: non introdurne, per nessun motivo. Se un giorno serve
-  CAMERA per la scansione QR, va aggiunto con richiesta a runtime e
-  disattivabile, mai come permesso di installazione implicito.
+  principale: non introdurne, per nessun motivo.
+
+  Vale anche per CAMERA: il QR si mostra e non si scansiona. Decisione
+  chiusa, non un residuo — vedi CLAUDE.md.
 -->
 
 <!--

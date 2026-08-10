@@ -28,9 +28,10 @@ class ContactsActivity : Activity() {
         //   Il QR di persona e' l'unica cosa che chiude il MITM al primo
         //   contatto, che il TOFU da solo non chiude: va reso facile da
         //   raggiungere, non sepolto.
-        //   La scansione richiede CAMERA. Se lo si aggiunge: permesso a
-        //   runtime, richiesto solo all'apertura dello scanner, mai
-        //   all'installazione. Il fork non deve guadagnare permessi passivi.
+        //   SOLO generazione: la scansione richiede CAMERA e quel permesso
+        //   non si prende. Decisione chiusa. Basta che uno dei due scansioni,
+        //   con un lettore QR qualunque, e consegni la stringa dallo share
+        //   sheet: il primo contatto si chiude lo stesso.
         //
         // TODO: confronto fingerprint -> markVerified.
         //
