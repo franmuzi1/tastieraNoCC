@@ -25,3 +25,6 @@ fuzz/target
 # Il corpus e' rigenerabile e cresce senza limiti; gli artefatti di crash NO:
 # quelli vanno versionati, sono la riproduzione di un bug.
 fuzz/corpus
+
+# Artefatti di build del crate JNI, che ha un workspace suo.
+jni/target/

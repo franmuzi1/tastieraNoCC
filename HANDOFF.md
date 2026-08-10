@@ -31,13 +31,13 @@ a tirare gli aggiornamenti, mai a spingere.
 
 ## Stato: core (`/home/user/tastieraNoCC`)
 
-**Completo, nessun `todo!()` residuo.** 61 test verdi nel core, 6 nel crate JNI,
+**Completo, nessun `todo!()` residuo.** 62 test verdi nel core, 6 nel crate JNI,
 clippy pulito con i lint di `CLAUDE.md` attivi.
 
 | file | righe | stato |
 |---|---|---|
 | `src/encoding.rs` | 302 | z-base-32, decodifica canonica stretta |
-| `src/format.rs` | 921 | sentinel, header, AAD, `parse`, KAT congelati |
+| `src/format.rs` | 944 | sentinel, header, AAD, `parse`, `looks_like_blob`, KAT |
 | `src/keys.rs` | 257 | `Identity`, `PublicKey`, `Fingerprint`, trait `Keyring` |
 | `src/baseline.rs` | 484 | X25519 + HKDF + XChaCha20-Poly1305, `seal`/`open` |
 | `src/api.rs` | 719 | `Session`, `handle_incoming_text`, destinatario per app |
@@ -46,51 +46,55 @@ clippy pulito con i lint di `CLAUDE.md` attivi.
 | `jni/src/keyring.rs` | 306 | keyring concreto + serializzazione persistibile |
 
 `fuzz/` ha tre target (`decode`, `parse`, `roundtrip`); ultima campagna ~136M
-input, nessun crash. Il corpus è in `.gitignore`, gli artefatti di crash no.
+input; ultima verifica ~48M in tre minuti, nessun crash. Il corpus è in
+`.gitignore`, gli artefatti di crash no.
 
-Tutto committato e pushato. Ultimo commit: `cfae0e0`.
+Tutto committato e pushato.
 Unica sporcizia nel working tree: `jni/target/` (artefatti di build, andrebbero
 aggiunti a `.gitignore` — `jni/target/.rustc_info.json` risulta modificato).
 
 ## Stato: fork Android (`/home/user/heliboard`)
 
-Due commit già fatti (`11f4c659`, `a8d0ce2b`): package `helium314.keyboard.cipher`,
-voci di manifest, task Gradle che invoca `cargo ndk` e deposita i `.so` in
-`src/main/jniLibs`.
+Branch `cipher`, remote `origin` = `franmuzi1/tastieraNoCC-app`.
 
-**Non ancora committato** (lavoro dell'ultima parte di sessione):
+**L'integrazione è completa e gira su dispositivo.** Il documento di riferimento
+è `CIPHER.md` nel fork: contiene lo stato punto per punto, la procedura per
+riprendere a freddo, e — soprattutto — le trappole d'ambiente che costano ore.
+Leggilo prima di toccare qualunque cosa lì dentro.
 
-- `CipherIdentity.kt` — ciclo di vita della chiave: generazione pigra,
-  `CipherState` (`Ready`/`Locked`/`Unavailable`/`Unreadable`), `resetIdentity`.
-  Regola centrale: **non rigenera mai l'identità da sola**, perché un guasto
-  locale diventerebbe indistinguibile da un attacco agli occhi dei contatti.
-- `CipherKeystore.kt` — chiave maestra AES in AndroidKeyStore,
-  `setUnlockedDeviceRequired`, `wrap`/`unwrap` con AAD di dominio.
-- `CipherStorage.kt` — i due file sotto `noBackupFilesDir` (non `filesDir`:
-  HeliBoard ha `allowBackup="true"`, e la chiave maestra non è esportabile —
-  un ripristino porterebbe due file illeggibili). Scrittura atomica con fsync.
-- `CipherCore.kt`, `DecryptActivity.kt` modificati.
-- `proguard-rules.pro` — `-keep` su `CipherCore` e `IncomingResult`: R8 non vede
-  nessun lettore Kotlin dei campi scritti da JNI e li rimuoverebbe.
+In sintesi, tutto fatto e verificato: ciclo di vita della chiave (Keystore +
+storage), tasti in toolbar, `DecryptActivity`, clipboard, identity card, UI
+contatti con conflitto di etichetta, esclusione dalla cronologia clipboard, QR.
 
-**Non è mai stato compilato**: manca la toolchain Android in questo ambiente.
-La prima compilazione vera è il prossimo rischio serio.
+Verificato **sul dispositivo** (emulatore API 34): ciclo cifra/decifra completo,
+conflitto di etichetta in tutti e tre gli esiti, percorsi negativi (blob
+corrotto, troncato, versione futura, tier non supportato).
+
+Resta scoperto solo il margine di versione Android: API 23 e API 21–22.
+
+### Tre bug trovati solo eseguendo
+
+Nessuno era visibile rileggendo il codice, e tutti e tre rendevano il sistema
+inutilizzabile o pericoloso per una fetta grande di utenti. Se una sessione
+futura è tentata di rimuovere queste difese, sappia cosa hanno pagato:
+
+1. **`setUnlockedDeviceRequired(true)` fallisce alla *generazione* della chiave**
+   su un dispositivo senza blocco schermo (`User ECDH key missing`). Da qui il
+   terzo tentativo di fallback in `CipherKeystore.generate`.
+2. **Uno schermo bloccato veniva diagnosticato come identità corrotta**, e
+   l'unico rimedio offerto era distruggerla. Da qui `unreadableOrLocked`.
+3. **Decifrare dalla toolbar attribuiva il destinatario alla tastiera stessa**,
+   non all'app di chat: la regola "decifrare stabilisce il destinatario" non
+   scattava mai per la via principale. Da qui l'extra col package dell'editor,
+   onorato solo se a chiamare è la stessa app.
 
 ## Cosa resta da fare
 
-1. Committare i file Kotlin nuovi nel fork.
-2. `jni/target/` in `.gitignore` del core.
-3. Attivare `todo = "deny"` in `[lints.clippy]` (la fase scheletro è finita).
-4. `DecryptActivity`: i `TODO` in cima sono reali e non cosmetici —
-   `onNewIntent` con `launchMode=singleTask` (senza, la seconda decifratura
-   viene ignorata e resta a schermo il plaintext precedente), e i messaggi
-   distinti per ogni `CipherState`.
-5. Prima di abilitare "copia il chiaro": escludere quel contenuto dalla
-   cronologia clipboard del fork, altrimenti il plaintext ci finisce dentro e
-   può essere persistito su disco.
-6. Build reale dell'APK; poi il rischio build riproducibile per F-Droid, mai
-   affrontato.
-7. UI contatti (`ContactsActivity`) è ancora uno scheletro.
+1. `jni/target/` in `.gitignore` del core.
+2. Attivare `todo = "deny"` in `[lints.clippy]` (la fase scheletro è finita).
+3. Provare su API 23 e su API 21–22.
+4. Scanner QR, se si accetta `CAMERA` a runtime. Oggi c'è solo la generazione.
+5. Build riproducibile per F-Droid: mai affrontato.
 
 ## Trappole già pagate — non ripercorrerle
 
