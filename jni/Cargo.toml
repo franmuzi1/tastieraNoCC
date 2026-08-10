@@ -25,6 +25,23 @@ jni = "0.21"
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = { version = "1", features = ["derive"] }
 
+[profile.release]
+# Toglie le informazioni di debug, che sono il grosso di cio' che incorpora
+# percorsi assoluti della macchina di build (`/home/<utente>/.cargo/registry`).
+# Servono a due cose: non regalare la struttura di chi compila, e permettere
+# una build riproducibile — un `.so` che cambia a seconda di dove e' stato
+# costruito non e' verificabile da nessuno.
+#
+# `"debuginfo"` e non `"symbols"`: i simboli dinamici esportati verso la JVM
+# (`Java_helium314_keyboard_cipher_CipherCore_native...`) devono restare, perche'
+# JNI li risolve per nome. Toglierli darebbe un UnsatisfiedLinkError a runtime.
+strip = "debuginfo"
+
+# NON aggiungere `panic = "abort"`, per quanto allettante sulla dimensione:
+# ogni punto d'ingresso JNI e' avvolto in `catch_unwind`, e con l'abort quel
+# meccanismo smette di funzionare. Un panic diventerebbe la morte del processo
+# — cioe' della tastiera — invece di un codice d'errore restituito alla JVM.
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
