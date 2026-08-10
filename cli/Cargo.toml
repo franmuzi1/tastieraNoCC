@@ -17,6 +17,10 @@ rust-version = "1.75"
 description = "Riga di comando per provare keyboard-cipher da PC: seconda identita', cifra e decifra"
 publish = false
 
+[lib]
+name = "keyboard_cipher_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "kc"
 path = "src/main.rs"

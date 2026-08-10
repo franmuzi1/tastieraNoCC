@@ -1,0 +1,27 @@
+# Crate separato, come `jni/` e `cli/`, e per lo stesso motivo: il core non fa
+# I/O ne' interfaccia. Qui invece c'e' una finestra, il disco e gli appunti.
+#
+# Perche' egui/eframe e non un toolkit di sistema: un binario solo, senza nulla
+# da installare, e lo stesso codice su Debian e su Windows. Soprattutto resta
+# Rust, quindi linka il core direttamente — nessun ponte, nessuna seconda
+# implementazione del formato, che in un progetto di crittografia e' la cosa
+# che conta piu' di tutte.
+[workspace]
+
+[package]
+name = "keyboard-cipher-gui"
+version = "0.1.0"
+edition = "2021"
+description = "App da scrivania per cifrare e decifrare i messaggi della tastiera"
+publish = false
+
+[[bin]]
+name = "keyboard-cipher"
+path = "src/main.rs"
+
+[dependencies]
+keyboard-cipher-core = { path = ".." }
+keyboard-cipher-cli = { path = "../cli" }
+eframe = "0.29"
+# OsRng: l'entropia viene dall'OS, mai da un PRNG seedato in-app.
+rand_core = { version = "0.6", features = ["getrandom"] }

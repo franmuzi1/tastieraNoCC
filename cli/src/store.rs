@@ -40,6 +40,12 @@ pub fn state_path() -> PathBuf {
     if let Ok(dir) = std::env::var("KC_HOME") {
         return PathBuf::from(dir).join("state");
     }
+    // Windows non ha XDG ne' HOME: senza questo il file finirebbe nella
+    // directory corrente, cioe' in un posto diverso a seconda di da dove si
+    // avvia il programma — e l'identita' sembrerebbe sparita.
+    if let Ok(dir) = std::env::var("APPDATA") {
+        return PathBuf::from(dir).join("keyboard-cipher").join("state");
+    }
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
