@@ -592,6 +592,30 @@ impl<K: Keyring> Session<K> {
         let ParsedBlob::Message(parsed) = format::parse(text, &mut buf)? else {
             return Err(Error::Format("non e' un messaggio"));
         };
+        if parsed.header.origin.uses_prekey() {
+            // Le chiavi ancora vive si possono usare: sono nostre e le abbiamo
+            // gia'. Cade solo cio' che la catena ha gia' buttato, che e'
+            // esattamente la proprieta' — non un limite da aggirare.
+            //
+            // **Non fa avanzare la catena.** Leggere un archivio non e'
+            // ricevere un messaggio: se buttasse le chiavi vecchie, aprire una
+            // vecchia conversazione ucciderebbe i messaggi ancora in viaggio, e
+            // fissare la prossima chiave del mittente da un file lascerebbe a
+            // chiunque ci mandi un'esportazione il modo di dirottare la
+            // conversazione successiva.
+            let mio = self.identity.public();
+            for candidato in self.keyring.peers()? {
+                for segreto in self.keyring.my_prekeys(&candidato)? {
+                    let prekey = keys::EphemeralSecret::from_bytes(segreto);
+                    if let Ok((_, plaintext)) =
+                        baseline::open_forward(&prekey, &candidato, &mio, &parsed)
+                    {
+                        return Ok((candidato, plaintext));
+                    }
+                }
+            }
+            return Err(Error::Crypto);
+        }
         if parsed.header.origin.is_ephemeral() {
             let (mittente, _, plaintext) = self.prova_i_contatti(&parsed)?;
             return Ok((mittente, plaintext));
@@ -1100,6 +1124,45 @@ mod tests {
             format::serialize_message(&parsed.header, parsed.ciphertext)
         };
         assert!(bob.handle_incoming_text(WHATSAPP, &come_messaggio, 11).is_err());
+    }
+
+    /// Leggere un archivio non deve far avanzare la catena: se lo facesse,
+    /// aprire una conversazione vecchia ucciderebbe i messaggi ancora in
+    /// viaggio, e una esportazione ricevuta da chiunque potrebbe dirottare la
+    /// conversazione successiva.
+    #[test]
+    fn leggere_un_archivio_non_muove_la_catena() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity().public();
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+        bob.set_current_peer(WHATSAPP, &chiave_alice).unwrap();
+
+        let uno = alice
+            .encrypt_for_app_with(WHATSAPP, b"primo", 10, &mut rng(9), true)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &uno, 11).unwrap();
+        let due = bob
+            .encrypt_for_app_with(WHATSAPP, b"secondo", 12, &mut rng(8), true)
+            .unwrap();
+        alice.handle_incoming_text(WHATSAPP, &due, 13).unwrap();
+        let tre = alice
+            .encrypt_for_app_with(WHATSAPP, b"terzo", 14, &mut rng(7), true)
+            .unwrap();
+
+        // Bob non l'ha ancora letto: la chiave c'e' ancora, quindi l'archivio
+        // lo apre.
+        let prima = bob.keyring.my_prekeys(&chiave_alice).unwrap();
+        let (chi, testo) = bob.open_archived(&tre).unwrap();
+        assert_eq!(chi, chiave_alice);
+        assert_eq!(testo.as_bytes(), b"terzo");
+
+        // E dopo averlo letto dall'archivio, niente e' cambiato.
+        assert_eq!(bob.keyring.my_prekeys(&chiave_alice).unwrap(), prima);
+        assert!(bob.handle_incoming_text(WHATSAPP, &tre, 15).is_ok());
     }
 
     /// **Il prezzo accettato:** quando la catena avanza, i messaggi vecchi non
