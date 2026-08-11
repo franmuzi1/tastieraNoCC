@@ -94,6 +94,17 @@ pub struct IncomingFile {
 /// Cosa e' risultato essere il testo in arrivo.
 pub enum IncomingItem {
     Message(DecryptedMessage),
+    /// Un messaggio **nostro**, riaperto. Capita ricopiando cio' che si e'
+    /// appena mandato, ed e' un caso da presentare come tale: qui non c'e' un
+    /// mittente da mostrare, c'e' un destinatario.
+    ///
+    /// Esiste solo senza forward secrecy. Con la catena accesa la chiave non
+    /// esiste piu' e non c'e' niente da riaprire — per nessuno.
+    OwnMessage {
+        recipient: PublicKey,
+        recipient_label: Option<String>,
+        plaintext: Plaintext,
+    },
     /// Una presentazione: nessun messaggio da mostrare, solo una chiave da
     /// fissare. La UI mostra il fingerprint e l'esito del pin.
     IdentityCard {
@@ -201,6 +212,15 @@ impl<K: Keyring> Session<K> {
                     .sender_pub()
                     .cloned()
                     .ok_or(Error::Format("messaggio senza pubkey del mittente"))?;
+
+                // L'abbiamo scritto noi: si riapre provando i nostri contatti
+                // come DESTINATARI, che e' l'unica cosa che l'header non dice.
+                // Si riconosce da un campo in chiaro, prima di tentare
+                // qualunque decifratura, quindi non e' una deduzione da un
+                // fallimento AEAD e non intacca l'opacita' di `Crypto`.
+                if sender == self.identity.public() {
+                    return self.riapri_un_mio_messaggio(app_package, &parsed);
+                }
 
                 // ORDINE CRITICO: si decifra PRIMA di toccare il keyring.
                 //
@@ -469,6 +489,40 @@ impl<K: Keyring> Session<K> {
         })
     }
 
+    /// Riapre un messaggio nostro provando i contatti come destinatari.
+    ///
+    /// **Non tocca il pin e non fissa niente:** il mittente siamo noi, non c'e'
+    /// nessuna chiave nuova da fissare. Sposta pero' il destinatario corrente
+    /// dell'app, ed e' la stessa regola di sempre — chi rilegge cio' che ha
+    /// mandato a Marco sta guardando la conversazione con Marco.
+    ///
+    /// Fallendo tutti, [`Error::OwnMessage`]: sappiamo che e' nostro perche'
+    /// c'e' scritto, ma il destinatario non e' piu' fra i contatti — succede se
+    /// e' stato dimenticato.
+    fn riapri_un_mio_messaggio(
+        &mut self,
+        app_package: &str,
+        parsed: &crate::format::ParsedEnvelope<'_>,
+    ) -> Result<IncomingItem> {
+        for candidato in self.keyring.peers()? {
+            let Ok(plaintext) = baseline::open_as_sender(&self.identity, &candidato, parsed) else {
+                continue;
+            };
+            let recipient_label = self
+                .keyring
+                .get(&candidato)?
+                .and_then(|record| record.label);
+            self.current_peer
+                .insert(app_package.to_owned(), candidato.clone());
+            return Ok(IncomingItem::OwnMessage {
+                recipient: candidato,
+                recipient_label,
+                plaintext,
+            });
+        }
+        Err(Error::OwnMessage)
+    }
+
     /// [`Self::prova_i_contatti`] per gli allegati.
     fn prova_i_contatti_sul_file(
         &self,
@@ -625,6 +679,21 @@ impl<K: Keyring> Session<K> {
             .sender_pub()
             .cloned()
             .ok_or(Error::Format("messaggio senza pubkey del mittente"))?;
+        // In un'esportazione di chat meta' dei messaggi sono NOSTRI. Senza
+        // questo ramo, "ricostruisci" mostrerebbe solo cio' che abbiamo
+        // ricevuto e lascerebbe chiuso tutto quello che abbiamo scritto — che
+        // e' meta' della conversazione, e la meta' che l'utente sa gia' di
+        // poter leggere.
+        if sender == self.identity.public() {
+            for candidato in self.keyring.peers()? {
+                if let Ok(plaintext) =
+                    baseline::open_as_sender(&self.identity, &candidato, &parsed)
+                {
+                    return Ok((candidato, plaintext));
+                }
+            }
+            return Err(Error::OwnMessage);
+        }
         let plaintext = baseline::open(&self.identity, &sender, &parsed)?;
         Ok((sender, plaintext))
     }
@@ -1124,6 +1193,66 @@ mod tests {
             format::serialize_message(&parsed.header, parsed.ciphertext)
         };
         assert!(bob.handle_incoming_text(WHATSAPP, &come_messaggio, 11).is_err());
+    }
+
+    /// Ricopiare un proprio messaggio gia' mandato capita, e non deve
+    /// somigliare a un guasto.
+    #[test]
+    fn un_mio_messaggio_si_riapre_solo_senza_catena() {
+        let mut alice = sessione(1);
+        let bob = sessione(2);
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+
+        // Senza forward secrecy si riapre: il segreto ECDH e' simmetrico, e
+        // il destinatario si trova provando i contatti.
+        let mio = alice
+            .encrypt_for_app_with(WHATSAPP, b"ciao", 10, &mut rng(9), false)
+            .unwrap();
+        let letto = alice.handle_incoming_text(WHATSAPP, &mio, 11).unwrap();
+        let IncomingItem::OwnMessage {
+            recipient,
+            plaintext,
+            ..
+        } = letto
+        else {
+            panic!("doveva essere un messaggio nostro")
+        };
+        assert_eq!(recipient, chiave_bob);
+        assert_eq!(plaintext.as_bytes(), b"ciao");
+
+        // Con la forward secrecy la nostra chiave NON c'e', per costruzione:
+        // resta un fallimento opaco, ed e' giusto cosi'. Se un giorno questo
+        // test cominciasse a dare OwnMessage, vorrebbe dire che l'identita' del
+        // mittente e' tornata visibile nell'header.
+        let effimero = alice
+            .encrypt_for_app_with(WHATSAPP, b"ciao", 12, &mut rng(8), true)
+            .unwrap();
+        assert!(matches!(
+            alice.handle_incoming_text(WHATSAPP, &effimero, 13),
+            Err(Error::Crypto)
+        ));
+    }
+
+    /// Meta' di una chat esportata l'abbiamo scritta noi: se restasse chiusa,
+    /// "ricostruisci" mostrerebbe una conversazione a senso unico.
+    #[test]
+    fn l_archivio_riapre_anche_i_miei_messaggi() {
+        let mut alice = sessione(1);
+        let bob = sessione(2);
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+
+        let mio = alice
+            .encrypt_for_app_with(WHATSAPP, b"scritto da me", 10, &mut rng(9), false)
+            .unwrap();
+        let (chi, testo) = alice.open_archived(&mio).unwrap();
+        // Il "chi" e' il destinatario: in una conversazione a due e' cio' che
+        // serve a mettere il messaggio nella colonna giusta.
+        assert_eq!(chi, chiave_bob);
+        assert_eq!(testo.as_bytes(), b"scritto da me");
     }
 
     /// Leggere un archivio non deve far avanzare la catena: se lo facesse,

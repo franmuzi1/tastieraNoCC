@@ -33,6 +33,20 @@ pub enum Error {
     #[error("tier non supportato dalla build corrente")]
     TierUnsupported,
 
+    /// Il blob dichiara come mittente la NOSTRA chiave: e' un messaggio che
+    /// abbiamo scritto noi, e solo il destinatario puo' aprirlo.
+    ///
+    /// **Non viola l'opacita' di [`Error::Crypto`]**, e la distinzione va fatta
+    /// prima di tentare la decifratura, non dopo: si guarda un campo in chiaro
+    /// dell'header, che chiunque legge comunque. Chi fabbricasse un blob con la
+    /// nostra pubkey dentro non imparerebbe nulla che non ci abbia messo lui.
+    ///
+    /// Esiste perche' il caso capita davvero — si manda un messaggio e poi lo
+    /// si ricopia — e presentarlo come fallimento crypto fa sembrare guasto
+    /// cio' che e' il funzionamento previsto.
+    #[error("questo messaggio l'hai scritto tu: puo' aprirlo solo il destinatario")]
+    OwnMessage,
+
     /// L'implementazione di [`crate::keys::Keyring`] sta fuori dal core (storage
     /// cifrato lato Android): i suoi fallimenti risalgono qui senza dettagli.
     #[error("errore del keyring")]

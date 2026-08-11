@@ -62,12 +62,18 @@ mod code {
     pub const KEYRING: jint = 8;
     /// Sessione non inizializzata, errore JNI, o panic intercettato.
     pub const INTERNAL: jint = 9;
+    /// L'abbiamo scritto noi: puo' aprirlo solo il destinatario. Esito
+    /// NORMALE, non un guasto — capita ricopiando un proprio messaggio.
+    pub const OWN_MESSAGE: jint = 10;
 
     /// Esiti di `handleIncomingText`, quando il codice e' OK.
     pub const ITEM_MESSAGE: jint = 0;
     pub const ITEM_IDENTITY_CARD: jint = 1;
     /// Allegato cifrato. Vedi `nativeDecryptFile`.
     pub const ITEM_FILE: jint = 2;
+    /// Un messaggio nostro, riaperto. `senderKey` e l'etichetta sono quelli
+    /// del DESTINATARIO: qui non c'e' un mittente da mostrare.
+    pub const ITEM_OWN_MESSAGE: jint = 3;
 
     /// Esiti di `assignLabel`.
     pub const LABEL_ASSIGNED: jint = 0;
@@ -84,6 +90,7 @@ fn code_of(error: &Error) -> jint {
         Error::Crypto => code::CRYPTO,
         Error::UnknownPeer => code::UNKNOWN_PEER,
         Error::TierUnsupported => code::TIER_UNSUPPORTED,
+        Error::OwnMessage => code::OWN_MESSAGE,
         Error::Keyring => code::KEYRING,
     }
 }
@@ -758,6 +765,58 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
                 }
                 // Il plaintext esce come byte[]: mai String.
                 let Ok(array) = env.byte_array_from_slice(message.plaintext.as_bytes()) else {
+                    return code::INTERNAL;
+                };
+                if env
+                    .set_field(&result, "plaintext", "[B", (&array).into())
+                    .is_err()
+                {
+                    return code::INTERNAL;
+                }
+                code::OK
+            }
+            IncomingItem::OwnMessage {
+                recipient,
+                recipient_label,
+                plaintext,
+            } => {
+                // Si riempiono gli stessi campi di un messaggio, ma il peer e'
+                // il destinatario. Un campo in piu' significherebbe due modi di
+                // dire "l'altra persona" nello stesso oggetto, ed e' il
+                // chiamante a sapere gia' dal `kind` come presentarlo.
+                if !set_int("kind", code::ITEM_OWN_MESSAGE) || !set_int("verified", 0) {
+                    return code::INTERNAL;
+                }
+                let fingerprint = keyboard_cipher_core::keys::Fingerprint::of(&recipient);
+                if !fill_strings(
+                    &mut env,
+                    &result,
+                    &fingerprint.display(),
+                    recipient_label.as_deref(),
+                ) {
+                    return code::INTERNAL;
+                }
+                if env
+                    .set_field(
+                        &result,
+                        "sentAtUnix",
+                        "J",
+                        jni::objects::JValue::Long(plaintext.sent_at_unix()),
+                    )
+                    .is_err()
+                {
+                    return code::INTERNAL;
+                }
+                let Ok(chiave) = env.byte_array_from_slice(recipient.as_bytes()) else {
+                    return code::INTERNAL;
+                };
+                if env
+                    .set_field(&result, "senderKey", "[B", (&chiave).into())
+                    .is_err()
+                {
+                    return code::INTERNAL;
+                }
+                let Ok(array) = env.byte_array_from_slice(plaintext.as_bytes()) else {
                     return code::INTERNAL;
                 };
                 if env

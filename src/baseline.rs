@@ -616,6 +616,52 @@ pub fn open_file(
     open_inner(Kind::File, recipient, sender_pub, parsed)
 }
 
+/// Riapre un messaggio **che abbiamo scritto noi**, provando `recipient` come
+/// destinatario.
+///
+/// Funziona perche' il segreto ECDH e' simmetrico: chi cifra ha la propria
+/// privata e la pubblica dell'altro, cioe' esattamente cio' che serve a rifare
+/// la stessa chiave. Non e' una scorciatoia e non indebolisce niente — chi ha
+/// la nostra privata puo' farlo comunque, ed e' precisamente la proprieta' che
+/// la forward secrecy spenta non promette.
+///
+/// **Vale solo senza forward secrecy.** Con la catena accesa la chiave
+/// usa-e-getta e' stata distrutta subito dopo aver cifrato, e questo non ha
+/// nessun equivalente: e' il senso dell'interruttore.
+///
+/// Chi era il destinatario non e' scritto da nessuna parte, quindi il chiamante
+/// prova i propri contatti — come fa gia' per i mittenti effimeri.
+pub fn open_as_sender(
+    sender: &Identity,
+    recipient: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<Plaintext> {
+    if parsed.header.tier != Tier::Baseline {
+        return Err(Error::TierUnsupported);
+    }
+    if parsed.ciphertext.len() < TAG_LEN {
+        return Err(Error::Crypto);
+    }
+
+    let aad = format::build_aad(Kind::Message, &parsed.header);
+    let shared = sender.diffie_hellman(recipient)?;
+    let key = derive_key(&shared, &parsed.header.nonce, &aad, recipient)?;
+
+    let inner = Zeroizing::new(
+        XChaCha20Poly1305::new((&*key).into())
+            .decrypt(
+                XNonce::from_slice(&parsed.header.nonce),
+                Payload {
+                    msg: parsed.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::Crypto)?,
+    );
+
+    stacca_timestamp(&inner)
+}
+
 fn open_inner(
     kind: Kind,
     recipient: &Identity,
