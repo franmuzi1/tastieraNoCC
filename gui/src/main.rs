@@ -89,6 +89,8 @@ struct App {
 
     /// Guardare gli appunti per accorgersi dei messaggi copiati altrove.
     sorveglia_appunti: bool,
+    /// Tenere la finestra sopra le altre: per leggere senza uscire dalla chat.
+    sempre_sopra: bool,
     appunti: Option<arboard::Clipboard>,
     /// L'ultimo contenuto gia' esaminato, per non rifare il lavoro a ogni giro.
     ultimo_appunto: String,
@@ -128,6 +130,7 @@ impl App {
             conflitto: None,
             da_dimenticare: None,
             sorveglia_appunti: true,
+            sempre_sopra: false,
             appunti: arboard::Clipboard::new().ok(),
             ultimo_appunto: String::new(),
         };
@@ -422,7 +425,7 @@ impl App {
     /// resta niente. E' comunque una lettura degli appunti mentre l'app e'
     /// aperta, quindi si puo' spegnere — la casella e' li' accanto, non
     /// sepolta in un menu.
-    fn guarda_appunti(&mut self) {
+    fn guarda_appunti(&mut self, ctx: &egui::Context) {
         if !self.sorveglia_appunti {
             return;
         }
@@ -438,12 +441,27 @@ impl App {
         self.incollato = testo;
         self.scheda = Scheda::Leggi;
         self.decifra();
+        // La finestra si porta davanti da sola: chi ha appena copiato sta
+        // guardando la chat, non questa app, e un messaggio decifrato dentro
+        // una finestra coperta non l'ha letto nessuno.
+        //
+        // Si porta davanti e basta: il chiaro **non** torna negli appunti e non
+        // finisce nel campo dell'app di chat. Quel campo appartiene all'app —
+        // scriverci il messaggio in chiaro significherebbe consegnarglielo, che
+        // e' esattamente cio' che questo sistema esiste per non fare, e
+        // basterebbe un invio distratto per rispedirlo a tutti in chiaro.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.guarda_appunti();
+        self.guarda_appunti(ctx);
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.sempre_sopra {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        }));
         // Senza questo l'app si ridisegna solo quando la tocchi, e degli
         // appunti si accorgerebbe soltanto al primo movimento del mouse.
         ctx.request_repaint_after(std::time::Duration::from_millis(700));
@@ -570,6 +588,13 @@ impl App {
              messaggi di questa tastiera. Tutto il resto viene scartato senza \
              essere salvato.",
         );
+        ui.checkbox(&mut self.sempre_sopra, "Tieni la finestra sopra le altre")
+            .on_hover_text(
+                "Per leggere senza uscire dalla chat. Il messaggio decifrato \
+                 resta qui: non torna negli appunti e non entra nel campo di \
+                 scrittura dell'app, dove un invio distratto lo rispedirebbe in \
+                 chiaro.",
+            );
         if let Some(letto) = &self.letto {
             ui.add_space(12.0);
             ui.separator();
