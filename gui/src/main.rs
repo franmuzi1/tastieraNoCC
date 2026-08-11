@@ -86,6 +86,12 @@ struct App {
     conflitto: Option<Conflitto>,
     /// Contatto che si sta per dimenticare, in attesa di conferma.
     da_dimenticare: Option<usize>,
+
+    /// Guardare gli appunti per accorgersi dei messaggi copiati altrove.
+    sorveglia_appunti: bool,
+    appunti: Option<arboard::Clipboard>,
+    /// L'ultimo contenuto gia' esaminato, per non rifare il lavoro a ogni giro.
+    ultimo_appunto: String,
 }
 
 struct Letto {
@@ -121,6 +127,9 @@ impl App {
             nuovo_nome: String::new(),
             conflitto: None,
             da_dimenticare: None,
+            sorveglia_appunti: true,
+            appunti: arboard::Clipboard::new().ok(),
+            ultimo_appunto: String::new(),
         };
         app.ricarica();
         app
@@ -401,8 +410,43 @@ impl App {
     }
 }
 
+impl App {
+    /// Guarda negli appunti se e' comparso un nostro messaggio.
+    ///
+    /// Toglie l'ultimo passaggio a mano: copi il messaggio da Telegram e
+    /// l'app lo ha gia' aperto, senza che tu debba tornare qui e incollare.
+    ///
+    /// **Cosa guarda e cosa no.** Cerca solo il sentinel. Tutto il resto viene
+    /// scartato senza essere letto oltre, senza essere salvato e senza uscire
+    /// da questa funzione: se copi una password, qui non succede niente e non
+    /// resta niente. E' comunque una lettura degli appunti mentre l'app e'
+    /// aperta, quindi si puo' spegnere — la casella e' li' accanto, non
+    /// sepolta in un menu.
+    fn guarda_appunti(&mut self) {
+        if !self.sorveglia_appunti {
+            return;
+        }
+        let Some(appunti) = self.appunti.as_mut() else { return };
+        let Ok(testo) = appunti.get_text() else { return };
+        if testo == self.ultimo_appunto {
+            return;
+        }
+        self.ultimo_appunto = testo.clone();
+        if !testo.contains(SENTINEL) {
+            return;
+        }
+        self.incollato = testo;
+        self.scheda = Scheda::Leggi;
+        self.decifra();
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.guarda_appunti();
+        // Senza questo l'app si ridisegna solo quando la tocchi, e degli
+        // appunti si accorgerebbe soltanto al primo movimento del mouse.
+        ctx.request_repaint_after(std::time::Duration::from_millis(700));
         egui::TopBottomPanel::top("intestazione").show(ctx, |ui| {
             ui.add_space(8.0);
             match self.identita.clone() {
@@ -516,6 +560,16 @@ impl App {
         if ui.button("Decifra").clicked() {
             self.decifra();
         }
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut self.sorveglia_appunti,
+            "Apri da solo i messaggi che copio",
+        )
+        .on_hover_text(
+            "Guarda negli appunti mentre l'app e' aperta, e cerca soltanto i \
+             messaggi di questa tastiera. Tutto il resto viene scartato senza \
+             essere salvato.",
+        );
         if let Some(letto) = &self.letto {
             ui.add_space(12.0);
             ui.separator();

@@ -18,6 +18,7 @@ mod store;
 use std::io::Read;
 
 use keyboard_cipher_core::api::{IncomingItem, SenderStatus, Session};
+use keyboard_cipher_core::file::FileMeta;
 use keyboard_cipher_core::keys::{Fingerprint, LabelOutcome, PinOutcome, PublicKey};
 use rand_core::{OsRng, RngCore};
 use store::{FileKeyring, State};
@@ -48,6 +49,8 @@ fn run() -> Result<(), String> {
         "verify" => cmd_verify(rest),
         "encrypt" => cmd_encrypt(rest),
         "decrypt" => cmd_decrypt(rest),
+        "sealfile" => cmd_sealfile(rest),
+        "openfile" => cmd_openfile(rest),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             Ok(())
@@ -67,6 +70,8 @@ kc — l'altra parte di keyboard-cipher, per provare la tastiera da soli.
   kc verify <chi>          segna il fingerprint come confrontato di persona
   kc encrypt --to <chi> [testo]   cifra (se manca il testo, legge da stdin)
   kc decrypt [blob]        decifra un messaggio o fissa una presentazione
+  kc sealfile --to <chi> <file>    cifra un file, scrive <file>.kc
+  kc openfile <file.kc> [dove]     apre un allegato cifrato
 
 <chi> e' un nome, un indice di `kc contacts`, o l'inizio di un fingerprint.
 
@@ -300,6 +305,105 @@ fn cmd_decrypt(args: &[String]) -> Result<(), String> {
             println!("\nConfronta il codice di persona, poi dagli un nome con `kc name`.");
         }
     }
+    Ok(())
+}
+
+/// Cifra un file. Il risultato e' **binario**, non testo: z-base-32 gonfierebbe
+/// di 1,6x una cosa che va allegata e non incollata.
+///
+/// Nome e tipo del file finiscono **dentro** il cifrato; fuori resta un nome
+/// neutro. Se il nome viaggiasse in chiaro, l'allegato si chiamerebbe
+/// `compleanno-di-marco.jpg.kc` e racconterebbe da solo quasi tutto.
+fn cmd_sealfile(args: &[String]) -> Result<(), String> {
+    let mut who: Option<&str> = None;
+    let mut percorso: Option<&str> = None;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        match arg.as_str() {
+            "--to" | "-t" => {
+                who = args.get(i.saturating_add(1)).map(String::as_str);
+                i = i.saturating_add(2);
+            }
+            altro => {
+                percorso = Some(altro);
+                i = i.saturating_add(1);
+            }
+        }
+    }
+    let who = who.ok_or("manca --to <chi>. Vedi `kc help`.")?;
+    let percorso = percorso.ok_or("manca il file da cifrare.")?;
+    let contenuto = std::fs::read(percorso).map_err(|e| format!("{percorso}: {e}"))?;
+
+    let state = load()?;
+    let peer = resolve(&state.keyring, who)?;
+    let nome = std::path::Path::new(percorso)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "allegato".to_owned());
+    let meta = FileMeta {
+        name: nome,
+        // Il tipo si dichiara, non si indovina: qui non c'e' una tabella dei
+        // tipi e inventarne una sarebbe peggio che dire "non lo so".
+        mime: "application/octet-stream".to_owned(),
+    };
+    let session = Session::new(state.identity, state.keyring);
+    let blob = session
+        .encrypt_file(&peer, &meta, &contenuto, now_unix(), &mut OsRng)
+        .map_err(|e| format!("{e}"))?;
+
+    let uscita = format!("{percorso}.kc");
+    std::fs::write(&uscita, &blob).map_err(|e| format!("{uscita}: {e}"))?;
+    println!("{uscita} ({} byte)", blob.len());
+    Ok(())
+}
+
+/// Apre un allegato cifrato. Senza `dove`, scrive accanto al file con il nome
+/// originale, che sta dentro il cifrato.
+fn cmd_openfile(args: &[String]) -> Result<(), String> {
+    let percorso = args.first().ok_or("manca il file da aprire.")?;
+    let blob = std::fs::read(percorso).map_err(|e| format!("{percorso}: {e}"))?;
+    let state = load()?;
+    let secret = state.secret_bytes();
+    let mut session = Session::new(state.identity, state.keyring);
+    let incoming = session
+        .handle_incoming_file(&blob, now_unix())
+        .map_err(|e| format!("{e}"))?;
+
+    let chi = match &incoming.sender_status {
+        SenderStatus::New => "mittente mai visto, ora fissato".to_owned(),
+        SenderStatus::Known { label, verified } => {
+            let nome = label.clone().unwrap_or_else(|| "(senza nome)".to_owned());
+            if *verified { format!("{nome} ✓") } else { nome }
+        }
+    };
+    persist(&secret, &session)?;
+
+    // Il nome arriva da chi ha mandato il file: autenticato, non credibile.
+    // Si tiene solo l'ultimo segmento, cosi' un nome con `../` o un separatore
+    // non puo' scrivere fuori dalla cartella scelta.
+    let nome_pulito = incoming
+        .file
+        .meta
+        .name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("allegato")
+        .to_owned();
+    let destinazione = match args.get(1) {
+        Some(dove) => std::path::PathBuf::from(dove),
+        None => std::path::Path::new(percorso)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(&nome_pulito),
+    };
+    std::fs::write(&destinazione, &incoming.file.content)
+        .map_err(|e| format!("{}: {e}", destinazione.display()))?;
+
+    println!("da:       {chi}");
+    println!("chiave:   {}", Fingerprint::of(&incoming.sender).display());
+    println!("scritto:  {} (secondo il mittente)", format_unix(incoming.file.sent_at_unix));
+    println!("nome:     {} ({})", incoming.file.meta.name, incoming.file.meta.mime);
+    println!("salvato:  {}", destinazione.display());
     Ok(())
 }
 

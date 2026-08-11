@@ -23,5 +23,8 @@ path = "src/main.rs"
 keyboard-cipher-core = { path = ".." }
 keyboard-cipher-cli = { path = "../cli" }
 eframe = "0.29"
+# Lettura degli appunti di sistema. eframe espone solo l'incolla dell'utente,
+# e qui serve accorgersi di cio' che e' stato copiato altrove.
+arboard = "3"
 # OsRng: l'entropia viene dall'OS, mai da un PRNG seedato in-app.
 rand_core = { version = "0.6", features = ["getrandom"] }
