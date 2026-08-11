@@ -193,6 +193,7 @@ fn seal_inner<R: RngCore + CryptoRng>(
 pub fn seal_ephemeral<R: RngCore + CryptoRng>(
     sender: &Identity,
     recipient: &PublicKey,
+    mia_prekey: &PublicKey,
     plaintext: &[u8],
     now_unix: i64,
     rng: &mut R,
@@ -215,10 +216,18 @@ pub fn seal_ephemeral<R: RngCore + CryptoRng>(
         recipient,
     )?;
 
+    // La prekey viaggia anche qui, ed e' cio' che fa **partire** la catena:
+    // senza, chi riceve non avrebbe mai una nostra chiave temporanea da usare,
+    // e la forward secrecy piena non comincerebbe mai. Sta dentro il cifrato
+    // perche' va autenticata: in chiaro, chiunque potrebbe sostituirla e
+    // dirottare tutta la conversazione successiva.
     let mut inner = Zeroizing::new(Vec::with_capacity(
-        TIMESTAMP_LEN.saturating_add(plaintext.len()),
+        TIMESTAMP_LEN
+            .saturating_add(KEY_LEN)
+            .saturating_add(plaintext.len()),
     ));
     inner.extend_from_slice(&now_unix.to_le_bytes());
+    inner.extend_from_slice(mia_prekey.as_bytes());
     inner.extend_from_slice(plaintext);
 
     let ciphertext = XChaCha20Poly1305::new((&*key).into())
@@ -245,7 +254,7 @@ pub fn open_ephemeral(
     recipient: &Identity,
     candidato: &PublicKey,
     parsed: &ParsedEnvelope<'_>,
-) -> Result<Plaintext> {
+) -> Result<(PublicKey, Plaintext)> {
     if parsed.header.tier != Tier::Baseline {
         return Err(Error::TierUnsupported);
     }
@@ -265,16 +274,34 @@ pub fn open_ephemeral(
         &recipient.public(),
     )?;
 
-    let aperto = XChaCha20Poly1305::new((&*key).into())
-        .decrypt(
-            XNonce::from_slice(&parsed.header.nonce),
-            Payload {
-                msg: parsed.ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| Error::Crypto)?;
-    stacca_timestamp(&aperto)
+    let aperto = Zeroizing::new(
+        XChaCha20Poly1305::new((&*key).into())
+            .decrypt(
+                XNonce::from_slice(&parsed.header.nonce),
+                Payload {
+                    msg: parsed.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::Crypto)?,
+    );
+    stacca_prekey(&aperto)
+}
+
+/// Separa timestamp, prekey del mittente e testo.
+fn stacca_prekey(aperto: &[u8]) -> Result<(PublicKey, Plaintext)> {
+    let inizio = TIMESTAMP_LEN;
+    let fine = inizio.saturating_add(KEY_LEN);
+    let chiave = aperto
+        .get(inizio..fine)
+        .ok_or(Error::Format("plaintext senza prekey: mittente malformato"))?;
+    let mut bytes = [0u8; KEY_LEN];
+    bytes.copy_from_slice(chiave);
+
+    let mut senza = Zeroizing::new(Vec::with_capacity(aperto.len()));
+    senza.extend_from_slice(aperto.get(..inizio).unwrap_or(&[]));
+    senza.extend_from_slice(aperto.get(fine..).unwrap_or(&[]));
+    Ok((PublicKey::from_bytes(bytes), stacca_timestamp(&senza)?))
 }
 
 /// Cifra con **forward secrecy piena**: effimera del mittente e chiave
@@ -390,19 +417,7 @@ pub fn open_forward(
     // Timestamp, poi la prekey del mittente, poi il testo. Tutto autenticato:
     // se qui manca qualcosa e' il mittente ad aver prodotto un plaintext
     // malformato, non un attacco.
-    let inizio = TIMESTAMP_LEN;
-    let fine = inizio.saturating_add(KEY_LEN);
-    let chiave = aperto
-        .get(inizio..fine)
-        .ok_or(Error::Format("plaintext senza prekey: mittente malformato"))?;
-    let mut bytes = [0u8; KEY_LEN];
-    bytes.copy_from_slice(chiave);
-    let prossima = PublicKey::from_bytes(bytes);
-
-    let mut senza_prekey = Zeroizing::new(Vec::with_capacity(aperto.len()));
-    senza_prekey.extend_from_slice(aperto.get(..inizio).unwrap_or(&[]));
-    senza_prekey.extend_from_slice(aperto.get(fine..).unwrap_or(&[]));
-    Ok((prossima, stacca_timestamp(&senza_prekey)?))
+    stacca_prekey(&aperto)
 }
 
 /// Come [`derive_key`], ma il materiale iniziale sono i due segreti in fila.
@@ -662,15 +677,20 @@ mod tests {
         let alice = identita(1);
         let bob = identita(2);
         let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
-        let blob = seal_ephemeral(&alice, &bob.public(), b"ciao", 99, &mut rng).unwrap();
+        let mia = prekey(4);
+        let blob =
+            seal_ephemeral(&alice, &bob.public(), &mia.public(), b"ciao", 99, &mut rng).unwrap();
 
         let mut buf = Vec::new();
         let ParsedBlob::Message(parsed) = format::parse(&blob, &mut buf).unwrap() else {
             panic!("doveva essere un messaggio");
         };
-        let aperto = open_ephemeral(&bob, &alice.public(), &parsed).unwrap();
+        let (prekey_ricevuta, aperto) = open_ephemeral(&bob, &alice.public(), &parsed).unwrap();
         assert_eq!(aperto.as_bytes(), b"ciao");
         assert_eq!(aperto.sent_at_unix(), 99);
+        // Anche il messaggio a meta' porta la prekey: e' cosi' che la catena
+        // parte, altrimenti la forward secrecy piena non comincerebbe mai.
+        assert_eq!(prekey_ricevuta, mia.public());
     }
 
     /// La chiave di Alice non compare da nessuna parte in chiaro: e' cio' che
@@ -680,7 +700,7 @@ mod tests {
         let alice = identita(1);
         let bob = identita(2);
         let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
-        let blob = seal_ephemeral(&alice, &bob.public(), b"ciao", 1, &mut rng).unwrap();
+        let blob = seal_ephemeral(&alice, &bob.public(), &prekey(4).public(), b"ciao", 1, &mut rng).unwrap();
 
         let mut buf = Vec::new();
         let ParsedBlob::Message(parsed) = format::parse(&blob, &mut buf).unwrap() else {
@@ -701,7 +721,7 @@ mod tests {
         let bob = identita(2);
         let carol = identita(3);
         let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
-        let blob = seal_ephemeral(&alice, &bob.public(), b"ciao", 1, &mut rng).unwrap();
+        let blob = seal_ephemeral(&alice, &bob.public(), &prekey(4).public(), b"ciao", 1, &mut rng).unwrap();
 
         let mut buf = Vec::new();
         let ParsedBlob::Message(parsed) = format::parse(&blob, &mut buf).unwrap() else {
@@ -720,8 +740,8 @@ mod tests {
         let alice = identita(1);
         let bob = identita(2);
         let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
-        let uno = seal_ephemeral(&alice, &bob.public(), b"ciao", 1, &mut rng).unwrap();
-        let due = seal_ephemeral(&alice, &bob.public(), b"ciao", 1, &mut rng).unwrap();
+        let uno = seal_ephemeral(&alice, &bob.public(), &prekey(4).public(), b"ciao", 1, &mut rng).unwrap();
+        let due = seal_ephemeral(&alice, &bob.public(), &prekey(4).public(), b"ciao", 1, &mut rng).unwrap();
         assert_ne!(uno, due);
 
         let (mut a, mut b) = (Vec::new(), Vec::new());
@@ -738,7 +758,7 @@ mod tests {
         let bob = identita(2);
         let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
 
-        let effimero = seal_ephemeral(&alice, &bob.public(), b"ciao", 1, &mut rng).unwrap();
+        let effimero = seal_ephemeral(&alice, &bob.public(), &prekey(4).public(), b"ciao", 1, &mut rng).unwrap();
         let mut buf = Vec::new();
         let ParsedBlob::Message(parsed) = format::parse(&effimero, &mut buf).unwrap() else {
             panic!()

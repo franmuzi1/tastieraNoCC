@@ -336,6 +336,33 @@ pub trait Keyring {
     /// serviva a chiudere.
     fn forget(&mut self, peer: &PublicKey) -> Result<bool>;
 
+    /// L'ultima chiave temporanea che il peer ci ha mandato, con cui gli si
+    /// scrive. `None` finche' non ne ha mandata nessuna.
+    fn peer_prekey(&self, peer: &PublicKey) -> Result<Option<PublicKey>>;
+
+    fn set_peer_prekey(&mut self, peer: &PublicKey, prekey: &PublicKey) -> Result<()>;
+
+    /// Le nostre chiavi temporanee ancora valide verso quel peer, dalla piu'
+    /// recente. Sono privatissime e vanno persistite: senza, un riavvio
+    /// renderebbe illeggibili i messaggi gia' in viaggio.
+    fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<[u8; KEY_LEN]>>;
+
+    /// Aggiunge una nostra chiave temporanea, tenendo solo le ultime poche.
+    fn push_my_prekey(&mut self, peer: &PublicKey, secret: [u8; KEY_LEN]) -> Result<()>;
+
+    /// Butta le nostre chiavi temporanee piu' vecchie di quella indicata.
+    ///
+    /// **E' il gesto che produce la forward secrecy**: finche' quelle chiavi
+    /// esistono, i messaggi che le usavano restano apribili. Si butta il
+    /// vecchio e non tutto, cosi' due messaggi mandati con la stessa chiave
+    /// restano leggibili anche se arrivano in ordine sparso — cosa che in un
+    /// mezzo fatto di copia-incolla succede spesso.
+    fn drop_my_prekeys_older_than(
+        &mut self,
+        peer: &PublicKey,
+        secret: &[u8; KEY_LEN],
+    ) -> Result<()>;
+
     /// Le chiavi fissate, per chi deve provarle tutte.
     ///
     /// Serve ai messaggi a mittente effimero: chi riceve non sa chi ha

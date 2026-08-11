@@ -40,7 +40,7 @@ use crate::baseline::{self, Plaintext};
 use crate::file::{self, DecryptedFile, FileMeta};
 use crate::error::{Error, Result};
 use crate::format::{self, ParsedBlob};
-use crate::keys::{Fingerprint, Identity, Keyring, LabelOutcome, PinOutcome, PublicKey};
+use crate::keys::{self, Fingerprint, Identity, Keyring, LabelOutcome, PinOutcome, PublicKey};
 
 /// Stato vivo del core, posseduto dal layer JNI per la durata della sessione.
 pub struct Session<K: Keyring> {
@@ -75,6 +75,13 @@ pub struct DecryptedMessage {
     pub sender: PublicKey,
     pub sender_status: SenderStatus,
     pub plaintext: Plaintext,
+}
+
+/// Un segreto nuovo per una chiave temporanea.
+fn nuovo_segreto<R: RngCore + CryptoRng>(rng: &mut R) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    rng.fill_bytes(&mut bytes);
+    bytes
 }
 
 /// Un allegato decifrato, con lo stato TOFU di chi l'ha mandato.
@@ -160,11 +167,25 @@ impl<K: Keyring> Session<K> {
     ) -> Result<IncomingItem> {
         let mut buf = Vec::new();
         match format::parse(text, &mut buf)? {
+            ParsedBlob::Message(parsed) if parsed.header.origin.uses_prekey() => {
+                let (sender, plaintext) = self.prova_con_le_prekey(&parsed)?;
+                let sender_status = self.pin_and_classify(&sender, now_unix)?;
+                self.current_peer
+                    .insert(app_package.to_owned(), sender.clone());
+                Ok(IncomingItem::Message(DecryptedMessage {
+                    sender,
+                    sender_status,
+                    plaintext,
+                }))
+            }
             ParsedBlob::Message(parsed) if parsed.header.origin.is_ephemeral() => {
                 // Mittente effimero: chi ha scritto non e' dichiarato, si
                 // scopre provando. La prima chiave che apre il messaggio E'
                 // il mittente, perche' la derivazione richiede la sua privata.
-                let (sender, plaintext) = self.prova_i_contatti(&parsed)?;
+                let (sender, prekey, plaintext) = self.prova_i_contatti(&parsed)?;
+                // Da qui in poi gli si puo' rispondere con la forward secrecy
+                // piena: la catena e' partita.
+                self.keyring.set_peer_prekey(&sender, &prekey)?;
                 let sender_status = self.pin_and_classify(&sender, now_unix)?;
                 self.current_peer
                     .insert(app_package.to_owned(), sender.clone());
@@ -265,7 +286,7 @@ impl<K: Keyring> Session<K> {
     /// Ritorna [`Error::UnknownPeer`] se per quell'app non c'e' un
     /// destinatario: la UI deve chiedere, mai indovinare.
     pub fn encrypt_for_app<R: RngCore + CryptoRng>(
-        &self,
+        &mut self,
         app_package: &str,
         plaintext: &[u8],
         now_unix: i64,
@@ -283,18 +304,61 @@ impl<K: Keyring> Session<K> {
     /// lato non e' aggiornato va lasciato spento. Il core non sa che versione
     /// abbia il destinatario, e indovinarlo produrrebbe messaggi illeggibili.
     pub fn encrypt_for_app_with<R: RngCore + CryptoRng>(
-        &self,
+        &mut self,
         app_package: &str,
         plaintext: &[u8],
         now_unix: i64,
         rng: &mut R,
         effimero: bool,
     ) -> Result<String> {
-        let peer = self.current_peer.get(app_package).ok_or(Error::UnknownPeer)?;
-        if effimero {
-            baseline::seal_ephemeral(&self.identity, peer, plaintext, now_unix, rng)
-        } else {
-            baseline::seal(&self.identity, peer, plaintext, now_unix, rng)
+        let peer = self
+            .current_peer
+            .get(app_package)
+            .ok_or(Error::UnknownPeer)?
+            .clone();
+        if !effimero {
+            return baseline::seal(&self.identity, &peer, plaintext, now_unix, rng);
+        }
+
+        // Con una chiave temporanea del destinatario si fa la forward secrecy
+        // piena; senza — primo messaggio, o lui non ha ancora risposto — si
+        // ripiega su quella a meta', che protegge comunque cio' che mandiamo.
+        // Il ripiego non e' un downgrade forzabile: dipende da cosa CI ha
+        // mandato lui, non da cosa dichiara il messaggio.
+        match self.keyring.peer_prekey(&peer)? {
+            Some(sua_prekey) => {
+                let mia = keys::EphemeralSecret::from_bytes(nuovo_segreto(rng));
+                let blob = baseline::seal_forward(
+                    &self.identity,
+                    &peer,
+                    &sua_prekey,
+                    &mia.public(),
+                    plaintext,
+                    now_unix,
+                    rng,
+                )?;
+                // Si conserva DOPO aver cifrato: se la cifratura fallisse,
+                // avremmo salvato una chiave che non serve a niente.
+                self.keyring.push_my_prekey(&peer, *mia.to_bytes())?;
+                Ok(blob)
+            }
+            None => {
+                // Anche il ripiego porta una nostra chiave temporanea: e' cio'
+                // che fa PARTIRE la catena. Senza, chi riceve non avrebbe mai
+                // una nostra prekey e la forward secrecy piena non comincerebbe
+                // mai — il primo messaggio resterebbe l'unico schema per sempre.
+                let mia = keys::EphemeralSecret::from_bytes(nuovo_segreto(rng));
+                let blob = baseline::seal_ephemeral(
+                    &self.identity,
+                    &peer,
+                    &mia.public(),
+                    plaintext,
+                    now_unix,
+                    rng,
+                )?;
+                self.keyring.push_my_prekey(&peer, *mia.to_bytes())?;
+                Ok(blob)
+            }
         }
     }
 
@@ -375,9 +439,43 @@ impl<K: Keyring> Session<K> {
     fn prova_i_contatti(
         &self,
         parsed: &crate::format::ParsedEnvelope<'_>,
-    ) -> Result<(PublicKey, Plaintext)> {
+    ) -> Result<(PublicKey, PublicKey, Plaintext)> {
         for candidato in self.keyring.peers()? {
-            if let Ok(plaintext) = baseline::open_ephemeral(&self.identity, &candidato, parsed) {
+            if let Ok((prekey, plaintext)) =
+                baseline::open_ephemeral(&self.identity, &candidato, parsed)
+            {
+                return Ok((candidato, prekey, plaintext));
+            }
+        }
+        Err(Error::Crypto)
+    }
+
+    /// Come [`Self::prova_i_contatti`], per i messaggi a forward secrecy piena:
+    /// si provano i contatti **per ciascuna** delle nostre chiavi temporanee.
+    ///
+    /// Poche moltiplicate per pochi: qualche decina di tentativi, ciascuno un
+    /// AEAD su un messaggio breve.
+    ///
+    /// Quando uno riesce si fanno due cose, e sono le due che mandano avanti la
+    /// catena: si prende nota della prossima chiave del mittente, e si buttano
+    /// le nostre piu' vecchie di quella appena usata. Da quel momento i
+    /// messaggi che le usavano non si riaprono piu' — nemmeno per noi.
+    fn prova_con_le_prekey(
+        &mut self,
+        parsed: &crate::format::ParsedEnvelope<'_>,
+    ) -> Result<(PublicKey, Plaintext)> {
+        let mio = self.identity.public();
+        for candidato in self.keyring.peers()? {
+            for segreto in self.keyring.my_prekeys(&candidato)? {
+                let prekey = keys::EphemeralSecret::from_bytes(segreto);
+                let Ok((prossima, plaintext)) =
+                    baseline::open_forward(&prekey, &candidato, &mio, parsed)
+                else {
+                    continue;
+                };
+                self.keyring.set_peer_prekey(&candidato, &prossima)?;
+                self.keyring
+                    .drop_my_prekeys_older_than(&candidato, &segreto)?;
                 return Ok((candidato, plaintext));
             }
         }
@@ -400,7 +498,8 @@ impl<K: Keyring> Session<K> {
             return Err(Error::Format("non e' un messaggio"));
         };
         if parsed.header.origin.is_ephemeral() {
-            return self.prova_i_contatti(&parsed);
+            let (mittente, _, plaintext) = self.prova_i_contatti(&parsed)?;
+            return Ok((mittente, plaintext));
         }
         let sender = parsed
             .header
@@ -469,9 +568,62 @@ mod tests {
     #[derive(Default)]
     struct KeyringInMemoria {
         peers: Vec<PeerRecord>,
+        // Vec e non HashMap: `PublicKey` non implementa `Hash` apposta, per
+        // non finire usata come chiave di mappa senza pensarci.
+        prekey_loro: Vec<(PublicKey, PublicKey)>,
+        prekey_mie: Vec<(PublicKey, Vec<[u8; 32]>)>,
     }
 
     impl Keyring for KeyringInMemoria {
+        fn peer_prekey(&self, peer: &PublicKey) -> Result<Option<PublicKey>> {
+            Ok(self
+                .prekey_loro
+                .iter()
+                .find(|(p, _)| p == peer)
+                .map(|(_, k)| k.clone()))
+        }
+
+        fn set_peer_prekey(&mut self, peer: &PublicKey, prekey: &PublicKey) -> Result<()> {
+            match self.prekey_loro.iter_mut().find(|(p, _)| p == peer) {
+                Some((_, k)) => *k = prekey.clone(),
+                None => self.prekey_loro.push((peer.clone(), prekey.clone())),
+            }
+            Ok(())
+        }
+
+        fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<[u8; 32]>> {
+            Ok(self
+                .prekey_mie
+                .iter()
+                .find(|(p, _)| p == peer)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default())
+        }
+
+        fn push_my_prekey(&mut self, peer: &PublicKey, secret: [u8; 32]) -> Result<()> {
+            match self.prekey_mie.iter_mut().find(|(p, _)| p == peer) {
+                Some((_, v)) => {
+                    v.insert(0, secret);
+                    v.truncate(3);
+                }
+                None => self.prekey_mie.push((peer.clone(), vec![secret])),
+            }
+            Ok(())
+        }
+
+        fn drop_my_prekeys_older_than(
+            &mut self,
+            peer: &PublicKey,
+            secret: &[u8; 32],
+        ) -> Result<()> {
+            if let Some((_, v)) = self.prekey_mie.iter_mut().find(|(p, _)| p == peer) {
+                if let Some(i) = v.iter().position(|s| s == secret) {
+                    v.truncate(i.saturating_add(1));
+                }
+            }
+            Ok(())
+        }
+
         fn peers(&self) -> Result<Vec<PublicKey>> {
             Ok(self.peers.iter().map(|p| p.public.clone()).collect())
         }
@@ -765,9 +917,102 @@ mod tests {
         assert_eq!(alice.current_peer(WHATSAPP), Some(&bob.identity.public()));
     }
 
+    /// La catena: il primo messaggio parte a meta' e porta gia' la chiave con
+    /// cui il prossimo sara' pieno.
+    #[test]
+    fn la_catena_parte_col_primo_messaggio() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity().public();
+        let chiave_bob = bob.identity().public();
+
+        // Si conoscono: senza, un mittente effimero non e' riconoscibile.
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+
+        // Primo messaggio: Alice non ha una chiave temporanea di Bob, quindi
+        // ripiega sulla forward secrecy a meta' — ma porta gia' la propria.
+        let uno = alice
+            .encrypt_for_app_with(WHATSAPP, b"primo", 10, &mut rng(9), true)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &uno, 11).unwrap();
+        assert!(
+            bob.keyring.peer_prekey(&chiave_alice).unwrap().is_some(),
+            "il primo messaggio deve far partire la catena"
+        );
+
+        // La risposta di Bob usa quella chiave: forward secrecy piena.
+        let due = bob
+            .encrypt_for_app_with(WHATSAPP, b"risposta", 12, &mut rng(8), true)
+            .unwrap();
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&due, &mut buf).unwrap() else {
+            panic!()
+        };
+        assert!(
+            parsed.header.origin.uses_prekey(),
+            "la risposta doveva essere a forward secrecy piena"
+        );
+        drop(parsed);
+
+        let letto = alice.handle_incoming_text(WHATSAPP, &due, 13).unwrap();
+        let IncomingItem::Message(messaggio) = letto else {
+            panic!("doveva essere un messaggio")
+        };
+        assert_eq!(messaggio.plaintext.as_bytes(), b"risposta");
+        assert_eq!(messaggio.sender, chiave_bob);
+    }
+
+    /// **Il prezzo accettato:** quando la catena avanza, i messaggi vecchi non
+    /// si riaprono piu' — nemmeno per chi li ha ricevuti.
+    #[test]
+    fn la_cronologia_non_si_rilegge() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity().public();
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+        bob.set_current_peer(WHATSAPP, &chiave_alice).unwrap();
+
+        // Si scrivono a turni finche' la catena e' partita da entrambi i lati.
+        let uno = alice
+            .encrypt_for_app_with(WHATSAPP, b"primo", 10, &mut rng(9), true)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &uno, 11).unwrap();
+        let due = bob
+            .encrypt_for_app_with(WHATSAPP, b"secondo", 12, &mut rng(8), true)
+            .unwrap();
+        alice.handle_incoming_text(WHATSAPP, &due, 13).unwrap();
+
+        // Alice risponde: usa la prekey di Bob, e Bob leggendola butta le
+        // proprie chiavi piu' vecchie.
+        let tre = alice
+            .encrypt_for_app_with(WHATSAPP, b"terzo", 14, &mut rng(7), true)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &tre, 15).unwrap();
+        let quattro = bob
+            .encrypt_for_app_with(WHATSAPP, b"quarto", 16, &mut rng(6), true)
+            .unwrap();
+        alice.handle_incoming_text(WHATSAPP, &quattro, 17).unwrap();
+        let cinque = alice
+            .encrypt_for_app_with(WHATSAPP, b"quinto", 18, &mut rng(5), true)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &cinque, 19).unwrap();
+
+        // Il terzo messaggio, che Bob aveva gia' letto, ora non si riapre:
+        // la chiave con cui era stato cifrato non esiste piu'.
+        assert!(
+            bob.handle_incoming_text(WHATSAPP, &tre, 20).is_err(),
+            "la catena e' avanzata: quel messaggio doveva essere morto"
+        );
+    }
+
     #[test]
     fn senza_destinatario_non_si_indovina() {
-        let bob = sessione(2);
+        let mut bob = sessione(2);
         assert!(matches!(
             bob.encrypt_for_app(WHATSAPP, b"per chi?", 1_700_000_000, &mut rng(1)),
             Err(Error::UnknownPeer)
