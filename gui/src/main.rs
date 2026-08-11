@@ -59,6 +59,7 @@ enum Scheda {
     Scrivi,
     Leggi,
     Contatti,
+    Archivio,
 }
 
 struct Contatto {
@@ -94,6 +95,22 @@ struct App {
     appunti: Option<arboard::Clipboard>,
     /// L'ultimo contenuto gia' esaminato, per non rifare il lavoro a ogni giro.
     ultimo_appunto: String,
+
+    /// La conversazione ricostruita da un'esportazione.
+    archivio: Vec<RigaArchivio>,
+    archivio_da: Option<String>,
+    archivio_trovati: usize,
+}
+
+/// Un messaggio ricostruito da un'esportazione di chat.
+struct RigaArchivio {
+    quando: String,
+    chi: String,
+    testo: String,
+    /// `false` quando il blob c'era ma non si e' aperto: puo' essere di
+    /// un'altra conversazione, per un altro destinatario, o cifrato con una
+    /// chiave che non esiste piu'.
+    aperto: bool,
 }
 
 struct Letto {
@@ -133,6 +150,9 @@ impl App {
             sempre_sopra: false,
             appunti: arboard::Clipboard::new().ok(),
             ultimo_appunto: String::new(),
+            archivio: Vec::new(),
+            archivio_da: None,
+            archivio_trovati: 0,
         };
         app.ricarica();
         app
@@ -414,6 +434,72 @@ impl App {
 }
 
 impl App {
+    /// Ricostruisce una conversazione da un'esportazione di chat.
+    ///
+    /// Non si analizza il formato dell'esportazione — Telegram, Signal,
+    /// WhatsApp e Instagram ne hanno uno ciascuno, e cambiano a ogni loro
+    /// aggiornamento. Si cerca il **sentinel** ovunque compaia, esattamente
+    /// come fa la tastiera dentro un testo qualunque: cosi' funziona con
+    /// qualsiasi formato, anche futuro, purche' i messaggi ci siano come testo.
+    ///
+    /// **Non tocca il keyring.** Un archivio puo' contenere qualunque cosa,
+    /// anche messaggi fabbricati: fissare chiavi leggendo un file sarebbe un
+    /// modo per riempirsi i contatti senza accorgersene, e per vedersi
+    /// comparire un falso "la chiave di Marco e' cambiata".
+    fn ricostruisci(&mut self, percorso: std::path::PathBuf) {
+        let Ok(testo) = std::fs::read_to_string(&percorso) else {
+            self.avviso = Some((
+                "Non riesco a leggere quel file. Se e' un archivio compresso, \
+                 estrailo prima."
+                    .to_owned(),
+                true,
+            ));
+            return;
+        };
+        let Some(stato) = self.stato() else { return };
+        let session = Session::new(stato.identity, stato.keyring);
+
+        self.archivio.clear();
+        self.archivio_trovati = 0;
+        let mut resto = testo.as_str();
+        while let Some(inizio) = resto.find(SENTINEL) {
+            let dopo = resto.get(inizio..).unwrap_or("");
+            let fine = dopo
+                .char_indices()
+                .position(|(i, c)| i >= SENTINEL.len() && !c.is_ascii_alphanumeric())
+                .unwrap_or(dopo.len());
+            let blob = dopo.get(..fine).unwrap_or("");
+            resto = dopo.get(fine.max(SENTINEL.len())..).unwrap_or("");
+            self.archivio_trovati += 1;
+
+            match session.open_archived(blob) {
+                Ok((mittente, plaintext)) => {
+                    let nome = keyboard_cipher_core::keys::Keyring::get(session.keyring(), &mittente)
+                        .ok()
+                        .flatten()
+                        .and_then(|r| r.label)
+                        .unwrap_or_else(|| Fingerprint::of(&mittente).display());
+                    self.archivio.push(RigaArchivio {
+                        quando: data(plaintext.sent_at_unix()),
+                        chi: nome,
+                        testo: String::from_utf8_lossy(plaintext.as_bytes()).into_owned(),
+                        aperto: true,
+                    });
+                }
+                Err(_) => self.archivio.push(RigaArchivio {
+                    quando: String::new(),
+                    chi: String::new(),
+                    testo: "(non decifrabile)".to_owned(),
+                    aperto: false,
+                }),
+            }
+        }
+        self.archivio_da = percorso
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        self.avviso = None;
+    }
+
     /// Guarda negli appunti se e' comparso un nostro messaggio.
     ///
     /// Toglie l'ultimo passaggio a mano: copi il messaggio da Telegram e
@@ -493,6 +579,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.scheda, Scheda::Scrivi, "Scrivi");
                 ui.selectable_value(&mut self.scheda, Scheda::Leggi, "Leggi");
                 ui.selectable_value(&mut self.scheda, Scheda::Contatti, "Contatti");
+                ui.selectable_value(&mut self.scheda, Scheda::Archivio, "Archivio");
             });
             ui.add_space(4.0);
         });
@@ -514,6 +601,7 @@ impl eframe::App for App {
             Scheda::Scrivi => self.scheda_scrivi(ui, ctx),
             Scheda::Leggi => self.scheda_leggi(ui),
             Scheda::Contatti => self.scheda_contatti(ui),
+            Scheda::Archivio => self.scheda_archivio(ui),
         });
 
         self.finestra_conflitto(ctx);
@@ -718,6 +806,57 @@ impl App {
         if conferma {
             self.da_dimenticare = None;
             self.dimentica(indice);
+        }
+    }
+
+    fn scheda_archivio(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            "Apri l'esportazione di una conversazione — Telegram, Signal, WhatsApp, \
+             Instagram: qualunque formato, purche' i messaggi ci siano come testo.",
+        );
+        ui.add_space(8.0);
+        if ui.button("Ricostruisci una chat…").clicked() {
+            if let Some(percorso) = rfd::FileDialog::new()
+                .add_filter("Esportazioni", &["html", "json", "txt", "htm", "csv", "md"])
+                .add_filter("Qualunque file", &["*"])
+                .pick_file()
+            {
+                self.ricostruisci(percorso);
+            }
+        }
+        if let Some(da) = &self.archivio_da {
+            ui.add_space(8.0);
+            let aperti = self.archivio.iter().filter(|r| r.aperto).count();
+            ui.label(format!(
+                "{da}: {aperti} messaggi aperti su {} trovati.",
+                self.archivio_trovati
+            ));
+            ui.add_space(4.0);
+            // Con la forward secrecy accesa le chiavi dei messaggi vecchi non
+            // esistono piu', ed e' il prezzo dichiarato di quella scelta: qui
+            // si dice, invece di lasciar credere a un guasto.
+            if aperti < self.archivio_trovati {
+                ui.small(
+                    "Quelli non decifrabili possono essere di un'altra conversazione, \
+                     diretti a qualcun altro, oppure cifrati con forward secrecy: in \
+                     quel caso la chiave non esiste piu' e non tornera'.",
+                );
+            }
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for riga in &self.archivio {
+                    if riga.aperto {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.small(&riga.quando);
+                            ui.strong(&riga.chi);
+                        });
+                        ui.add(egui::Label::new(&riga.testo).wrap());
+                    } else {
+                        ui.weak(&riga.testo);
+                    }
+                    ui.add_space(6.0);
+                }
+            });
         }
     }
 

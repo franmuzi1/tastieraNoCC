@@ -384,6 +384,33 @@ impl<K: Keyring> Session<K> {
         Err(Error::Crypto)
     }
 
+    /// Apre un messaggio **senza toccare il keyring**, per leggere un archivio.
+    ///
+    /// La differenza con [`Self::handle_incoming_text`] non e' una comodita':
+    /// un'esportazione di chat contiene qualunque cosa, anche messaggi di
+    /// conversazioni diverse o fabbricati, e fissare chiavi leggendo un file
+    /// sarebbe un modo per riempirsi il keyring senza accorgersene — e per
+    /// vedersi comparire un falso "la chiave di Marco e' cambiata".
+    ///
+    /// Legge e basta: nessun pin, nessun destinatario scelto, nessuno stato
+    /// modificato.
+    pub fn open_archived(&self, text: &str) -> Result<(PublicKey, Plaintext)> {
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(text, &mut buf)? else {
+            return Err(Error::Format("non e' un messaggio"));
+        };
+        if parsed.header.origin.is_ephemeral() {
+            return self.prova_i_contatti(&parsed);
+        }
+        let sender = parsed
+            .header
+            .sender_pub()
+            .cloned()
+            .ok_or(Error::Format("messaggio senza pubkey del mittente"))?;
+        let plaintext = baseline::open(&self.identity, &sender, &parsed)?;
+        Ok((sender, plaintext))
+    }
+
     pub fn current_peer(&self, app_package: &str) -> Option<&PublicKey> {
         self.current_peer.get(app_package)
     }

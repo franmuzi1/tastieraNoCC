@@ -639,6 +639,7 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFo
     app_package: JString,
     plaintext: JByteArray,
     now_unix: jlong,
+    effimero: jboolean,
 ) -> jstring {
     guard(std::ptr::null_mut(), || {
         let nullo: jstring = std::ptr::null_mut();
@@ -649,8 +650,9 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFo
             return nullo;
         };
 
-        let esito =
-            with_session(|session| session.encrypt_for_app(&package, &bytes, now_unix, &mut OsRng));
+        let esito = with_session(|session| {
+            session.encrypt_for_app_with(&package, &bytes, now_unix, &mut OsRng, effimero != 0)
+        });
         // La copia Rust del plaintext sparisce subito; quella Java la azzera
         // il chiamante.
         use zeroize::Zeroize;

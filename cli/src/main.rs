@@ -19,7 +19,8 @@ use std::io::Read;
 
 use keyboard_cipher_core::api::{IncomingItem, SenderStatus, Session};
 use keyboard_cipher_core::file::FileMeta;
-use keyboard_cipher_core::keys::{Fingerprint, LabelOutcome, PinOutcome, PublicKey};
+use keyboard_cipher_core::format::SENTINEL;
+use keyboard_cipher_core::keys::{Fingerprint, Keyring, LabelOutcome, PinOutcome, PublicKey};
 use rand_core::{OsRng, RngCore};
 use store::{FileKeyring, State};
 
@@ -51,6 +52,7 @@ fn run() -> Result<(), String> {
         "decrypt" => cmd_decrypt(rest),
         "sealfile" => cmd_sealfile(rest),
         "openfile" => cmd_openfile(rest),
+        "archive" => cmd_archive(rest),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             Ok(())
@@ -72,6 +74,7 @@ kc — l'altra parte di keyboard-cipher, per provare la tastiera da soli.
   kc decrypt [blob]        decifra un messaggio o fissa una presentazione
   kc sealfile --to <chi> <file>    cifra un file, scrive <file>.kc
   kc openfile <file.kc> [dove]     apre un allegato cifrato
+  kc archive <esportazione>        decifra tutti i messaggi di una chat esportata
 
 <chi> e' un nome, un indice di `kc contacts`, o l'inizio di un fingerprint.
 
@@ -408,6 +411,70 @@ fn cmd_openfile(args: &[String]) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+
+/// Decifra tutti i messaggi nostri dentro un file qualunque.
+///
+/// Serve per le **esportazioni delle chat**: Telegram e le altre danno un HTML
+/// o un JSON dove i messaggi stanno come testo, quindi i blob ci sono tutti.
+/// Non si analizza il formato dell'esportazione — cambierebbe a ogni loro
+/// aggiornamento — si cerca il sentinel ovunque compaia, esattamente come fa la
+/// tastiera dentro un testo qualsiasi.
+///
+/// **Vale finche' la forward secrecy e' spenta.** Con quella accesa le chiavi
+/// dei messaggi vecchi non esistono piu', e un'esportazione e' un file di byte
+/// morti anche per chi l'ha scritta: e' il prezzo dichiarato di quella scelta.
+///
+/// Non tocca il keyring e non fissa nessuno: un archivio puo' contenere
+/// qualunque cosa, e fissare chiavi leggendo un file sarebbe un modo per
+/// riempire il keyring senza accorgersene.
+fn cmd_archive(args: &[String]) -> Result<(), String> {
+    let percorso = args.first().ok_or("manca il file esportato.")?;
+    let testo = std::fs::read_to_string(percorso).map_err(|e| format!("{percorso}: {e}"))?;
+
+    let state = load()?;
+    let session = Session::new(state.identity, state.keyring);
+
+    let mut trovati = 0usize;
+    let mut aperti = 0usize;
+    let mut resto = testo.as_str();
+    while let Some(inizio) = resto.find(SENTINEL) {
+        let dopo = resto.get(inizio..).unwrap_or("");
+        // Il blob finisce al primo carattere fuori dall'alfabeto: la stessa
+        // regola del riconoscimento dentro un testo qualunque.
+        let fine = dopo
+            .char_indices()
+            .position(|(i, c)| i >= SENTINEL.len() && !c.is_ascii_alphanumeric())
+            .unwrap_or(dopo.len());
+        let blob = dopo.get(..fine).unwrap_or("");
+        resto = dopo.get(fine.max(SENTINEL.len())..).unwrap_or("");
+        trovati += 1;
+
+        // `Session::open_archived` non tocca il keyring: qui interessa leggere,
+        // non riconoscere chi scrive.
+        match session.open_archived(blob) {
+            Ok((mittente, plaintext)) => {
+                aperti += 1;
+                let nome = Keyring::get(session.keyring(), &mittente)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.label)
+                    .unwrap_or_else(|| Fingerprint::of(&mittente).display());
+                println!(
+                    "[{}] {}: {}",
+                    format_unix(plaintext.sent_at_unix()),
+                    nome,
+                    String::from_utf8_lossy(plaintext.as_bytes())
+                );
+            }
+            // Un blob che non si apre non e' un errore del comando: puo' essere
+            // di un'altra conversazione, per un altro destinatario, o cifrato
+            // con una chiave che non esiste piu'.
+            Err(_) => println!("[non decifrabile]"),
+        }
+    }
+    eprintln!("\n{aperti} messaggi aperti su {trovati} trovati.");
+    Ok(())
+}
 
 /// Data leggibile, in UTC.
 ///
