@@ -26,7 +26,8 @@ use std::path::{Path, PathBuf};
 
 use keyboard_cipher_core::encoding;
 use keyboard_cipher_core::keys::{
-    Fingerprint, Identity, Keyring, LabelOutcome, PeerRecord, PinOutcome, PublicKey, KEY_LEN,
+    Fingerprint, Identity, Keyring, LabelOutcome, PeerRecord, PinOutcome, PrekeyStore, PublicKey,
+    KEY_LEN,
 };
 use keyboard_cipher_core::{Error, Result};
 use zeroize::Zeroizing;
@@ -64,6 +65,9 @@ pub fn state_path() -> PathBuf {
 #[derive(Default)]
 pub struct FileKeyring {
     peers: Vec<PeerRecord>,
+    /// La catena di forward secrecy. La logica sta nel core: qui c'e' solo il
+    /// giro su disco, che e' l'unica parte che riguarda questo binario.
+    pub(crate) prekey: PrekeyStore,
 }
 
 impl FileKeyring {
@@ -94,6 +98,10 @@ impl FileKeyring {
         match self.position(peer) {
             Some(indice) => {
                 self.peers.remove(indice);
+                // Anche le chiavi temporanee verso di lui: restare su disco
+                // dopo che l'utente ha cancellato il contatto sarebbe il
+                // contrario di quello che ha chiesto.
+                self.prekey.forget(peer);
                 true
             }
             None => false,
@@ -108,6 +116,33 @@ impl Keyring for FileKeyring {
 
     fn forget(&mut self, peer: &PublicKey) -> Result<bool> {
         Ok(self.remove(peer))
+    }
+
+    fn peer_prekey(&self, peer: &PublicKey) -> Result<Option<PublicKey>> {
+        Ok(self.prekey.peer_prekey(peer))
+    }
+
+    fn set_peer_prekey(&mut self, peer: &PublicKey, prekey: &PublicKey) -> Result<()> {
+        self.prekey.set_peer_prekey(peer, prekey);
+        Ok(())
+    }
+
+    fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<[u8; KEY_LEN]>> {
+        Ok(self.prekey.my_prekeys(peer))
+    }
+
+    fn push_my_prekey(&mut self, peer: &PublicKey, secret: [u8; KEY_LEN]) -> Result<()> {
+        self.prekey.push_my_prekey(peer, secret);
+        Ok(())
+    }
+
+    fn drop_my_prekeys_older_than(
+        &mut self,
+        peer: &PublicKey,
+        secret: &[u8; KEY_LEN],
+    ) -> Result<()> {
+        self.prekey.drop_my_prekeys_older_than(peer, secret);
+        Ok(())
     }
 
     fn tofu_pin(&mut self, peer: &PublicKey, now_unix: i64) -> Result<PinOutcome> {
@@ -256,6 +291,29 @@ pub fn save(path: &Path, secret: &[u8; KEY_LEN], keyring: &FileKeyring) -> io::R
         out.push_str(peer.label.as_deref().unwrap_or(""));
         out.push('\n');
     }
+    // Le righe `chain` stanno DOPO le `peer` e non dentro: un binario piu'
+    // vecchio le ignora (il parser scarta le righe che non conosce) e continua
+    // a funzionare senza forward secrecy piena, invece di rifiutare il file e
+    // far sparire l'identita'.
+    //
+    // Qui c'e' materiale privato in chiaro, come il segreto d'identita' due
+    // righe sopra: stesso file, stessi permessi, stessa avvertenza.
+    for (chi, loro, mie) in keyring.prekey.dump() {
+        out.push_str("chain ");
+        out.push_str(&encoding::encode(chi.as_bytes()));
+        out.push(' ');
+        out.push_str(&match loro {
+            Some(k) => encoding::encode(k.as_bytes()),
+            // Un contatto a cui abbiamo scritto per primi non ha ancora una
+            // loro chiave: il trattino tiene la posizione della colonna.
+            None => "-".to_owned(),
+        });
+        for segreto in mie {
+            out.push(' ');
+            out.push_str(&encoding::encode(&segreto));
+        }
+        out.push('\n');
+    }
     // Scrittura atomica: un file di stato troncato a meta' e' un'identita'
     // persa, e qui non c'e' nessun backup dietro.
     let tmp = path.with_extension("tmp");
@@ -282,6 +340,17 @@ fn restrict(_path: &Path) -> io::Result<()> {
 /// Sembra permissivo e non lo e': chi chiama non rigenera mai da solo. Vedi la
 /// nota in `main`, ed e' la stessa regola del lato Android — un guasto locale
 /// non deve diventare indistinguibile da un attacco.
+fn chiave(testo: &str) -> Option<PublicKey> {
+    let bytes = encoding::decode(testo).ok()?;
+    let bytes: [u8; KEY_LEN] = bytes.as_slice().try_into().ok()?;
+    Some(PublicKey::from_bytes(bytes))
+}
+
+fn segreto_da(testo: &str) -> Option<[u8; KEY_LEN]> {
+    let bytes = encoding::decode(testo).ok()?;
+    bytes.as_slice().try_into().ok()
+}
+
 fn parse(text: &str) -> Option<State> {
     let mut lines = text.lines();
     if lines.next()? != MAGIC {
@@ -313,6 +382,22 @@ fn parse(text: &str) -> Option<State> {
                     first_seen_unix,
                     verified,
                 });
+            }
+            // Una riga rotta qui costa la catena di quel contatto, non
+            // l'identita': niente `?`, che uscirebbe da `parse` con `None` e
+            // farebbe sparire tutto. Il peggio che succede e' che il prossimo
+            // messaggio verso quella persona riparta a meta' forward secrecy,
+            // che e' esattamente il caso del primo contatto.
+            (Some("chain"), Some(rest)) => {
+                let mut campi = rest.split(' ');
+                if let Some(chi) = campi.next().and_then(chiave) {
+                    let loro = match campi.next() {
+                        Some("-") | None => None,
+                        Some(testo) => chiave(testo),
+                    };
+                    let mie = campi.filter_map(segreto_da).collect();
+                    keyring.prekey.restore(&chi, loro, mie);
+                }
             }
             _ => {}
         }
@@ -364,6 +449,49 @@ mod tests {
         assert_eq!(peers[1].label, None);
         assert!(peers[1].verified);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Un riavvio non deve uccidere i messaggi gia' in viaggio: le chiavi
+    /// temporanee devono sopravvivere al giro su disco, **nel loro ordine**.
+    #[test]
+    fn la_catena_sopravvive_al_riavvio() {
+        let dir = std::env::temp_dir().join(format!("kc-chain-{}", std::process::id()));
+        let path = dir.join("state");
+        let mut keyring = FileKeyring::default();
+        keyring.tofu_pin(&peer(1), 111).unwrap();
+        keyring.tofu_pin(&peer(2), 222).unwrap();
+        keyring.set_peer_prekey(&peer(1), &peer(50)).unwrap();
+        keyring.push_my_prekey(&peer(1), [10; KEY_LEN]).unwrap();
+        keyring.push_my_prekey(&peer(1), [11; KEY_LEN]).unwrap();
+        // Contatto a cui abbiamo scritto per primi: nessuna chiave sua.
+        keyring.push_my_prekey(&peer(2), [20; KEY_LEN]).unwrap();
+
+        save(&path, &secret(), &keyring).unwrap();
+        let loaded = State::load(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.keyring.peer_prekey(&peer(1)).unwrap(), Some(peer(50)));
+        assert_eq!(
+            loaded.keyring.my_prekeys(&peer(1)).unwrap(),
+            vec![[11; KEY_LEN], [10; KEY_LEN]]
+        );
+        assert_eq!(loaded.keyring.peer_prekey(&peer(2)).unwrap(), None);
+        assert_eq!(
+            loaded.keyring.my_prekeys(&peer(2)).unwrap(),
+            vec![[20; KEY_LEN]]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Una riga `chain` illeggibile costa la catena di quel contatto, non
+    /// l'identita': il file resta caricabile.
+    #[test]
+    fn una_catena_corrotta_non_fa_sparire_l_identita() {
+        let testo = format!(
+            "{MAGIC}\nsecret {}\nchain ??? -\n",
+            encoding::encode(&secret())
+        );
+        let stato = parse(&testo).unwrap();
+        assert_eq!(stato.secret_bytes(), secret());
     }
 
     #[test]

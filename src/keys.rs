@@ -303,6 +303,120 @@ pub enum LabelOutcome {
 ///
 /// Object-safe di proposito: il layer Android lo usera' dietro `dyn Keyring`.
 /// Niente `-> impl Iterator` nei metodi, che romperebbe la object safety.
+/// Quante nostre chiavi temporanee si tengono per ogni contatto.
+///
+/// Non e' un parametro da regolare a gusto: e' **la finestra dentro cui la
+/// forward secrecy non c'e' ancora**. Tenerne una sola romperebbe il caso
+/// normale — mando due messaggi di fila, l'altro apre il secondo, il primo e'
+/// gia' morto — e tenerne molte allungherebbe il periodo in cui un telefono
+/// sequestrato apre i messaggi passati. Tre copre i messaggi in viaggio senza
+/// diventare un archivio.
+pub const MAX_PREKEY_MIE: usize = 3;
+
+/// Lo stato per contatto della catena di forward secrecy.
+///
+/// Sta nel core, che non fa I/O, perche' e' **struttura dati e basta**: chi la
+/// usa la salva come vuole. Il motivo per cui esiste e' che le tre
+/// implementazioni di [`Keyring`] — telefono, riga di comando, test — hanno
+/// bisogno esattamente della stessa logica, e tre copie di questa logica
+/// sarebbero tre modi diversi di sbagliare la parte che decide se un messaggio
+/// vecchio si riapre.
+///
+/// `Vec` e non `HashMap`: [`PublicKey`] non implementa `Hash` apposta.
+#[derive(Default)]
+pub struct PrekeyStore {
+    /// L'ultima chiave temporanea che il peer ci ha mandato. Pubblica.
+    loro: Vec<(PublicKey, PublicKey)>,
+    /// Le nostre, private, dalla piu' recente. Azzerate quando cadono.
+    mie: Vec<(PublicKey, Vec<Zeroizing<[u8; KEY_LEN]>>)>,
+}
+
+impl PrekeyStore {
+    pub fn peer_prekey(&self, peer: &PublicKey) -> Option<PublicKey> {
+        self.loro
+            .iter()
+            .find(|(p, _)| p == peer)
+            .map(|(_, k)| k.clone())
+    }
+
+    pub fn set_peer_prekey(&mut self, peer: &PublicKey, prekey: &PublicKey) {
+        match self.loro.iter_mut().find(|(p, _)| p == peer) {
+            Some((_, k)) => *k = prekey.clone(),
+            None => self.loro.push((peer.clone(), prekey.clone())),
+        }
+    }
+
+    pub fn my_prekeys(&self, peer: &PublicKey) -> Vec<[u8; KEY_LEN]> {
+        self.mie
+            .iter()
+            .find(|(p, _)| p == peer)
+            .map(|(_, v)| v.iter().map(|s| **s).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn push_my_prekey(&mut self, peer: &PublicKey, secret: [u8; KEY_LEN]) {
+        match self.mie.iter_mut().find(|(p, _)| p == peer) {
+            Some((_, v)) => {
+                v.insert(0, Zeroizing::new(secret));
+                // `truncate` fa cadere le eccedenti, e cadendo si azzerano.
+                v.truncate(MAX_PREKEY_MIE);
+            }
+            None => self.mie.push((peer.clone(), vec![Zeroizing::new(secret)])),
+        }
+    }
+
+    /// Vedi [`Keyring::drop_my_prekeys_older_than`]. Se la chiave indicata non
+    /// c'e' piu' non si butta niente: significa che e' gia' caduta, e trattare
+    /// "non trovata" come "buttale tutte" cancellerebbe anche le piu' recenti.
+    pub fn drop_my_prekeys_older_than(&mut self, peer: &PublicKey, secret: &[u8; KEY_LEN]) {
+        if let Some((_, v)) = self.mie.iter_mut().find(|(p, _)| p == peer) {
+            if let Some(i) = v.iter().position(|s| &**s == secret) {
+                v.truncate(i.saturating_add(1));
+            }
+        }
+    }
+
+    /// Chi dimentica un contatto deve chiamarla: senza, le chiavi private
+    /// temporanee verso quella persona resterebbero su disco dopo che l'utente
+    /// ha chiesto di cancellarla.
+    pub fn forget(&mut self, peer: &PublicKey) {
+        self.loro.retain(|(p, _)| p != peer);
+        self.mie.retain(|(p, _)| p != peer);
+    }
+
+    /// Per chi deve scrivere lo stato su disco.
+    pub fn dump(&self) -> Vec<(PublicKey, Option<PublicKey>, Vec<[u8; KEY_LEN]>)> {
+        let mut fuori: Vec<(PublicKey, Option<PublicKey>, Vec<[u8; KEY_LEN]>)> = Vec::new();
+        for (peer, loro) in &self.loro {
+            fuori.push((peer.clone(), Some(loro.clone()), self.my_prekeys(peer)));
+        }
+        for (peer, _) in &self.mie {
+            if !fuori.iter().any(|(p, _, _)| p == peer) {
+                fuori.push((peer.clone(), None, self.my_prekeys(peer)));
+            }
+        }
+        fuori
+    }
+
+    /// Per chi lo rilegge. Le nostre chiavi vanno passate dalla piu' recente,
+    /// cioe' nell'ordine in cui [`Self::dump`] le ha restituite: l'ordine e'
+    /// significativo, e' quello che decide cosa cade.
+    pub fn restore(&mut self, peer: &PublicKey, loro: Option<PublicKey>, mie: Vec<[u8; KEY_LEN]>) {
+        if let Some(k) = loro {
+            self.set_peer_prekey(peer, &k);
+        }
+        if !mie.is_empty() {
+            let mut v: Vec<Zeroizing<[u8; KEY_LEN]>> =
+                mie.into_iter().map(Zeroizing::new).collect();
+            v.truncate(MAX_PREKEY_MIE);
+            match self.mie.iter_mut().find(|(p, _)| p == peer) {
+                Some((_, dentro)) => *dentro = v,
+                None => self.mie.push((peer.clone(), v)),
+            }
+        }
+    }
+}
+
 pub trait Keyring {
     /// Registra il peer se nuovo, senza etichetta.
     fn tofu_pin(&mut self, peer: &PublicKey, now_unix: i64) -> Result<PinOutcome>;
@@ -377,7 +491,103 @@ pub trait Keyring {
 }
 
 #[cfg(test)]
+// I divieti valgono per il codice di produzione: in un test un panic e' il
+// modo in cui si segnala il fallimento.
+#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
+    use super::*;
+
+    fn peer(n: u8) -> PublicKey {
+        PublicKey::from_bytes([n; KEY_LEN])
+    }
+
+    /// Il caso normale: mando due messaggi di fila, l'altro apre il secondo, e
+    /// il primo deve restare apribile. E' la ragione per cui non se ne tiene
+    /// una sola.
+    #[test]
+    fn buttare_il_vecchio_non_e_buttare_tutto() {
+        let mut store = PrekeyStore::default();
+        store.push_my_prekey(&peer(1), [10; KEY_LEN]);
+        store.push_my_prekey(&peer(1), [11; KEY_LEN]);
+        store.push_my_prekey(&peer(1), [12; KEY_LEN]);
+
+        // La piu' recente per prima: e' l'ordine in cui si prova ad aprire.
+        assert_eq!(store.my_prekeys(&peer(1))[0], [12; KEY_LEN]);
+
+        // Arriva un messaggio cifrato con la penultima: cade solo cio' che e'
+        // piu' vecchio di lei.
+        store.drop_my_prekeys_older_than(&peer(1), &[11; KEY_LEN]);
+        assert_eq!(
+            store.my_prekeys(&peer(1)),
+            vec![[12; KEY_LEN], [11; KEY_LEN]]
+        );
+    }
+
+    /// Se la chiave indicata e' gia' caduta non si butta niente: trattare "non
+    /// trovata" come "buttale tutte" ucciderebbe anche i messaggi in viaggio.
+    #[test]
+    fn una_chiave_gia_caduta_non_ne_trascina_altre() {
+        let mut store = PrekeyStore::default();
+        store.push_my_prekey(&peer(1), [10; KEY_LEN]);
+        store.drop_my_prekeys_older_than(&peer(1), &[99; KEY_LEN]);
+        assert_eq!(store.my_prekeys(&peer(1)), vec![[10; KEY_LEN]]);
+    }
+
+    #[test]
+    fn la_finestra_non_diventa_un_archivio() {
+        let mut store = PrekeyStore::default();
+        for i in 0..10u8 {
+            store.push_my_prekey(&peer(1), [i; KEY_LEN]);
+        }
+        assert_eq!(store.my_prekeys(&peer(1)).len(), MAX_PREKEY_MIE);
+        assert_eq!(store.my_prekeys(&peer(1))[0], [9; KEY_LEN]);
+    }
+
+    /// Dimenticare un contatto deve portarsi via anche le chiavi private verso
+    /// di lui, altrimenti restano su disco dopo che l'utente ha cancellato.
+    #[test]
+    fn dimenticare_porta_via_anche_le_chiavi() {
+        let mut store = PrekeyStore::default();
+        store.set_peer_prekey(&peer(1), &peer(50));
+        store.push_my_prekey(&peer(1), [10; KEY_LEN]);
+        store.set_peer_prekey(&peer(2), &peer(51));
+
+        store.forget(&peer(1));
+        assert!(store.peer_prekey(&peer(1)).is_none());
+        assert!(store.my_prekeys(&peer(1)).is_empty());
+        assert_eq!(store.peer_prekey(&peer(2)), Some(peer(51)));
+    }
+
+    /// Un riavvio non deve rendere illeggibili i messaggi gia' in viaggio:
+    /// l'ordine sopravvive, ed e' l'ordine che decide cosa cade.
+    #[test]
+    fn lo_stato_sopravvive_al_giro_su_disco() {
+        let mut store = PrekeyStore::default();
+        store.set_peer_prekey(&peer(1), &peer(50));
+        store.push_my_prekey(&peer(1), [10; KEY_LEN]);
+        store.push_my_prekey(&peer(1), [11; KEY_LEN]);
+        // Un contatto che ci ha scritto ma a cui non abbiamo ancora risposto:
+        // ha una chiave loro e nessuna nostra.
+        store.set_peer_prekey(&peer(2), &peer(51));
+        // E uno a cui abbiamo scritto per primi: nostre e basta.
+        store.push_my_prekey(&peer(3), [30; KEY_LEN]);
+
+        let mut riletto = PrekeyStore::default();
+        for (chi, loro, mie) in store.dump() {
+            riletto.restore(&chi, loro, mie);
+        }
+
+        assert_eq!(riletto.peer_prekey(&peer(1)), Some(peer(50)));
+        assert_eq!(
+            riletto.my_prekeys(&peer(1)),
+            vec![[11; KEY_LEN], [10; KEY_LEN]]
+        );
+        assert_eq!(riletto.peer_prekey(&peer(2)), Some(peer(51)));
+        assert!(riletto.my_prekeys(&peer(2)).is_empty());
+        assert!(riletto.peer_prekey(&peer(3)).is_none());
+        assert_eq!(riletto.my_prekeys(&peer(3)), vec![[30; KEY_LEN]]);
+    }
+
     // - generate() con RNG a seme fisso e' riproducibile
     // - SecretKey non implementa Debug/Display/Serialize (test di compilazione)
     // - fingerprint stabile: vettore congelato pubkey -> stringa

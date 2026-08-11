@@ -71,12 +71,18 @@ kc — l'altra parte di keyboard-cipher, per provare la tastiera da soli.
   kc name <chi> <nome>     attribuisce un nome a una chiave
   kc verify <chi>          segna il fingerprint come confrontato di persona
   kc encrypt --to <chi> [testo]   cifra (se manca il testo, legge da stdin)
+                                  --no-fs: senza forward secrecy, rileggibile
   kc decrypt [blob]        decifra un messaggio o fissa una presentazione
   kc sealfile --to <chi> <file>    cifra un file, scrive <file>.kc
   kc openfile <file.kc> [dove]     apre un allegato cifrato
   kc archive <esportazione>        decifra tutti i messaggi di una chat esportata
 
 <chi> e' un nome, un indice di `kc contacts`, o l'inizio di un fingerprint.
+
+La forward secrecy e' accesa: ogni messaggio porta una chiave nuova e leggere
+una risposta butta le vecchie. Chi ti sequestra il telefono domani non apre i
+messaggi di oggi — e non li apri piu' nemmeno tu. Con `--no-fs` restano
+rileggibili, e `kc archive` funziona.
 
 Lo stato sta in $KC_HOME oppure in ~/.local/share/keyboard-cipher/state, con
 permessi 0600. La chiave privata e' in chiaro: sul telefono la protegge Android
@@ -209,15 +215,27 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Cifra un messaggio.
+///
+/// **Forward secrecy accesa di default**, come sul telefono: ogni messaggio
+/// porta una chiave temporanea nuova, e leggendo la risposta si buttano le
+/// vecchie. Il prezzo e' che i messaggi non si riaprono una seconda volta, e
+/// `--no-fs` serve a chi quel prezzo non lo vuole pagare — per esempio per
+/// tenere una conversazione rileggibile con `kc archive`.
 fn cmd_encrypt(args: &[String]) -> Result<(), String> {
     let mut who: Option<&str> = None;
     let mut text: Vec<&str> = Vec::new();
+    let mut forward = true;
     let mut i = 0;
     while let Some(arg) = args.get(i) {
         match arg.as_str() {
             "--to" | "-t" => {
                 who = args.get(i.saturating_add(1)).map(String::as_str);
                 i = i.saturating_add(2);
+            }
+            "--no-fs" => {
+                forward = false;
+                i = i.saturating_add(1);
             }
             other => {
                 text.push(other);
@@ -227,6 +245,7 @@ fn cmd_encrypt(args: &[String]) -> Result<(), String> {
     }
     let who = who.ok_or("manca --to <chi>. Vedi `kc help`.")?;
     let state = load()?;
+    let secret = state.secret_bytes();
     let peer = resolve(&state.keyring, who)?;
 
     let plaintext = if text.is_empty() {
@@ -243,8 +262,12 @@ fn cmd_encrypt(args: &[String]) -> Result<(), String> {
         .set_current_peer(APP, &peer)
         .map_err(|e| format!("{e}"))?;
     let blob = session
-        .encrypt_for_app(APP, plaintext.as_bytes(), now_unix(), &mut OsRng)
+        .encrypt_for_app_with(APP, plaintext.as_bytes(), now_unix(), &mut OsRng, forward)
         .map_err(|e| format!("{e}"))?;
+    // Senza questo la forward secrecy non funzionerebbe affatto: cifrare
+    // genera una chiave temporanea nuova, e se non la si salva la risposta
+    // dell'altro arriva cifrata verso una chiave che non esiste piu'.
+    persist(&secret, &session)?;
     println!("{blob}");
     Ok(())
 }
@@ -447,13 +470,13 @@ fn cmd_archive(args: &[String]) -> Result<(), String> {
             .unwrap_or(dopo.len());
         let blob = dopo.get(..fine).unwrap_or("");
         resto = dopo.get(fine.max(SENTINEL.len())..).unwrap_or("");
-        trovati += 1;
+        trovati = trovati.saturating_add(1);
 
         // `Session::open_archived` non tocca il keyring: qui interessa leggere,
         // non riconoscere chi scrive.
         match session.open_archived(blob) {
             Ok((mittente, plaintext)) => {
-                aperti += 1;
+                aperti = aperti.saturating_add(1);
                 let nome = Keyring::get(session.keyring(), &mittente)
                     .ok()
                     .flatten()

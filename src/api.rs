@@ -568,46 +568,25 @@ mod tests {
     #[derive(Default)]
     struct KeyringInMemoria {
         peers: Vec<PeerRecord>,
-        // Vec e non HashMap: `PublicKey` non implementa `Hash` apposta, per
-        // non finire usata come chiave di mappa senza pensarci.
-        prekey_loro: Vec<(PublicKey, PublicKey)>,
-        prekey_mie: Vec<(PublicKey, Vec<[u8; 32]>)>,
+        prekey: crate::keys::PrekeyStore,
     }
 
     impl Keyring for KeyringInMemoria {
         fn peer_prekey(&self, peer: &PublicKey) -> Result<Option<PublicKey>> {
-            Ok(self
-                .prekey_loro
-                .iter()
-                .find(|(p, _)| p == peer)
-                .map(|(_, k)| k.clone()))
+            Ok(self.prekey.peer_prekey(peer))
         }
 
         fn set_peer_prekey(&mut self, peer: &PublicKey, prekey: &PublicKey) -> Result<()> {
-            match self.prekey_loro.iter_mut().find(|(p, _)| p == peer) {
-                Some((_, k)) => *k = prekey.clone(),
-                None => self.prekey_loro.push((peer.clone(), prekey.clone())),
-            }
+            self.prekey.set_peer_prekey(peer, prekey);
             Ok(())
         }
 
         fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<[u8; 32]>> {
-            Ok(self
-                .prekey_mie
-                .iter()
-                .find(|(p, _)| p == peer)
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default())
+            Ok(self.prekey.my_prekeys(peer))
         }
 
         fn push_my_prekey(&mut self, peer: &PublicKey, secret: [u8; 32]) -> Result<()> {
-            match self.prekey_mie.iter_mut().find(|(p, _)| p == peer) {
-                Some((_, v)) => {
-                    v.insert(0, secret);
-                    v.truncate(3);
-                }
-                None => self.prekey_mie.push((peer.clone(), vec![secret])),
-            }
+            self.prekey.push_my_prekey(peer, secret);
             Ok(())
         }
 
@@ -616,11 +595,7 @@ mod tests {
             peer: &PublicKey,
             secret: &[u8; 32],
         ) -> Result<()> {
-            if let Some((_, v)) = self.prekey_mie.iter_mut().find(|(p, _)| p == peer) {
-                if let Some(i) = v.iter().position(|s| s == secret) {
-                    v.truncate(i.saturating_add(1));
-                }
-            }
+            self.prekey.drop_my_prekeys_older_than(peer, secret);
             Ok(())
         }
 
@@ -632,6 +607,7 @@ mod tests {
             match self.peers.iter().position(|p| &p.public == peer) {
                 Some(i) => {
                     self.peers.remove(i);
+                    self.prekey.forget(peer);
                     Ok(true)
                 }
                 None => Ok(false),
