@@ -1,5 +1,0 @@
-/home/user/tastieraNoCC/cli/target/debug/deps/zeroize_derive-f51fe237b94b7f5c.d: /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize_derive-1.5.0/src/lib.rs
-
-/home/user/tastieraNoCC/cli/target/debug/deps/libzeroize_derive-f51fe237b94b7f5c.so: /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize_derive-1.5.0/src/lib.rs
-
-/home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize_derive-1.5.0/src/lib.rs:

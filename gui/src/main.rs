@@ -88,6 +88,12 @@ struct App {
     /// Contatto che si sta per dimenticare, in attesa di conferma.
     da_dimenticare: Option<usize>,
 
+    /// Forward secrecy: una chiave temporanea nuova a ogni messaggio, e le
+    /// vecchie buttate quando arriva una risposta. Accesa di default, come sul
+    /// telefono. Spegnerla serve a chi vuole poter rileggere: con questa
+    /// accesa "ricostruisci chat" non riapre niente, per costruzione.
+    forward_secrecy: bool,
+
     /// Guardare gli appunti per accorgersi dei messaggi copiati altrove.
     sorveglia_appunti: bool,
     /// Tenere la finestra sopra le altre: per leggere senza uscire dalla chat.
@@ -146,6 +152,7 @@ impl App {
             nuovo_nome: String::new(),
             conflitto: None,
             da_dimenticare: None,
+            forward_secrecy: true,
             sorveglia_appunti: true,
             sempre_sopra: false,
             appunti: arboard::Clipboard::new().ok(),
@@ -257,13 +264,24 @@ impl App {
         }
         let chiave = contatto.chiave.clone();
         let Some(stato) = self.stato() else { return };
+        let secret = stato.secret_bytes();
         let mut session = Session::new(stato.identity, stato.keyring);
         if let Err(e) = session.set_current_peer(APP, &chiave) {
             self.avviso = Some((format!("{e}"), true));
             return;
         }
-        match session.encrypt_for_app(APP, self.messaggio.as_bytes(), adesso(), &mut OsRng) {
+        match session.encrypt_for_app_with(
+            APP,
+            self.messaggio.as_bytes(),
+            adesso(),
+            &mut OsRng,
+            self.forward_secrecy,
+        ) {
             Ok(blob) => {
+                // Su disco subito: con la forward secrecy accesa cifrare
+                // genera una chiave temporanea nuova, e non salvarla
+                // significa non poter aprire la risposta.
+                self.salva(&secret, session.keyring());
                 ctx.copy_text(blob);
                 self.messaggio.clear();
                 self.avviso = Some((
@@ -623,7 +641,7 @@ impl App {
             let scelto = self
                 .destinatario
                 .and_then(|i| self.contatti.get(i))
-                .map(|c| etichetta(c))
+                .map(etichetta)
                 .unwrap_or_else(|| "— scegli —".to_owned());
             egui::ComboBox::from_id_salt("destinatario")
                 .selected_text(scelto)
@@ -641,9 +659,19 @@ impl App {
                 .hint_text("Scrivi qui il messaggio in chiaro"),
         );
         ui.add_space(8.0);
-        if ui.button("Cifra e copia").clicked() {
-            self.cifra(ctx);
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Cifra e copia").clicked() {
+                self.cifra(ctx);
+            }
+            ui.add_space(16.0);
+            ui.checkbox(&mut self.forward_secrecy, "Forward secrecy")
+                .on_hover_text(
+                    "Ogni messaggio porta una chiave nuova, e leggere una risposta butta le \
+                     vecchie. Chi ti prende il computer domani non apre i messaggi di oggi — \
+                     e non li apri piu' nemmeno tu: con questa accesa «Ricostruisci chat» \
+                     non riapre niente.",
+                );
+        });
     }
 
     fn scheda_leggi(&mut self, ui: &mut egui::Ui) {

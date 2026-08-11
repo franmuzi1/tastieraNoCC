@@ -14,10 +14,19 @@
 
 use keyboard_cipher_core::error::{Error, Result};
 use keyboard_cipher_core::keys::{
-    Fingerprint, Keyring, LabelOutcome, PeerRecord, PinOutcome, PublicKey, KEY_LEN,
+    Fingerprint, Keyring, LabelOutcome, PeerRecord, PinOutcome, PrekeyStore, PublicKey, KEY_LEN,
+    MAX_PREKEY_MIE,
 };
 
-const STORAGE_VERSION: u8 = 1;
+/// La 2 aggiunge la catena di forward secrecy in coda.
+///
+/// **Si scrive la 2 e si leggono entrambe.** Chi aggiorna l'app ha gia' un
+/// keyring versione 1 su disco: rifiutarlo significherebbe cancellare i
+/// contatti di tutti a un aggiornamento, cioe' ri-fissare ogni chiave al
+/// prossimo messaggio — accettare in silenzio un eventuale MITM, che e'
+/// esattamente cio' che l'errore su blob corrotto serve a evitare.
+const STORAGE_VERSION: u8 = 2;
+const STORAGE_VERSION_SENZA_CATENA: u8 = 1;
 /// pubkey + first_seen(i64) + verified(u8) + lunghezza etichetta(u16)
 const RECORD_LEN: usize = KEY_LEN + 8 + 1 + 2;
 /// Un'etichetta e' un nome scelto dall'utente, non un campo libero di rete.
@@ -26,6 +35,11 @@ const MAX_LABEL_LEN: usize = 256;
 #[derive(Default)]
 pub struct MemoryKeyring {
     peers: Vec<PeerRecord>,
+    /// Contiene chiavi PRIVATE temporanee. Questo blob e' gia' cifrato dalla
+    /// JVM con una chiave in Android Keystore prima di toccare il disco: e' la
+    /// stessa protezione dell'identita', e serve, perche' finche' queste
+    /// chiavi esistono i messaggi che le usavano si riaprono.
+    prekey: PrekeyStore,
 }
 
 impl MemoryKeyring {
@@ -55,6 +69,26 @@ impl MemoryKeyring {
                 out.extend_from_slice(etichetta);
             }
         }
+        let catena = self.prekey.dump();
+        let quante = u32::try_from(catena.len()).unwrap_or(0);
+        out.extend_from_slice(&quante.to_le_bytes());
+        for (chi, loro, mie) in catena.iter().take(quante as usize) {
+            out.extend_from_slice(chi.as_bytes());
+            match loro {
+                Some(k) => {
+                    out.push(1);
+                    out.extend_from_slice(k.as_bytes());
+                }
+                // Un contatto a cui abbiamo scritto per primi non ha ancora
+                // una chiave sua.
+                None => out.push(0),
+            }
+            let quante_mie = u8::try_from(mie.len()).unwrap_or(0);
+            out.push(quante_mie);
+            for segreto in mie.iter().take(usize::from(quante_mie)) {
+                out.extend_from_slice(segreto);
+            }
+        }
         out
     }
 
@@ -67,7 +101,7 @@ impl MemoryKeyring {
     pub fn import(bytes: &[u8]) -> Result<Self> {
         let mut cursor = bytes.iter().copied();
         let version = cursor.next().ok_or(Error::Keyring)?;
-        if version != STORAGE_VERSION {
+        if version != STORAGE_VERSION && version != STORAGE_VERSION_SENZA_CATENA {
             return Err(Error::Keyring);
         }
 
@@ -117,10 +151,41 @@ impl MemoryKeyring {
                 verified: verified != 0,
             });
         }
+        let mut prekey = PrekeyStore::default();
+        if version == STORAGE_VERSION {
+            let mut quante_bytes = [0u8; 4];
+            for slot in quante_bytes.iter_mut() {
+                *slot = cursor.next().ok_or(Error::Keyring)?;
+            }
+            let quante =
+                usize::try_from(u32::from_le_bytes(quante_bytes)).map_err(|_| Error::Keyring)?;
+            for _ in 0..quante {
+                let chi = PublicKey::from_bytes(prendi_chiave(&mut cursor)?);
+                let loro = match cursor.next().ok_or(Error::Keyring)? {
+                    0 => None,
+                    1 => Some(PublicKey::from_bytes(prendi_chiave(&mut cursor)?)),
+                    _ => return Err(Error::Keyring),
+                };
+                let quante_mie = usize::from(cursor.next().ok_or(Error::Keyring)?);
+                if quante_mie > MAX_PREKEY_MIE {
+                    return Err(Error::Keyring);
+                }
+                let mut mie = Vec::with_capacity(quante_mie);
+                for _ in 0..quante_mie {
+                    mie.push(prendi_chiave(&mut cursor)?);
+                }
+                prekey.restore(&chi, loro, mie);
+            }
+        }
         if cursor.next().is_some() {
             return Err(Error::Keyring);
         }
-        Ok(Self { peers })
+        Ok(Self { peers, prekey })
+    }
+
+    #[cfg(test)]
+    fn catena(&self) -> &PrekeyStore {
+        &self.prekey
     }
 
     fn find(&self, peer: &PublicKey) -> Option<&PeerRecord> {
@@ -137,6 +202,10 @@ impl Keyring for MemoryKeyring {
         match self.peers.iter().position(|p| &p.public == peer) {
             Some(indice) => {
                 self.peers.remove(indice);
+                // Anche le chiavi temporanee: restare dopo che l'utente ha
+                // cancellato il contatto sarebbe il contrario di cio' che ha
+                // chiesto.
+                self.prekey.forget(peer);
                 Ok(true)
             }
             None => Ok(false),
@@ -204,6 +273,33 @@ impl Keyring for MemoryKeyring {
         Ok(self.find(peer).cloned())
     }
 
+    fn peer_prekey(&self, peer: &PublicKey) -> Result<Option<PublicKey>> {
+        Ok(self.prekey.peer_prekey(peer))
+    }
+
+    fn set_peer_prekey(&mut self, peer: &PublicKey, prekey: &PublicKey) -> Result<()> {
+        self.prekey.set_peer_prekey(peer, prekey);
+        Ok(())
+    }
+
+    fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<[u8; KEY_LEN]>> {
+        Ok(self.prekey.my_prekeys(peer))
+    }
+
+    fn push_my_prekey(&mut self, peer: &PublicKey, secret: [u8; KEY_LEN]) -> Result<()> {
+        self.prekey.push_my_prekey(peer, secret);
+        Ok(())
+    }
+
+    fn drop_my_prekeys_older_than(
+        &mut self,
+        peer: &PublicKey,
+        secret: &[u8; KEY_LEN],
+    ) -> Result<()> {
+        self.prekey.drop_my_prekeys_older_than(peer, secret);
+        Ok(())
+    }
+
     fn mark_verified(&mut self, peer: &PublicKey) -> Result<()> {
         match self
             .peers
@@ -217,6 +313,14 @@ impl Keyring for MemoryKeyring {
             None => Err(Error::UnknownPeer),
         }
     }
+}
+
+fn prendi_chiave(cursor: &mut impl Iterator<Item = u8>) -> Result<[u8; KEY_LEN]> {
+    let mut chiave = [0u8; KEY_LEN];
+    for slot in chiave.iter_mut() {
+        *slot = cursor.next().ok_or(Error::Keyring)?;
+    }
+    Ok(chiave)
 }
 
 #[cfg(test)]
@@ -253,11 +357,75 @@ mod tests {
         assert_eq!(secondo.label.as_deref(), Some("Marco è qui ✓"));
     }
 
+    /// Chi aggiorna l'app ha un keyring versione 1 su disco. Deve continuare a
+    /// caricarsi: rifiutarlo cancellerebbe i contatti di tutti, e il prossimo
+    /// messaggio ri-fisserebbe ogni chiave senza chiedere niente a nessuno.
+    #[test]
+    fn un_keyring_di_prima_si_carica_ancora() {
+        let mut keyring = MemoryKeyring::new();
+        keyring.tofu_pin(&key(1), 100).unwrap();
+        keyring.assign_label(&key(1), "Marco").unwrap();
+
+        // Un blob versione 1 e' un versione 2 senza la coda della catena.
+        let mut vecchio = keyring.export();
+        let taglio = vecchio.len().checked_sub(4).unwrap();
+        vecchio.truncate(taglio);
+        *vecchio.first_mut().unwrap() = 1;
+
+        let riletto = MemoryKeyring::import(&vecchio).unwrap();
+        assert_eq!(
+            riletto.get(&key(1)).unwrap().unwrap().label.as_deref(),
+            Some("Marco")
+        );
+        assert!(riletto.peer_prekey(&key(1)).unwrap().is_none());
+    }
+
+    /// La catena deve sopravvivere al giro su disco **nel suo ordine**: e'
+    /// l'ordine che decide quali messaggi in viaggio restano apribili.
+    #[test]
+    fn la_catena_sopravvive_al_round_trip() {
+        let mut keyring = MemoryKeyring::new();
+        keyring.tofu_pin(&key(1), 100).unwrap();
+        keyring.tofu_pin(&key(2), 200).unwrap();
+        keyring.set_peer_prekey(&key(1), &key(50)).unwrap();
+        keyring.push_my_prekey(&key(1), [10; KEY_LEN]).unwrap();
+        keyring.push_my_prekey(&key(1), [11; KEY_LEN]).unwrap();
+        // Contatto a cui abbiamo scritto per primi: nessuna chiave sua.
+        keyring.push_my_prekey(&key(2), [20; KEY_LEN]).unwrap();
+
+        let riletto = MemoryKeyring::import(&keyring.export()).unwrap();
+        assert_eq!(riletto.peer_prekey(&key(1)).unwrap(), Some(key(50)));
+        assert_eq!(
+            riletto.my_prekeys(&key(1)).unwrap(),
+            vec![[11; KEY_LEN], [10; KEY_LEN]]
+        );
+        assert_eq!(riletto.peer_prekey(&key(2)).unwrap(), None);
+        assert_eq!(riletto.my_prekeys(&key(2)).unwrap(), vec![[20; KEY_LEN]]);
+        assert_eq!(riletto.catena().dump().len(), 2);
+    }
+
+    /// Dimenticare un contatto porta via anche le sue chiavi temporanee, che
+    /// altrimenti resterebbero nel blob salvato su disco.
+    #[test]
+    fn dimenticare_svuota_anche_la_catena() {
+        let mut keyring = MemoryKeyring::new();
+        keyring.tofu_pin(&key(1), 1).unwrap();
+        keyring.set_peer_prekey(&key(1), &key(50)).unwrap();
+        keyring.push_my_prekey(&key(1), [10; KEY_LEN]).unwrap();
+
+        assert!(keyring.forget(&key(1)).unwrap());
+        assert!(keyring.catena().dump().is_empty());
+        let riletto = MemoryKeyring::import(&keyring.export()).unwrap();
+        assert!(riletto.my_prekeys(&key(1)).unwrap().is_empty());
+    }
+
     /// Un blob corrotto deve fallire, non degradare a keyring vuoto.
     #[test]
     fn blob_corrotto_e_un_errore() {
         let mut keyring = MemoryKeyring::new();
         keyring.tofu_pin(&key(1), 1).unwrap();
+        keyring.set_peer_prekey(&key(1), &key(50)).unwrap();
+        keyring.push_my_prekey(&key(1), [10; KEY_LEN]).unwrap();
         let buono = keyring.export();
 
         for taglio in 1..buono.len() {

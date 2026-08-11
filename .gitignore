@@ -26,5 +26,10 @@ fuzz/target
 # quelli vanno versionati, sono la riproduzione di un bug.
 fuzz/corpus
 
-# Artefatti di build del crate JNI, che ha un workspace suo.
+# Artefatti di build dei crate fuori dal workspace del core, che hanno un
+# `target/` per uno. La riga `/target` in cima copre solo la radice, e senza
+# queste un `git add -A` si porta dentro centinaia di MB — con il push
+# rifiutato da GitHub come unico avviso.
 jni/target/
+cli/target/
+gui/target/

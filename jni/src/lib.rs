@@ -632,6 +632,10 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeLooksLike
 }
 
 /// Cifra verso il destinatario corrente dell'app. `null` se non c'e'.
+///
+/// Con `forward` diverso da zero **modifica il keyring**: ci mette una chiave
+/// temporanea nuova. Chi chiama deve esportarlo e persisterlo subito, altrimenti
+/// la risposta arrivera' cifrata verso una chiave che non esiste piu'.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptForApp(
     mut env: JNIEnv,
@@ -639,7 +643,7 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFo
     app_package: JString,
     plaintext: JByteArray,
     now_unix: jlong,
-    effimero: jboolean,
+    forward: jboolean,
 ) -> jstring {
     guard(std::ptr::null_mut(), || {
         let nullo: jstring = std::ptr::null_mut();
@@ -651,7 +655,7 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFo
         };
 
         let esito = with_session(|session| {
-            session.encrypt_for_app_with(&package, &bytes, now_unix, &mut OsRng, effimero != 0)
+            session.encrypt_for_app_with(&package, &bytes, now_unix, &mut OsRng, forward != 0)
         });
         // La copia Rust del plaintext sparisce subito; quella Java la azzera
         // il chiamante.
