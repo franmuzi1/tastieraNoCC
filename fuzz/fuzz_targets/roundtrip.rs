@@ -38,11 +38,13 @@ fuzz_target!(|data: &[u8]| {
         // Tutte e quattro le origini, cosi' il round-trip copre anche gli
         // schemi a mittente effimero: senza, il fuzzer proverebbe solo la
         // meta' del formato che esisteva prima della catena.
-        origin: match controllo & 0b1100 {
-            0b0000 => Origin::Assente,
-            0b0100 => Origin::Mittente(PublicKey::from_bytes(chiave)),
-            0b1000 => Origin::Effimera(PublicKey::from_bytes(chiave)),
-            _ => Origin::EffimeraConPrekey(PublicKey::from_bytes(chiave)),
+        origin: match controllo % 6 {
+            0 => Origin::Assente,
+            1 => Origin::Mittente(PublicKey::from_bytes(chiave)),
+            2 => Origin::Effimera(PublicKey::from_bytes(chiave)),
+            3 => Origin::EffimeraConPrekey(PublicKey::from_bytes(chiave)),
+            4 => Origin::MittenteConEpoca(PublicKey::from_bytes(chiave)),
+            _ => Origin::MittenteConPrekey(PublicKey::from_bytes(chiave)),
         },
         nonce,
     };

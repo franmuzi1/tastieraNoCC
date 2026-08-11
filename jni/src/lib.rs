@@ -76,6 +76,9 @@ mod code {
     pub const ITEM_OWN_MESSAGE: jint = 3;
     /// Un allegato nostro, riaperto. Come sopra: il peer e' il destinatario.
     pub const ITEM_OWN_FILE: jint = 4;
+    /// L'altro ha chiesto di bruciare la conversazione, e l'abbiamo fatto.
+    /// Non c'e' testo: e' un gesto, non un messaggio.
+    pub const ITEM_BURNED: jint = 5;
 
     /// Esiti di `assignLabel`.
     pub const LABEL_ASSIGNED: jint = 0;
@@ -782,6 +785,26 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
                 }
                 code::OK
             }
+            IncomingItem::Burned { peer } => {
+                if !set_int("kind", code::ITEM_BURNED) || !set_int("verified", 0) {
+                    return code::INTERNAL;
+                }
+                let fingerprint = keyboard_cipher_core::keys::Fingerprint::of(&peer);
+                let etichetta = session_label(&peer).unwrap_or_default();
+                if !fill_strings(&mut env, &result, &fingerprint.display(), etichetta.as_deref()) {
+                    return code::INTERNAL;
+                }
+                let Ok(chiave) = env.byte_array_from_slice(peer.as_bytes()) else {
+                    return code::INTERNAL;
+                };
+                if env
+                    .set_field(&result, "senderKey", "[B", (&chiave).into())
+                    .is_err()
+                {
+                    return code::INTERNAL;
+                }
+                code::OK
+            }
             IncomingItem::OwnMessage {
                 recipient,
                 recipient_label,
@@ -997,6 +1020,53 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeExportKey
         match guard.as_mut() {
             Some(session) => new_byte_array(&env, &session.keyring().export()),
             None => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Nome del peer. Riprende il lucchetto della sessione invece di riusare quello
+/// del chiamante: qui non siamo dentro un'operazione crypto, quindi il costo e'
+/// nullo e il codice resta leggibile.
+fn session_label(
+    peer: &keyboard_cipher_core::keys::PublicKey,
+) -> keyboard_cipher_core::Result<Option<String>> {
+    let mut guard = match session_slot().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match guard.as_mut() {
+        Some(session) => Ok(session.keyring().get(peer)?.and_then(|r| r.label)),
+        None => Ok(None),
+    }
+}
+
+/// **Brucia la conversazione** con un peer (decisione J).
+///
+/// Ritorna il blob da consegnare all'altra persona, oppure `null`. Da questo
+/// lato l'effetto e' gia' avvenuto quando la funzione ritorna: **il chiamante
+/// deve persistere subito**, altrimenti un processo che muore lascia le chiavi
+/// su disco e il rogo non e' avvenuto.
+///
+/// Dall'altro lato e' una richiesta, non un comando: chi riceve deve avere
+/// un'app che la onora. Non raccontarlo come cancellazione garantita.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeBurnConversation(
+    env: JNIEnv,
+    _class: JClass,
+    peer: JByteArray,
+    now_unix: jlong,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let mut env = env;
+        let nullo: jstring = std::ptr::null_mut();
+        let Ok(chiave) = read_key(&mut env, &peer) else {
+            return nullo;
+        };
+        let esito =
+            with_session(|session| session.burn_conversation(&chiave, now_unix, &mut OsRng));
+        match esito {
+            Ok(blob) => new_string(&env, &blob),
+            Err(_) => nullo,
         }
     })
 }

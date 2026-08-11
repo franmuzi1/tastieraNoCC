@@ -115,6 +115,15 @@ pub enum Kind {
     /// parser resta uno solo e `kind` sta gia' nell'AAD: un file non puo'
     /// essere fatto passare per un messaggio, ne' viceversa.
     File = 2,
+    /// **Richiesta di bruciare** (decisione J): "distruggi la chiave d'epoca
+    /// con cui ci scriviamo".
+    ///
+    /// Non porta testo: e' il gesto, non un messaggio. Viaggia cifrato come
+    /// tutto il resto, quindi solo chi ha davvero quella conversazione puo'
+    /// chiederlo — ma **non e' imponibile**: chi riceve deve avere un'app che
+    /// lo onora. Verso chi non collabora non esiste cancellazione a distanza,
+    /// e questo formato non pretende il contrario.
+    Burn = 3,
 }
 
 impl Kind {
@@ -123,6 +132,7 @@ impl Kind {
             0 => Ok(Kind::Message),
             1 => Ok(Kind::IdentityCard),
             2 => Ok(Kind::File),
+            3 => Ok(Kind::Burn),
             _ => Err(Error::Format("kind sconosciuto")),
         }
     }
@@ -186,8 +196,21 @@ impl Flags {
     /// [`Flags::EPHEMERAL`], perche' senza la chiave usa-e-getta del mittente
     /// meta' della proprieta' non ci sarebbe.
     pub const PREKEY: Flags = Flags(0b0000_0100);
+    /// Il cifrato **porta** la chiave d'epoca del mittente.
+    ///
+    /// Distinto da [`Flags::PREKEY`], che dice l'opposto: *usare* quella del
+    /// destinatario. Servono separati perche' il primo messaggio di una
+    /// conversazione a epoca porta la propria senza poter usare la sua — non
+    /// ce l'ha ancora — e senza questa distinzione quel messaggio sarebbe
+    /// costretto a essere effimero, cioe' non rileggibile da chi l'ha scritto.
+    /// E' esattamente il caso che la decisione J esiste per rendere possibile.
+    ///
+    /// Negli schemi effimeri la chiave viaggia comunque, e li' questo bit
+    /// resta **spento**: quei blob esistono gia' in giro e dichiararlo adesso
+    /// li renderebbe illeggibili.
+    pub const EPOCH_OFFER: Flags = Flags(0b0000_1000);
     /// Bit definiti nella versione 1. Tutto il resto deve essere zero.
-    pub const KNOWN: Flags = Flags(0b0000_0111);
+    pub const KNOWN: Flags = Flags(0b0000_1111);
 
     pub fn contains(self, other: Flags) -> bool {
         self.0 & other.0 == other.0
@@ -227,6 +250,25 @@ pub enum Origin {
     /// chiunque — compreso lui: **la cronologia non si rilegge**, ed e' il
     /// prezzo accettato con la decisione I.
     EffimeraConPrekey(PublicKey),
+    /// La chiave del mittente in chiaro, e il cifrato porta la **nostra** chiave
+    /// d'epoca senza usare la sua: e' il primo messaggio di una conversazione a
+    /// epoca, o il primo dopo un rogo.
+    ///
+    /// Cifrato verso l'identita' del destinatario, come lo schema statico —
+    /// quindi rileggibile da entrambi, che e' il punto della decisione J.
+    MittenteConEpoca(PublicKey),
+    /// La chiave del mittente in chiaro **piu'** l'uso della chiave d'epoca del
+    /// destinatario: e' la **decisione J**, la conversazione bruciabile.
+    ///
+    /// La differenza con [`Origin::EffimeraConPrekey`] e' cio' che NON c'e':
+    /// niente chiave effimera. E' esattamente quello che rende il messaggio
+    /// rileggibile — anche da chi l'ha scritto, che puo' rifare la stessa
+    /// derivazione — e quindi la cronologia esiste.
+    ///
+    /// In cambio la riservatezza non viene dal tempo ma da un gesto: finche'
+    /// le due chiavi d'epoca esistono si legge, quando vengono distrutte non si
+    /// legge piu', da nessuna delle due parti.
+    MittenteConPrekey(PublicKey),
 }
 
 impl Origin {
@@ -235,14 +277,42 @@ impl Origin {
     }
 
     pub fn uses_prekey(&self) -> bool {
-        matches!(self, Origin::EffimeraConPrekey(_))
+        matches!(
+            self,
+            Origin::EffimeraConPrekey(_) | Origin::MittenteConPrekey(_)
+        )
+    }
+
+    /// Schema a epoca: chiave del mittente in chiaro, cifrato verso la chiave
+    /// d'epoca del destinatario. Rileggibile finche' quelle chiavi esistono.
+    pub fn uses_epoch(&self) -> bool {
+        matches!(self, Origin::MittenteConPrekey(_))
+    }
+
+    /// Il cifrato porta la chiave d'epoca del mittente **dichiarandolo**.
+    /// Gli schemi effimeri la portano comunque, ma senza il bit.
+    pub fn offers_epoch(&self) -> bool {
+        matches!(
+            self,
+            Origin::MittenteConEpoca(_) | Origin::MittenteConPrekey(_)
+        )
+    }
+
+    /// Il primo messaggio di una conversazione a epoca: porta la nostra chiave
+    /// ma non usa la sua, perche' non ce l'abbiamo ancora.
+    pub fn is_epoch_bootstrap(&self) -> bool {
+        matches!(self, Origin::MittenteConEpoca(_))
     }
 
     /// La chiave da mettere nel body, se c'e'.
     pub fn key(&self) -> Option<&PublicKey> {
         match self {
             Origin::Assente => None,
-            Origin::Mittente(k) | Origin::Effimera(k) | Origin::EffimeraConPrekey(k) => Some(k),
+            Origin::Mittente(k)
+            | Origin::Effimera(k)
+            | Origin::EffimeraConPrekey(k)
+            | Origin::MittenteConEpoca(k)
+            | Origin::MittenteConPrekey(k) => Some(k),
         }
     }
 }
@@ -270,6 +340,10 @@ impl Header {
             Origin::EffimeraConPrekey(_) => {
                 Flags(Flags::SENDER_PUB.0 | Flags::EPHEMERAL.0 | Flags::PREKEY.0)
             }
+            Origin::MittenteConEpoca(_) => Flags(Flags::SENDER_PUB.0 | Flags::EPOCH_OFFER.0),
+            Origin::MittenteConPrekey(_) => {
+                Flags(Flags::SENDER_PUB.0 | Flags::PREKEY.0 | Flags::EPOCH_OFFER.0)
+            }
         }
     }
 
@@ -278,7 +352,11 @@ impl Header {
     /// identita' significherebbe fissare nel keyring una chiave usa-e-getta.
     pub fn sender_pub(&self) -> Option<&PublicKey> {
         match &self.origin {
-            Origin::Mittente(k) => Some(k),
+            // Nello schema a epoca la chiave e' del mittente come nel caso
+            // statico: e' l'effimera a non dire chi ha scritto, non la prekey.
+            Origin::Mittente(k) | Origin::MittenteConEpoca(k) | Origin::MittenteConPrekey(k) => {
+                Some(k)
+            }
             _ => None,
         }
     }
@@ -304,6 +382,10 @@ pub struct IdentityCard {
 pub enum ParsedBlob<'a> {
     Message(ParsedEnvelope<'a>),
     IdentityCard(IdentityCard),
+    /// Una richiesta di bruciare la conversazione (decisione J). L'involucro e'
+    /// identico a quello di un messaggio: cambia solo `kind`, che sta nell'AAD
+    /// e quindi non e' scambiabile con un messaggio normale.
+    Burn(ParsedEnvelope<'a>),
 }
 
 /// Dati autenticati ma non cifrati (AAD dell'AEAD).
@@ -460,8 +542,35 @@ pub fn parse<'a>(text: &str, out: &'a mut Vec<u8>) -> Result<ParsedBlob<'a>> {
         // Qualcuno potrebbe comunque codificarne uno in z-base-32 e incollarlo,
         // e allora e' meglio dirgli che il blob non e' di questo tipo piuttosto
         // che tentare una decifratura che l'AAD farebbe fallire come "crypto".
+        Kind::Burn => parse_message(cursor).map(ParsedBlob::Burn),
         Kind::File => Err(Error::Format("un file non si incolla come testo")),
     }
+}
+
+/// Serializza una richiesta di bruciare. Dall'esterno e' indistinguibile da un
+/// messaggio: stesso sentinel, stessa forma, lunghezza nella stessa fascia.
+/// Un sentinel dedicato direbbe allo scanning "qui due persone stanno
+/// cancellando una conversazione", che e' esattamente il tipo di marcatore che
+/// mettere `kind` dentro il cifrato serve a non emettere.
+pub fn serialize_burn(header: &Header, ciphertext: &[u8]) -> String {
+    let capacity = MESSAGE_PREFIX_LEN
+        .saturating_add(KEY_LEN)
+        .saturating_add(NONCE_LEN)
+        .saturating_add(ciphertext.len());
+    let mut body = Vec::with_capacity(capacity);
+    body.push(PROTOCOL_VERSION);
+    body.push(Kind::Burn as u8);
+    body.push(header.tier as u8);
+    body.push(header.flags().0);
+    if let Some(chiave) = header.origin.key() {
+        body.extend_from_slice(chiave.as_bytes());
+    }
+    body.extend_from_slice(&header.nonce);
+    body.extend_from_slice(ciphertext);
+
+    let mut out = String::from(SENTINEL);
+    out.push_str(&encoding::encode(&body));
+    out
 }
 
 /// Serializza un file: stesso corpo di un messaggio, **senza** sentinel e
@@ -549,24 +658,38 @@ fn parse_message<'a>(mut cursor: Cursor<'a>) -> Result<ParsedEnvelope<'a>> {
     let ha_chiave = flags.contains(Flags::SENDER_PUB);
     let effimera = flags.contains(Flags::EPHEMERAL);
     let prekey = flags.contains(Flags::PREKEY);
-    if !ha_chiave && (effimera || prekey) {
+    let offre = flags.contains(Flags::EPOCH_OFFER);
+    if !ha_chiave && (effimera || prekey || offre) {
         return Err(Error::Format("effimera senza chiave"));
     }
-    // La prekey presuppone l'effimera: senza, meta' della forward secrecy non
-    // ci sarebbe e il messaggio dichiarerebbe una proprieta' che non ha.
-    if prekey && !effimera {
-        return Err(Error::Format("prekey senza effimera"));
+    // Usare la chiave d'epoca dell'altro senza portare la propria fermerebbe
+    // la conversazione al messaggio dopo: lui non avrebbe piu' niente verso cui
+    // scrivere. E' incoerente allo stesso modo di "effimera senza chiave".
+    if prekey && !effimera && !offre {
+        return Err(Error::Format("usa un'epoca senza offrirne una"));
     }
+    // Negli schemi effimeri la chiave viaggia gia' e il bit resta spento:
+    // accenderlo sarebbe una seconda fonte di verita' sullo stesso fatto.
+    if effimera && offre {
+        return Err(Error::Format("un'effimera porta gia' la propria chiave"));
+    }
+    // "Prekey senza effimera" NON e' piu' incoerente: dalla decisione J e' lo
+    // schema a epoca, dove l'assenza dell'effimera e' cio' che rende il
+    // messaggio rileggibile. Restava rifiutato per una ragione che non vale
+    // piu': allora significava soltanto "meta' della forward secrecy
+    // dichiarata e non fatta".
     let origin = if !ha_chiave {
         Origin::Assente
     } else {
         let mut bytes = [0u8; KEY_LEN];
         bytes.copy_from_slice(cursor.take(KEY_LEN)?);
         let chiave = PublicKey::from_bytes(bytes);
-        match (effimera, prekey) {
-            (false, _) => Origin::Mittente(chiave),
-            (true, false) => Origin::Effimera(chiave),
-            (true, true) => Origin::EffimeraConPrekey(chiave),
+        match (effimera, prekey, offre) {
+            (false, false, false) => Origin::Mittente(chiave),
+            (false, false, true) => Origin::MittenteConEpoca(chiave),
+            (false, true, _) => Origin::MittenteConPrekey(chiave),
+            (true, false, _) => Origin::Effimera(chiave),
+            (true, true, _) => Origin::EffimeraConPrekey(chiave),
         }
     };
 

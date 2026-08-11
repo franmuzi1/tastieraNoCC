@@ -50,6 +50,7 @@ fn run() -> Result<(), String> {
         "verify" => cmd_verify(rest),
         "encrypt" => cmd_encrypt(rest),
         "decrypt" => cmd_decrypt(rest),
+        "burn" => cmd_burn(rest),
         "sealfile" => cmd_sealfile(rest),
         "openfile" => cmd_openfile(rest),
         "archive" => cmd_archive(rest),
@@ -73,6 +74,7 @@ kc — l'altra parte di keyboard-cipher, per provare la tastiera da soli.
   kc encrypt --to <chi> [testo]   cifra (se manca il testo, legge da stdin)
                                   --no-fs: senza forward secrecy, rileggibile
   kc decrypt [blob]        decifra un messaggio o fissa una presentazione
+  kc burn <chi>            brucia la conversazione: non si rilegge piu'
   kc sealfile --to <chi> <file>    cifra un file, scrive <file>.kc (--no-fs)
   kc openfile <file.kc> [dove]     apre un allegato cifrato
   kc archive <esportazione>        decifra tutti i messaggi di una chat esportata
@@ -222,6 +224,43 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
 /// vecchie. Il prezzo e' che i messaggi non si riaprono una seconda volta, e
 /// `--no-fs` serve a chi quel prezzo non lo vuole pagare — per esempio per
 /// tenere una conversazione rileggibile con `kc archive`.
+/// Nome del peer per i messaggi a schermo, o "(senza nome)".
+fn state_label<K: keyboard_cipher_core::keys::Keyring>(
+    session: &Session<K>,
+    peer: &keyboard_cipher_core::keys::PublicKey,
+) -> String {
+    session
+        .keyring()
+        .get(peer)
+        .ok()
+        .flatten()
+        .and_then(|r| r.label)
+        .unwrap_or_else(|| "(senza nome)".to_owned())
+}
+
+/// Brucia la conversazione con un contatto (decisione J).
+///
+/// **Da questo lato e' definitivo**: le chiavi con cui si leggeva spariscono.
+/// Il blob stampato va consegnato all'altra persona: se la sua app lo onora,
+/// distrugge le proprie. Non e' imponibile, e non lo si racconta come se lo
+/// fosse.
+fn cmd_burn(args: &[String]) -> Result<(), String> {
+    let who = args.first().ok_or("manca <chi>. Vedi `kc help`.")?;
+    let state = load()?;
+    let secret = state.secret_bytes();
+    let peer = resolve(&state.keyring, who)?;
+    let mut session = Session::new(state.identity, state.keyring);
+    let richiesta = session
+        .burn_conversation(&peer, now_unix(), &mut OsRng)
+        .map_err(|e| format!("{e}"))?;
+    // Su disco subito: se il processo muore adesso, le chiavi sarebbero
+    // ancora li' e il rogo non sarebbe avvenuto.
+    persist(&secret, &session)?;
+    eprintln!("bruciata da questo lato. Manda all'altro la riga qui sotto:");
+    println!("{richiesta}");
+    Ok(())
+}
+
 fn cmd_encrypt(args: &[String]) -> Result<(), String> {
     let mut who: Option<&str> = None;
     let mut text: Vec<&str> = Vec::new();
@@ -289,6 +328,14 @@ fn cmd_decrypt(args: &[String]) -> Result<(), String> {
         .handle_incoming_text(APP, &input, now_unix())
         .map_err(|e| format!("{e}"))?;
     match item {
+        IncomingItem::Burned { peer } => {
+            persist(&secret, &session)?;
+            let chi = state_label(&session, &peer);
+            println!("bruciata:  la conversazione con {chi} non si rilegge piu'.");
+            println!("chiave:    {}", Fingerprint::of(&peer).display());
+            println!();
+            println!("Il contatto resta. Il prossimo messaggio riparte da capo.");
+        }
         // L'abbiamo scritto noi: qui non c'e' un mittente da mostrare, c'e' un
         // destinatario, e chiamarlo mittente sarebbe falso.
         IncomingItem::OwnMessage {

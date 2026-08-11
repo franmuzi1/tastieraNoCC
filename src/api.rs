@@ -110,6 +110,11 @@ pub enum IncomingItem {
         recipient_label: Option<String>,
         plaintext: Plaintext,
     },
+    /// L'altro ha chiesto di bruciare, e l'abbiamo fatto: le chiavi con cui si
+    /// leggeva quella conversazione non esistono piu' da questo lato.
+    ///
+    /// Non c'e' testo da mostrare — e' un gesto, non un messaggio.
+    Burned { peer: PublicKey },
     /// Una presentazione: nessun messaggio da mostrare, solo una chiave da
     /// fissare. La UI mostra il fingerprint e l'esito del pin.
     IdentityCard {
@@ -183,6 +188,35 @@ impl<K: Keyring> Session<K> {
     ) -> Result<IncomingItem> {
         let mut buf = Vec::new();
         match format::parse(text, &mut buf)? {
+            // Un rogo si riconosce dal kind, che sta nell'AAD: non e' un
+            // messaggio travestito, e un messaggio non puo' diventarlo.
+            ParsedBlob::Burn(parsed) => {
+                let peer = self.mittente_di_un_rogo(&parsed)?;
+                self.keyring.burn_conversation(&peer)?;
+                Ok(IncomingItem::Burned { peer })
+            }
+            ParsedBlob::Message(parsed)
+                if parsed.header.origin.uses_epoch()
+                    || parsed.header.origin.is_epoch_bootstrap() =>
+            {
+                let (peer, plaintext, nostro) = self.apri_a_epoca(&parsed)?;
+                self.current_peer
+                    .insert(app_package.to_owned(), peer.clone());
+                if nostro {
+                    let recipient_label = self.keyring.get(&peer)?.and_then(|r| r.label);
+                    return Ok(IncomingItem::OwnMessage {
+                        recipient: peer,
+                        recipient_label,
+                        plaintext,
+                    });
+                }
+                let sender_status = self.pin_and_classify(&peer, now_unix)?;
+                Ok(IncomingItem::Message(DecryptedMessage {
+                    sender: peer,
+                    sender_status,
+                    plaintext,
+                }))
+            }
             ParsedBlob::Message(parsed) if parsed.header.origin.uses_prekey() => {
                 let (sender, plaintext) = self.prova_con_le_prekey(&parsed)?;
                 let sender_status = self.pin_and_classify(&sender, now_unix)?;
@@ -342,7 +376,7 @@ impl<K: Keyring> Session<K> {
             .ok_or(Error::UnknownPeer)?
             .clone();
         if !effimero {
-            return baseline::seal(&self.identity, &peer, plaintext, now_unix, rng);
+            return self.cifra_a_epoca(&peer, plaintext, now_unix, rng);
         }
 
         // Con una chiave temporanea del destinatario si fa la forward secrecy
@@ -557,6 +591,135 @@ impl<K: Keyring> Session<K> {
         Err(Error::OwnMessage)
     }
 
+    /// Cifra **a epoca** (decisione J): la conversazione resta leggibile finche'
+    /// non la si brucia.
+    ///
+    /// Due casi, e la differenza sta solo in cosa abbiamo gia':
+    ///
+    /// - se il contatto ci ha gia' mandato la sua chiave d'epoca, si cifra
+    ///   verso quella. Il messaggio e' rileggibile da entrambi, e muore per
+    ///   entrambi quando le due chiavi vengono distrutte;
+    /// - se non ce l'abbiamo — primo messaggio, o subito dopo un "brucia" — si
+    ///   usa lo schema a mittente effimero, che **porta la nostra chiave
+    ///   d'epoca** senza aver bisogno della sua. E' il modo in cui la
+    ///   conversazione riparte da sola dopo un rogo, senza handshake e senza
+    ///   canale di ritorno: qui non ce n'e' uno.
+    ///
+    /// Il prezzo di quel ripiego: **quel singolo messaggio non lo rileggiamo**,
+    /// perche' l'effimera se n'e' andata. Uno per conversazione, e uno dopo
+    /// ogni rogo.
+    fn cifra_a_epoca<R: RngCore + CryptoRng>(
+        &mut self,
+        peer: &PublicKey,
+        plaintext: &[u8],
+        now_unix: i64,
+        rng: &mut R,
+    ) -> Result<String> {
+        let mia = self.mia_epoca(peer, rng)?;
+        match self
+            .keyring
+            .peer_prekey(peer)?
+            .filter(|k| self.identity.diffie_hellman(k).is_ok())
+        {
+            Some(sua) => {
+                let (header, ciphertext) = baseline::seal_epoch(
+                    &self.identity,
+                    &sua,
+                    &mia.public(),
+                    plaintext,
+                    now_unix,
+                    rng,
+                )?;
+                Ok(format::serialize_message(&header, &ciphertext))
+            }
+            None => {
+                let (header, ciphertext) = baseline::seal_epoch_bootstrap(
+                    &self.identity,
+                    peer,
+                    &mia.public(),
+                    plaintext,
+                    now_unix,
+                    rng,
+                )?;
+                Ok(format::serialize_message(&header, &ciphertext))
+            }
+        }
+    }
+
+    /// La nostra chiave d'epoca verso quel contatto, creandola se non c'e'.
+    ///
+    /// **Non se ne fa una nuova a ogni messaggio**, ed e' l'unica differenza
+    /// meccanica con la catena: e' quella che fa esistere la cronologia. Cambia
+    /// solo quando si brucia.
+    fn mia_epoca<R: RngCore + CryptoRng>(
+        &mut self,
+        peer: &PublicKey,
+        rng: &mut R,
+    ) -> Result<keys::EphemeralSecret> {
+        if let Some(segreto) = self.keyring.my_prekeys(peer)?.first() {
+            return Ok(keys::EphemeralSecret::from_bytes(*segreto));
+        }
+        let nuova = keys::EphemeralSecret::from_bytes(nuovo_segreto(rng));
+        self.keyring.push_my_prekey(peer, *nuova.to_bytes())?;
+        Ok(nuova)
+    }
+
+    /// **Brucia la conversazione** con un contatto (decisione J).
+    ///
+    /// Fa due cose diverse, e vale la pena non confonderle:
+    ///
+    /// 1. **da questo lato e' definitivo**: le chiavi con cui si leggeva quella
+    ///    conversazione vengono distrutte, e non tornano. Nessun messaggio
+    ///    scambiato prima si riapre piu' qui;
+    /// 2. **dall'altro lato e' una richiesta**. Il blob restituito va
+    ///    consegnato all'altra persona; se la sua app lo onora, distrugge le
+    ///    proprie. Non e' imponibile: chi vuole tenersi i messaggi puo'
+    ///    farlo, e la piattaforma ha comunque il proprio cifrato. Questa
+    ///    funzione non promette il contrario.
+    ///
+    /// Il blob si produce **prima** di distruggere: dopo, la chiave per
+    /// cifrarlo non ci sarebbe piu'.
+    pub fn burn_conversation<R: RngCore + CryptoRng>(
+        &mut self,
+        peer: &PublicKey,
+        now_unix: i64,
+        rng: &mut R,
+    ) -> Result<String> {
+        if self.keyring.get(peer)?.is_none() {
+            return Err(Error::UnknownPeer);
+        }
+        let richiesta = self.cifra_richiesta_di_rogo(peer, now_unix, rng)?;
+        self.keyring.burn_conversation(peer)?;
+        Ok(richiesta)
+    }
+
+    fn cifra_richiesta_di_rogo<R: RngCore + CryptoRng>(
+        &mut self,
+        peer: &PublicKey,
+        now_unix: i64,
+        rng: &mut R,
+    ) -> Result<String> {
+        let mia = self.mia_epoca(peer, rng)?;
+        let sua = self
+            .keyring
+            .peer_prekey(peer)?
+            .filter(|k| self.identity.diffie_hellman(k).is_ok());
+        // Senza una sua chiave d'epoca non c'e' niente da bruciare dall'altra
+        // parte, ma la richiesta si manda lo stesso: cifrata verso la sua
+        // identita', cosi' funziona anche se lui ha gia' bruciato per primo.
+        let (header, ciphertext) = match sua {
+            Some(sua) => baseline::seal_burn_epoch(
+                &self.identity,
+                &sua,
+                &mia.public(),
+                now_unix,
+                rng,
+            )?,
+            None => baseline::seal_burn_static(&self.identity, peer, &mia.public(), now_unix, rng)?,
+        };
+        Ok(format::serialize_burn(&header, &ciphertext))
+    }
+
     /// Memorizza la chiave temporanea di un peer **dopo averla controllata**.
     ///
     /// Una pubkey X25519 di ordine basso produce un segreto condiviso tutto
@@ -576,6 +739,103 @@ impl<K: Keyring> Session<K> {
             return Ok(());
         }
         self.keyring.set_peer_prekey(peer, prekey)
+    }
+
+    /// Apre un messaggio a epoca. Il terzo valore dice se l'abbiamo scritto noi.
+    ///
+    /// La chiave del mittente e' in chiaro, quindi non serve provare i
+    /// contatti: si sa gia' chi ha scritto. Serve solo la chiave d'epoca
+    /// giusta, e se e' stata bruciata non c'e' piu' niente da fare.
+    fn apri_a_epoca(
+        &mut self,
+        parsed: &crate::format::ParsedEnvelope<'_>,
+    ) -> Result<(PublicKey, Plaintext, bool)> {
+        let mittente = parsed
+            .header
+            .sender_pub()
+            .cloned()
+            .ok_or(Error::Format("messaggio a epoca senza mittente"))?;
+
+        let bootstrap = parsed.header.origin.is_epoch_bootstrap();
+
+        // L'abbiamo scritto noi: si riapre con la chiave d'epoca del
+        // destinatario che avevamo conservato — o, se era il primo messaggio,
+        // con la sua identita'. Bruciando sparisce anche questa possibilita',
+        // ed e' meta' del senso del gesto.
+        if mittente == self.identity.public() {
+            for candidato in self.keyring.peers()? {
+                let aperto = if bootstrap {
+                    baseline::open_epoch_bootstrap_as_sender(&self.identity, &candidato, parsed)
+                } else {
+                    let Some(sua) = self.keyring.peer_prekey(&candidato)? else {
+                        continue;
+                    };
+                    baseline::open_epoch_as_sender(&self.identity, &sua, parsed)
+                };
+                if let Ok((_, plaintext)) = aperto {
+                    return Ok((candidato, plaintext, true));
+                }
+            }
+            return Err(Error::OwnMessage);
+        }
+
+        // Il primo messaggio di una conversazione arriva cifrato verso la
+        // nostra identita': non serve nessuna chiave d'epoca nostra, ed e'
+        // esattamente il motivo per cui la conversazione puo' ripartire dopo
+        // un rogo senza che nessuno debba rimandare una presentazione.
+        if bootstrap {
+            let (sua_epoca, plaintext) =
+                baseline::open_epoch_bootstrap(&self.identity, &mittente, parsed)?;
+            self.ricorda_prekey(&mittente, &sua_epoca)?;
+            return Ok((mittente, plaintext, false));
+        }
+
+        for segreto in self.keyring.my_prekeys(&mittente)? {
+            let mia = keys::EphemeralSecret::from_bytes(segreto);
+            let Ok((sua_epoca, plaintext)) = baseline::open_epoch(&mia, &mittente, parsed) else {
+                continue;
+            };
+            // Si prende nota della sua chiave d'epoca, che e' come si risponde.
+            // **Non si butta niente**: qui la cronologia deve restare, ed e'
+            // l'unica differenza operativa con la catena.
+            self.ricorda_prekey(&mittente, &sua_epoca)?;
+            return Ok((mittente, plaintext, false));
+        }
+        Err(Error::Crypto)
+    }
+
+    /// Chi ha chiesto il rogo. Si **decifra** per saperlo: senza, chiunque
+    /// potrebbe cancellare le conversazioni altrui spedendo un blob a caso.
+    fn mittente_di_un_rogo(
+        &mut self,
+        parsed: &crate::format::ParsedEnvelope<'_>,
+    ) -> Result<PublicKey> {
+        if parsed.header.origin.uses_epoch() {
+            let mittente = parsed
+                .header
+                .sender_pub()
+                .cloned()
+                .ok_or(Error::Format("rogo senza mittente"))?;
+            for segreto in self.keyring.my_prekeys(&mittente)? {
+                let mia = keys::EphemeralSecret::from_bytes(segreto);
+                if baseline::open_burn_epoch(&mia, &mittente, parsed).is_ok() {
+                    return Ok(mittente);
+                }
+            }
+            return Err(Error::Crypto);
+        }
+        // Chi chiede il rogo senza avere una nostra chiave d'epoca lo cifra
+        // verso la nostra identita': succede quando avevamo gia' bruciato noi.
+        let mittente = parsed
+            .header
+            .sender_pub()
+            .cloned()
+            .ok_or(Error::Format("rogo senza mittente"))?;
+        if self.keyring.get(&mittente)?.is_none() {
+            return Err(Error::UnknownPeer);
+        }
+        baseline::open_burn_static(&self.identity, &mittente, parsed)?;
+        Ok(mittente)
     }
 
     /// [`Self::prova_i_contatti`] per gli allegati.
@@ -701,6 +961,44 @@ impl<K: Keyring> Session<K> {
         let ParsedBlob::Message(parsed) = format::parse(text, &mut buf)? else {
             return Err(Error::Format("non e' un messaggio"));
         };
+        // Schema a epoca: si legge finche' le chiavi esistono, e leggere un
+        // archivio non le tocca — come per la catena, e per la stessa ragione.
+        if parsed.header.origin.uses_epoch() || parsed.header.origin.is_epoch_bootstrap() {
+            let bootstrap = parsed.header.origin.is_epoch_bootstrap();
+            let mittente = parsed
+                .header
+                .sender_pub()
+                .cloned()
+                .ok_or(Error::Format("messaggio a epoca senza mittente"))?;
+            if mittente == self.identity.public() {
+                for candidato in self.keyring.peers()? {
+                    let aperto = if bootstrap {
+                        baseline::open_epoch_bootstrap_as_sender(&self.identity, &candidato, &parsed)
+                    } else {
+                        let Some(sua) = self.keyring.peer_prekey(&candidato)? else {
+                            continue;
+                        };
+                        baseline::open_epoch_as_sender(&self.identity, &sua, &parsed)
+                    };
+                    if let Ok((_, plaintext)) = aperto {
+                        return Ok((candidato, plaintext));
+                    }
+                }
+                return Err(Error::OwnMessage);
+            }
+            if bootstrap {
+                let (_, plaintext) =
+                    baseline::open_epoch_bootstrap(&self.identity, &mittente, &parsed)?;
+                return Ok((mittente, plaintext));
+            }
+            for segreto in self.keyring.my_prekeys(&mittente)? {
+                let mia = keys::EphemeralSecret::from_bytes(segreto);
+                if let Ok((_, plaintext)) = baseline::open_epoch(&mia, &mittente, &parsed) {
+                    return Ok((mittente, plaintext));
+                }
+            }
+            return Err(Error::Crypto);
+        }
         if parsed.header.origin.uses_prekey() {
             // Le chiavi ancora vive si possono usare: sono nostre e le abbiamo
             // gia'. Cade solo cio' che la catena ha gia' buttato, che e'
@@ -839,6 +1137,11 @@ mod tests {
             secret: &[u8; 32],
         ) -> Result<()> {
             self.prekey.drop_my_prekeys_older_than(peer, secret);
+            Ok(())
+        }
+
+        fn burn_conversation(&mut self, peer: &PublicKey) -> Result<()> {
+            self.prekey.burn(peer);
             Ok(())
         }
 
@@ -1406,6 +1709,151 @@ mod tests {
             .encrypt_file_with(&chiave_bob, &meta, b"foto", 12, &mut rng(2), true)
             .unwrap();
         assert!(alice.handle_incoming_file(&con_catena, 13).is_err());
+    }
+
+    /// **Dimenticare un contatto non cancella niente**, e vale la pena che sia
+    /// scritto in un test invece che scoperto per caso.
+    ///
+    /// Senza catena la chiave di lettura non e' memorizzata da nessuna parte:
+    /// si **ricalcola** dalla nostra identita' e dalla pubkey del mittente, che
+    /// viaggia in chiaro dentro il messaggio stesso. Togliere il pin toglie il
+    /// nome, non la capacita' di leggere. Chiunque prenda il telefono e trovi
+    /// un vecchio blob lo apre lo stesso.
+    ///
+    /// Ne segue che una funzione "brucia questa conversazione" **non puo'**
+    /// essere costruita sul solo keyring: richiede una chiave per contatto che
+    /// oggi esiste solo con la catena accesa.
+    #[test]
+    fn dimenticare_un_contatto_non_cancella_i_suoi_messaggi() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity().public();
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        bob.set_current_peer(WHATSAPP, &chiave_alice).unwrap();
+
+        // Bob scrive ad Alice senza forward secrecy.
+        let messaggio = bob
+            .encrypt_for_app_with(WHATSAPP, b"vecchio segreto", 10, &mut rng(1), false)
+            .unwrap();
+        alice.handle_incoming_text(WHATSAPP, &messaggio, 11).unwrap();
+
+        // Alice dimentica Bob: pin via, chiavi temporanee via.
+        assert!(alice.forget_peer(&chiave_bob).unwrap());
+
+        // Si riapre lo stesso: la chiave si ricalcola, non si conserva.
+        let (chi, testo) = alice.open_archived(&messaggio).unwrap();
+        assert_eq!(chi, chiave_bob);
+        assert_eq!(testo.as_bytes(), b"vecchio segreto");
+    }
+
+    /// **Decisione J.** Senza catena la conversazione si rilegge — da entrambi
+    /// — finche' non la si brucia; e bruciandola sparisce da entrambi.
+    #[test]
+    fn bruciare_rende_illeggibile_da_tutte_e_due_le_parti() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity().public();
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+        bob.set_current_peer(WHATSAPP, &chiave_alice).unwrap();
+
+        // Primo messaggio: nessuna chiave d'epoca dell'altro, quindi bootstrap.
+        // Deve essere rileggibile lo stesso — e' il punto della decisione.
+        let uno = alice
+            .encrypt_for_app_with(WHATSAPP, b"primo", 10, &mut rng(9), false)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &uno, 11).unwrap();
+        assert!(matches!(
+            alice.handle_incoming_text(WHATSAPP, &uno, 11),
+            Ok(IncomingItem::OwnMessage { .. })
+        ));
+
+        // Risposta: ora Bob ha la chiave d'epoca di Alice e la usa.
+        let due = bob
+            .encrypt_for_app_with(WHATSAPP, b"secondo", 12, &mut rng(8), false)
+            .unwrap();
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(p) = format::parse(&due, &mut buf).unwrap() else {
+            panic!()
+        };
+        let a_epoca = p.header.origin.uses_epoch();
+        assert!(a_epoca, "la risposta doveva usare la chiave d'epoca");
+
+        alice.handle_incoming_text(WHATSAPP, &due, 13).unwrap();
+        // E si rilegge quante volte si vuole: qui la cronologia esiste.
+        alice.handle_incoming_text(WHATSAPP, &due, 14).unwrap();
+        assert!(bob.open_archived(&due).is_ok(), "Bob rilegge cio' che ha scritto");
+
+        // Alice brucia. Da questo lato e' definitivo, subito.
+        let richiesta = alice.burn_conversation(&chiave_bob, 15, &mut rng(7)).unwrap();
+        assert!(alice.handle_incoming_text(WHATSAPP, &due, 16).is_err());
+
+        // Bob riceve la richiesta e la onora: sparisce anche dal suo lato.
+        let esito = bob.handle_incoming_text(WHATSAPP, &richiesta, 17).unwrap();
+        let IncomingItem::Burned { peer } = esito else {
+            panic!("doveva essere un rogo")
+        };
+        assert_eq!(peer, chiave_alice);
+        assert!(bob.open_archived(&due).is_err(), "il messaggio a epoca e' morto");
+
+        // **RESIDUO, e va guardato in faccia:** il messaggio di apertura NON
+        // brucia, per nessuno dei due. E' cifrato verso l'identita' di Bob,
+        // perche' quando e' partito non esisteva ancora nient'altro di
+        // condiviso — e l'identita' sopravvive al rogo per definizione.
+        //
+        // Non e' aggiustabile dentro questo schema: qualunque messaggio che un
+        // destinatario possa aprire senza stato precedente e' apribile con la
+        // sola chiave d'identita', quindi resta apribile anche dopo. Si chiude
+        // solo mettendo una chiave d'epoca nella presentazione, cosi' che un
+        // messaggio di apertura non serva piu'.
+        assert!(bob.open_archived(&uno).is_ok(), "il residuo, documentato");
+        assert!(alice.open_archived(&uno).is_ok(), "vale anche per chi scrive");
+
+        // Il contatto resta: e' la conversazione a essere bruciata, non lui.
+        assert!(bob.keyring.get(&chiave_alice).unwrap().is_some());
+
+        // E si puo' ricominciare da capo, senza rimandare nessuna
+        // presentazione: il primo messaggio riparte dal bootstrap.
+        let tre = bob
+            .encrypt_for_app_with(WHATSAPP, b"ricominciamo", 18, &mut rng(6), false)
+            .unwrap();
+        let letto = alice.handle_incoming_text(WHATSAPP, &tre, 19).unwrap();
+        let IncomingItem::Message(m) = letto else {
+            panic!("doveva essere un messaggio")
+        };
+        assert_eq!(m.plaintext.as_bytes(), b"ricominciamo");
+    }
+
+    /// Un rogo non si spedisce a nome d'altri: chi non ha la conversazione non
+    /// puo' cancellarla. Senza questo, chiunque potrebbe azzerare le chat
+    /// altrui spedendo un blob a caso.
+    #[test]
+    fn un_estraneo_non_puo_bruciare_le_conversazioni_altrui() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let mut mallory = sessione(3);
+        let chiave_alice = alice.identity().public();
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+
+        let uno = alice
+            .encrypt_for_app_with(WHATSAPP, b"primo", 10, &mut rng(9), false)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &uno, 11).unwrap();
+
+        // Mallory conosce Bob e prova a bruciare la sua conversazione.
+        mallory.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        let falso = mallory.burn_conversation(&chiave_bob, 12, &mut rng(5)).unwrap();
+        assert!(bob.handle_incoming_text(WHATSAPP, &falso, 13).is_err());
+
+        // La conversazione con Alice e' intatta.
+        assert!(bob.open_archived(&uno).is_ok());
     }
 
     /// Leggere un archivio non deve far avanzare la catena: se lo facesse,

@@ -300,6 +300,11 @@ impl Keyring for MemoryKeyring {
         Ok(())
     }
 
+    fn burn_conversation(&mut self, peer: &PublicKey) -> Result<()> {
+        self.prekey.burn(peer);
+        Ok(())
+    }
+
     fn mark_verified(&mut self, peer: &PublicKey) -> Result<()> {
         match self
             .peers

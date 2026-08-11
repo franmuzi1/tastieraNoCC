@@ -331,6 +331,25 @@ impl App {
                 self.ricarica();
                 self.avviso = None;
             }
+            Ok(IncomingItem::Burned { peer }) => {
+                let nome = self
+                    .contatti
+                    .iter()
+                    .find(|c| c.chiave == peer)
+                    .map(etichetta)
+                    .unwrap_or_else(|| "quel contatto".to_owned());
+                self.salva(&secret, session.keyring());
+                self.letto = None;
+                self.incollato.clear();
+                self.ricarica();
+                self.avviso = Some((
+                    format!(
+                        "Conversazione con {nome} bruciata: non si rilegge piu'. \
+                         Il contatto resta, il prossimo messaggio riparte da capo."
+                    ),
+                    false,
+                ));
+            }
             Ok(IncomingItem::OwnMessage {
                 recipient,
                 recipient_label,

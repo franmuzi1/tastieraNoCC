@@ -200,6 +200,62 @@ da conservare e due volte le occasioni di non buttarle. `kind` resta nell'AAD
 anche qui, quindi un allegato non si rilegge come messaggio nemmeno con la
 catena — c'e' il test.
 
+### Conversazione bruciabile (decisione J, chiusa)
+
+Chiude la domanda "posso rendere illeggibili i messaggi con una persona, sia
+per me sia per lei?". La risposta e' si', **a forward secrecy spenta**, e con un
+limite che va detto per primo.
+
+**Cosa e' garantito e cosa no.** Da questo lato e' crittografico: le chiavi
+spariscono e non tornano. Dall'altro e' una **richiesta**: la sua app deve
+onorarla. Chi vuole tenersi i messaggi ci riesce, e la piattaforma ha comunque
+il proprio cifrato. Non e' cancellazione a distanza, e la UI non deve
+raccontarla come tale.
+
+**Perche' serviva uno schema nuovo.** Senza catena la chiave di lettura non e'
+memorizzata da nessuna parte: si **ricalcola** dall'identita' e dalla pubkey del
+mittente, che viaggia in chiaro nel messaggio. Non c'e' niente da cancellare —
+dimenticare un contatto non rende illeggibile nulla, e c'e' il test che lo
+verifica. Serve una chiave **per contatto**, che prima esisteva solo con la
+catena accesa, dove pero' la cronologia non c'e' gia'.
+
+**Lo schema.** Una chiave d'epoca per contatto, che **non ruota a ogni
+messaggio** — ed e' esattamente questa la differenza con la decisione I, quella
+che fa esistere la cronologia:
+
+```text
+segreto = DH(mittente, epoca_destinatario)
+```
+
+Niente effimera: senza, la derivazione si puo' rifare, quindi il messaggio si
+rilegge anche da chi l'ha scritto. Segnalato da `PREKEY` **senza** `EPHEMERAL`,
+combinazione che il parser prima rifiutava — per una ragione che non vale piu'.
+
+**Il bit `EPOCH_OFFER`**, quarto flag: "il cifrato porta la mia chiave d'epoca".
+Distinto da `PREKEY`, che dice l'opposto — *usare* quella dell'altro. Servono
+separati perche' il primo messaggio porta la propria senza poter usare la sua:
+non ce l'ha ancora. Senza questa distinzione quel messaggio sarebbe costretto a
+essere effimero, cioe' non rileggibile da chi l'ha scritto — il caso che questa
+decisione esiste per rendere possibile.
+
+**Il rogo** e' un `kind` nuovo (`Burn`), non un messaggio con un marcatore nel
+testo: `kind` sta nell'AAD, quindi un rogo non e' un messaggio travestito ne'
+viceversa. Non porta testo. Chi lo riceve lo **decifra** per sapere chi l'ha
+mandato: senza, chiunque potrebbe azzerare le conversazioni altrui spedendo un
+blob a caso — c'e' il test.
+
+**Residuo accettato, e non e' aggirabile qui:** il **primo** messaggio di una
+conversazione non brucia. E' cifrato verso l'identita' dell'altro, perche'
+quando parte non esiste ancora niente di condiviso, e l'identita' sopravvive al
+rogo per definizione. Vale per qualunque messaggio che un destinatario possa
+aprire senza stato precedente. Si chiuderebbe mettendo una chiave d'epoca nella
+**presentazione**, cosi' che un messaggio di apertura non serva piu': e' la via,
+se un giorno il residuo diventa inaccettabile.
+
+**Dopo il rogo la conversazione riparte da sola**, senza rimandare
+presentazioni: chi non ha piu' una chiave d'epoca dell'altro ricomincia dal
+messaggio di apertura, che ne porta una nuova.
+
 ### Autenticazione mittente (baseline)
 
 - `crypto_box` statico-statico: ECDH fra il nostro segreto e la pubkey del

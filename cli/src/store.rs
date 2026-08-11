@@ -145,6 +145,11 @@ impl Keyring for FileKeyring {
         Ok(())
     }
 
+    fn burn_conversation(&mut self, peer: &PublicKey) -> Result<()> {
+        self.prekey.burn(peer);
+        Ok(())
+    }
+
     fn tofu_pin(&mut self, peer: &PublicKey, now_unix: i64) -> Result<PinOutcome> {
         if self.position(peer).is_some() {
             return Ok(PinOutcome::AlreadyPinned);

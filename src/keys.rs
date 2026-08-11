@@ -386,6 +386,18 @@ impl PrekeyStore {
         }
     }
 
+    /// **Brucia** la conversazione con un contatto: via le nostre chiavi e via
+    /// la sua. Il contatto resta, la sua identita' resta: sparisce solo la
+    /// possibilita' di leggere cio' che ci si e' scritti.
+    ///
+    /// E' la stessa operazione di [`Self::forget`] sulle chiavi, con
+    /// un'intenzione diversa, e vale la pena che i due nomi restino distinti:
+    /// dimenticare un contatto e bruciare una conversazione sono due gesti che
+    /// l'utente compie per motivi opposti.
+    pub fn burn(&mut self, peer: &PublicKey) {
+        self.forget(peer);
+    }
+
     /// Chi dimentica un contatto deve chiamarla: senza, le chiavi private
     /// temporanee verso quella persona resterebbero su disco dopo che l'utente
     /// ha chiesto di cancellarla.
@@ -486,6 +498,14 @@ pub trait Keyring {
         peer: &PublicKey,
         secret: &[u8; KEY_LEN],
     ) -> Result<()>;
+
+    /// Butta **tutto** lo stato di conversazione con quel peer: le nostre
+    /// chiavi temporanee e la sua. Il pin e il nome restano.
+    ///
+    /// E' il gesto della decisione J. Dopo, i messaggi scambiati con quella
+    /// persona non si riaprono piu' da questo lato — e il prossimo che si
+    /// manda riparte con una chiave nuova.
+    fn burn_conversation(&mut self, peer: &PublicKey) -> Result<()>;
 
     /// Le chiavi fissate, per chi deve provarle tutte.
     ///

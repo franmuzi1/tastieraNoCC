@@ -616,6 +616,326 @@ pub fn open_file(
     open_inner(Kind::File, recipient, sender_pub, parsed)
 }
 
+/// Cifra **a epoca** (decisione J): chiave del mittente in chiaro, cifrato
+/// verso la chiave d'epoca del destinatario.
+///
+/// Niente effimera, ed e' il punto: senza, la derivazione si puo' rifare, e
+/// quindi il messaggio si rilegge — anche da chi l'ha scritto. La riservatezza
+/// non viene dal tempo ma da un gesto: quando una delle due chiavi d'epoca
+/// viene distrutta, quel messaggio non si apre piu' da quel lato.
+///
+/// `mia_epoca` viaggia dentro il cifrato come nelle altre modalita': e' cosi'
+/// che l'altro sa verso quale chiave scriverci.
+pub fn seal_epoch<R: RngCore + CryptoRng>(
+    sender: &Identity,
+    epoca_destinatario: &PublicKey,
+    mia_epoca: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<(Header, Vec<u8>)> {
+    sigilla_a_epoca(
+        Kind::Message,
+        sender,
+        epoca_destinatario,
+        mia_epoca,
+        plaintext,
+        now_unix,
+        rng,
+    )
+}
+
+/// Una richiesta di rogo verso la chiave d'epoca dell'altro. Stessa
+/// derivazione, `kind` diverso — e `kind` sta nell'AAD, quindi un rogo non e'
+/// un messaggio travestito ne' viceversa.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_burn_epoch<R: RngCore + CryptoRng>(
+    sender: &Identity,
+    epoca_destinatario: &PublicKey,
+    mia_epoca: &PublicKey,
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<(Header, Vec<u8>)> {
+    sigilla_a_epoca(
+        Kind::Burn,
+        sender,
+        epoca_destinatario,
+        mia_epoca,
+        &[],
+        now_unix,
+        rng,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sigilla_a_epoca<R: RngCore + CryptoRng>(
+    kind: Kind,
+    sender: &Identity,
+    epoca_destinatario: &PublicKey,
+    mia_epoca: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<(Header, Vec<u8>)> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rng.fill_bytes(&mut nonce);
+
+    let header = Header {
+        tier: Tier::Baseline,
+        origin: Origin::MittenteConPrekey(sender.public()),
+        nonce,
+    };
+    let aad = format::build_aad(kind, &header);
+    let key = derive_key(
+        &*sender.diffie_hellman(epoca_destinatario)?,
+        &nonce,
+        &aad,
+        epoca_destinatario,
+    )?;
+
+    let mut inner = Zeroizing::new(Vec::with_capacity(
+        TIMESTAMP_LEN
+            .saturating_add(KEY_LEN)
+            .saturating_add(plaintext.len()),
+    ));
+    inner.extend_from_slice(&now_unix.to_le_bytes());
+    inner.extend_from_slice(mia_epoca.as_bytes());
+    inner.extend_from_slice(plaintext);
+
+    let ciphertext = XChaCha20Poly1305::new((&*key).into())
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &inner,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| Error::Crypto)?;
+
+    Ok((header, ciphertext))
+}
+
+/// Apre un messaggio a epoca **ricevuto**: serve la nostra chiave d'epoca.
+///
+/// Distruggendola, questo smette di funzionare per sempre. E' l'unica cosa
+/// che rende la cancellazione reale invece che cosmetica.
+pub fn open_epoch(
+    mia_epoca: &EphemeralSecret,
+    mittente: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    apri_epoca(
+        &*mia_epoca.diffie_hellman(mittente)?,
+        &mia_epoca.public(),
+        parsed,
+    )
+}
+
+/// Apre un messaggio a epoca **che abbiamo scritto noi**, con la chiave
+/// d'epoca del destinatario che avevamo conservato.
+///
+/// Quando la buttiamo, non rileggiamo piu' cio' che gli abbiamo mandato: e' la
+/// meta' del "brucia" che riguarda noi.
+pub fn open_epoch_as_sender(
+    sender: &Identity,
+    epoca_destinatario: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    apri_epoca(
+        &*sender.diffie_hellman(epoca_destinatario)?,
+        epoca_destinatario,
+        parsed,
+    )
+}
+
+fn apri_epoca(
+    shared: &[u8; KEY_LEN],
+    epoca_destinatario: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    if !parsed.header.origin.uses_epoch() {
+        return Err(Error::Crypto);
+    }
+    apri_epoca_con(Kind::Message, shared, epoca_destinatario, parsed)
+}
+
+fn apri_epoca_con(
+    kind: Kind,
+    shared: &[u8; KEY_LEN],
+    epoca_destinatario: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    if parsed.header.tier != Tier::Baseline {
+        return Err(Error::TierUnsupported);
+    }
+    if parsed.ciphertext.len() < TAG_LEN {
+        return Err(Error::Crypto);
+    }
+
+    let aad = format::build_aad(kind, &parsed.header);
+    let key = derive_key(shared, &parsed.header.nonce, &aad, epoca_destinatario)?;
+
+    let inner = Zeroizing::new(
+        XChaCha20Poly1305::new((&*key).into())
+            .decrypt(
+                XNonce::from_slice(&parsed.header.nonce),
+                Payload {
+                    msg: parsed.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::Crypto)?,
+    );
+
+    stacca_prekey(&inner)
+}
+
+/// Il **primo** messaggio di una conversazione a epoca: cifrato verso
+/// l'identita' del destinatario, come lo schema statico, ma porta la nostra
+/// chiave d'epoca dentro il cifrato.
+///
+/// E' cio' che fa partire la conversazione senza handshake, e resta
+/// rileggibile da entrambi — al contrario del ripiego effimero, che sarebbe
+/// stato la scelta ovvia e avrebbe reso non rileggibile proprio il primo
+/// messaggio di ogni conversazione.
+pub fn seal_epoch_bootstrap<R: RngCore + CryptoRng>(
+    sender: &Identity,
+    recipient: &PublicKey,
+    mia_epoca: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<(Header, Vec<u8>)> {
+    sigilla_verso_identita(
+        Kind::Message,
+        sender,
+        recipient,
+        mia_epoca,
+        plaintext,
+        now_unix,
+        rng,
+    )
+}
+
+/// Apre un bootstrap a epoca **ricevuto**: serve solo la nostra identita'.
+pub fn open_epoch_bootstrap(
+    recipient: &Identity,
+    mittente: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    apri_epoca_con(
+        Kind::Message,
+        &*recipient.diffie_hellman(mittente)?,
+        &recipient.public(),
+        parsed,
+    )
+}
+
+/// Apre un bootstrap a epoca **che abbiamo scritto noi**.
+pub fn open_epoch_bootstrap_as_sender(
+    sender: &Identity,
+    destinatario: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    apri_epoca_con(
+        Kind::Message,
+        &*sender.diffie_hellman(destinatario)?,
+        destinatario,
+        parsed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sigilla_verso_identita<R: RngCore + CryptoRng>(
+    kind: Kind,
+    sender: &Identity,
+    recipient: &PublicKey,
+    mia_epoca: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<(Header, Vec<u8>)> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rng.fill_bytes(&mut nonce);
+    let header = Header {
+        tier: Tier::Baseline,
+        origin: Origin::MittenteConEpoca(sender.public()),
+        nonce,
+    };
+    let aad = format::build_aad(kind, &header);
+    let key = derive_key(&*sender.diffie_hellman(recipient)?, &nonce, &aad, recipient)?;
+
+    let mut inner = Zeroizing::new(Vec::with_capacity(
+        TIMESTAMP_LEN
+            .saturating_add(KEY_LEN)
+            .saturating_add(plaintext.len()),
+    ));
+    inner.extend_from_slice(&now_unix.to_le_bytes());
+    inner.extend_from_slice(mia_epoca.as_bytes());
+    inner.extend_from_slice(plaintext);
+
+    let ciphertext = XChaCha20Poly1305::new((&*key).into())
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &inner,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| Error::Crypto)?;
+    Ok((header, ciphertext))
+}
+
+/// La richiesta di rogo quando non abbiamo una chiave d'epoca dell'altro:
+/// cifrata verso la sua identita', che abbiamo sempre.
+///
+/// Serve al caso in cui abbiamo gia' bruciato noi per primi e vogliamo comunque
+/// chiederglielo. Porta la nostra chiave d'epoca nuova, cosi' la conversazione
+/// puo' ripartire subito dopo.
+pub fn seal_burn_static<R: RngCore + CryptoRng>(
+    sender: &Identity,
+    recipient: &PublicKey,
+    mia_epoca: &PublicKey,
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<(Header, Vec<u8>)> {
+    sigilla_verso_identita(Kind::Burn, sender, recipient, mia_epoca, &[], now_unix, rng)
+}
+
+/// Verifica una richiesta di rogo arrivata nello schema statico.
+pub fn open_burn_static(
+    recipient: &Identity,
+    mittente: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    apri_rogo(
+        &*recipient.diffie_hellman(mittente)?,
+        &recipient.public(),
+        parsed,
+    )
+}
+
+/// Verifica una richiesta di rogo cifrata verso la nostra chiave d'epoca.
+pub fn open_burn_epoch(
+    mia_epoca: &EphemeralSecret,
+    mittente: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    apri_rogo(
+        &*mia_epoca.diffie_hellman(mittente)?,
+        &mia_epoca.public(),
+        parsed,
+    )
+}
+
+fn apri_rogo(
+    shared: &[u8; KEY_LEN],
+    destinatario: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    apri_epoca_con(Kind::Burn, shared, destinatario, parsed)
+}
+
 /// Riapre un messaggio **che abbiamo scritto noi**, provando `recipient` come
 /// destinatario.
 ///
