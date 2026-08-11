@@ -616,7 +616,14 @@ file la piattaforma lo conserva.
     che conta: raggiunge una copertura tripla rispetto a `parse`, perché quel
     target da solo dovrebbe indovinare l'encoding per arrivare ai rami
     profondi.
-  - Ultima esecuzione: ~136M input complessivi, nessun crash.
+  - Ultima esecuzione: ~146M input complessivi, nessun crash (decode 79M,
+    parse 62M, roundtrip 4M — quest'ultimo fa molto piu' lavoro per input).
+  - **I target si rompono in silenzio.** `parse` e `roundtrip` costruiscono
+    `Header` a mano, quindi un cambiamento del formato li fa smettere di
+    *compilare* — e `cargo test` non se ne accorge, perche' `fuzz/` e' fuori
+    dal workspace. Sono rimasti rotti per l'intera durata di un cambiamento di
+    formato senza che niente lo segnalasse. Dopo ogni modifica a `format.rs`:
+    `cargo +nightly fuzz build`, che costa pochi secondi.
   - Il corpus è in `.gitignore` (rigenerabile, cresce senza limiti); gli
     **artefatti di crash no**: quelli vanno versionati, sono la riproduzione
     di un bug.
