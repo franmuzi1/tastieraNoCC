@@ -252,6 +252,19 @@ pub trait Keyring {
     /// verificata fuori banda, per definizione.
     fn replace_pinned(&mut self, old: &PublicKey, new: &PublicKey, now_unix: i64) -> Result<()>;
 
+    /// Dimentica un peer. `Ok(true)` se c'era.
+    ///
+    /// Non serve al flusso della tastiera — li' dimenticare una chiave non ha
+    /// mai senso — ma serve a chi guarda l'elenco dei contatti, che altrimenti
+    /// puo' solo allungarsi.
+    ///
+    /// **Chi la chiama deve aver gia' avvertito l'utente:** si perde il pin, e
+    /// il prossimo messaggio da quella persona ricompare come mittente mai
+    /// visto e viene rifissato in silenzio. E' indistinguibile da qualcuno che
+    /// si spaccia per lei, cioe' si riapre esattamente la finestra che il pin
+    /// serviva a chiudere.
+    fn forget(&mut self, peer: &PublicKey) -> Result<bool>;
+
     fn get(&self, peer: &PublicKey) -> Result<Option<PeerRecord>>;
 
     /// Marca un peer come verificato fuori banda (fingerprint confrontato).

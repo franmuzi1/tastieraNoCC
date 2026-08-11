@@ -39,8 +39,9 @@ use jni::JNIEnv;
 use rand_core::OsRng;
 
 use keyboard_cipher_core::api::{IncomingItem, SenderStatus, Session};
+use keyboard_cipher_core::file::FileMeta;
 use keyboard_cipher_core::error::Error;
-use keyboard_cipher_core::keys::{Identity, LabelOutcome, PinOutcome, PublicKey, KEY_LEN};
+use keyboard_cipher_core::keys::{Identity, Keyring, LabelOutcome, PinOutcome, PublicKey, KEY_LEN};
 
 mod keyring;
 use keyring::MemoryKeyring;
@@ -65,6 +66,8 @@ mod code {
     /// Esiti di `handleIncomingText`, quando il codice e' OK.
     pub const ITEM_MESSAGE: jint = 0;
     pub const ITEM_IDENTITY_CARD: jint = 1;
+    /// Allegato cifrato. Vedi `nativeDecryptFile`.
+    pub const ITEM_FILE: jint = 2;
 
     /// Esiti di `assignLabel`.
     pub const LABEL_ASSIGNED: jint = 0;
@@ -231,6 +234,219 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeInit(
 // ============================================================================
 // Operazioni
 // ============================================================================
+
+/// Dimentica un peer.
+///
+/// Il chiamante deve avere gia' avvertito l'utente: si perde il pin, e il
+/// prossimo messaggio da quella persona verra' rifissato in silenzio come se
+/// fosse nuovo — indistinguibile da qualcuno che si spaccia per lei.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeForgetPeer(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer: JByteArray,
+) -> jint {
+    guard(code::INTERNAL, || {
+        let Ok(chiave) = read_key(&mut env, &peer) else {
+            return code::FORMAT;
+        };
+        // Passa da Session e non dal keyring: dimenticare deve togliere il
+        // peer anche dai destinatari correnti, altrimenti sparisce dall'elenco
+        // e si continua a cifrare verso quella chiave — un guasto che si
+        // scoprirebbe solo dall'altro lato.
+        match with_session(|session| session.forget_peer(&chiave)) {
+            Ok(_) => code::OK,
+            Err(codice) => codice,
+        }
+    })
+}
+
+/// Come si chiama il destinatario per questa app, da mostrare nella tastiera.
+///
+/// L'etichetta se c'e', altrimenti il fingerprint: due contatti senza nome
+/// sono distinguibili solo da quello. `null` se non c'e' nessun destinatario —
+/// che e' un'informazione, non un errore, e la tastiera la mostra come tale.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeCurrentPeerName(
+    mut env: JNIEnv,
+    _class: JClass,
+    app_package: JString,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let Ok(package) = read_string(&mut env, &app_package) else {
+            return std::ptr::null_mut();
+        };
+        let nome = with_session(|session| {
+            let Some(peer) = session.current_peer(&package) else {
+                return Ok(None);
+            };
+            let etichetta = Keyring::get(session.keyring(), peer)?
+                .and_then(|record| record.label)
+                .unwrap_or_else(|| keyboard_cipher_core::keys::Fingerprint::of(peer).display());
+            Ok(Some(etichetta))
+        });
+        match nome {
+            Ok(Some(nome)) => new_string(&env, nome.as_str()),
+            _ => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// C'e' un destinatario per questa app?
+///
+/// Serve alla tastiera per distinguere "non so a chi cifrare" da "la cifratura
+/// e' fallita": sono due cose che l'utente deve poter risolvere in modi
+/// diversi, e senza questa domanda si vedono uguali — cioe' come un tasto che
+/// non fa niente.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHasCurrentPeer(
+    mut env: JNIEnv,
+    _class: JClass,
+    app_package: JString,
+) -> jboolean {
+    guard(0, || {
+        let Ok(package) = read_string(&mut env, &app_package) else {
+            return 0;
+        };
+        let presente = with_session(|session| Ok(session.current_peer(&package).is_some()));
+        jboolean::from(presente.unwrap_or(false))
+    })
+}
+
+/// Cifra un file per un peer scelto esplicitamente.
+///
+/// Il contenuto attraversa il confine come `byte[]`, e il chiamante lo azzera
+/// appena consegnato: una `java.lang.String` non sarebbe azzerabile, e un file
+/// non e' testo comunque.
+///
+/// Niente destinatario implicito (decisione G4): questo percorso parte da una
+/// schermata, non dalla tastiera, quindi il contesto dell'app da cui dedurlo
+/// non esiste — e un file mandato alla persona sbagliata non si ritira.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer: JByteArray,
+    name: JString,
+    mime: JString,
+    content: JByteArray,
+    now_unix: jlong,
+) -> jbyteArray {
+    guard(std::ptr::null_mut(), || {
+        let Ok(chiave) = read_key(&mut env, &peer) else {
+            return std::ptr::null_mut();
+        };
+        let Ok(nome) = read_string(&mut env, &name) else {
+            return std::ptr::null_mut();
+        };
+        let Ok(tipo) = read_string(&mut env, &mime) else {
+            return std::ptr::null_mut();
+        };
+        let Ok(bytes) = read_bytes(&mut env, &content) else {
+            return std::ptr::null_mut();
+        };
+        let meta = FileMeta { name: nome, mime: tipo };
+        let esito = with_session(|session| {
+            session.encrypt_file(&chiave, &meta, &bytes, now_unix, &mut OsRng)
+        });
+        match esito {
+            Ok(blob) => new_byte_array(&env, &blob),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Apre un allegato ricevuto e riempie `result`.
+///
+/// Come per i messaggi, il core decifra **prima** di toccare il keyring: la
+/// decifratura riuscita e' la prova che chi ha mandato il file possiede la
+/// privata dichiarata.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeDecryptFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    blob: JByteArray,
+    now_unix: jlong,
+    result: JObject,
+) -> jint {
+    guard(code::INTERNAL, || {
+        let bytes = match read_bytes(&mut env, &blob) {
+            Ok(bytes) => bytes,
+            Err(codice) => return codice,
+        };
+        let esito = with_session(|session| session.handle_incoming_file(&bytes, now_unix));
+        let incoming = match esito {
+            Ok(incoming) => incoming,
+            Err(codice) => return codice,
+        };
+
+        let (etichetta, verificato) = match &incoming.sender_status {
+            SenderStatus::New => (None, false),
+            SenderStatus::Known { label, verified } => (label.clone(), *verified),
+        };
+        if env
+            .set_field(&result, "kind", "I", code::ITEM_FILE.into())
+            .is_err()
+            || env
+                .set_field(&result, "verified", "I", jint::from(verificato).into())
+                .is_err()
+        {
+            return code::INTERNAL;
+        }
+        let fingerprint = keyboard_cipher_core::keys::Fingerprint::of(&incoming.sender);
+        if !fill_strings(&mut env, &result, &fingerprint.display(), etichetta.as_deref()) {
+            return code::INTERNAL;
+        }
+        if env
+            .set_field(
+                &result,
+                "sentAtUnix",
+                "J",
+                jni::objects::JValue::Long(incoming.file.sent_at_unix),
+            )
+            .is_err()
+        {
+            return code::INTERNAL;
+        }
+        let Ok(chiave) = env.byte_array_from_slice(incoming.sender.as_bytes()) else {
+            return code::INTERNAL;
+        };
+        if env
+            .set_field(&result, "senderKey", "[B", (&chiave).into())
+            .is_err()
+        {
+            return code::INTERNAL;
+        }
+        // Nome e tipo arrivano da chi ha mandato il file: autenticati, non
+        // credibili. Chi li usa per salvare deve ripulirli — un nome puo'
+        // contenere `../` o un separatore di percorso.
+        let Ok(nome) = env.new_string(&incoming.file.meta.name) else {
+            return code::INTERNAL;
+        };
+        let Ok(tipo) = env.new_string(&incoming.file.meta.mime) else {
+            return code::INTERNAL;
+        };
+        if env
+            .set_field(&result, "fileName", "Ljava/lang/String;", (&nome).into())
+            .is_err()
+            || env
+                .set_field(&result, "fileMime", "Ljava/lang/String;", (&tipo).into())
+                .is_err()
+        {
+            return code::INTERNAL;
+        }
+        let Ok(contenuto) = env.byte_array_from_slice(&incoming.file.content) else {
+            return code::INTERNAL;
+        };
+        if env
+            .set_field(&result, "fileContent", "[B", (&contenuto).into())
+            .is_err()
+        {
+            return code::INTERNAL;
+        }
+        code::OK
+    })
+}
 
 /// Blob di presentazione da inserire nel campo con `commitText`.
 #[unsafe(no_mangle)]

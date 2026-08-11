@@ -74,9 +74,38 @@ impl FileKeyring {
     fn position(&self, peer: &PublicKey) -> Option<usize> {
         self.peers.iter().position(|p| &p.public == peer)
     }
+
+    /// Vedi [`Keyring::forget`]. Resta anche come metodo proprio perche' la
+    /// app la usa senza costruire una `Session`.
+    ///
+    /// Non passa dal trait `Keyring` del core, che non prevede la
+    /// cancellazione, e non e' una dimenticanza del core: dal lato tastiera
+    /// dimenticare una chiave non serve a niente e puo' fare danno. Qui invece
+    /// e' una schermata con un elenco, e un elenco che si puo' solo allungare
+    /// diventa inservibile.
+    ///
+    /// **Conseguenza da dire a chi lo fa:** si perde il pin. Il prossimo
+    /// messaggio da quella persona ricompare come mittente mai visto e viene
+    /// rifissato in silenzio — cioe' si riapre la finestra di attacco che il
+    /// pin serviva a chiudere, e si perde anche l'eventuale "confrontato di
+    /// persona". Cancellare un contatto non e' come cancellare una riga da una
+    /// rubrica.
+    pub fn remove(&mut self, peer: &PublicKey) -> bool {
+        match self.position(peer) {
+            Some(indice) => {
+                self.peers.remove(indice);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl Keyring for FileKeyring {
+    fn forget(&mut self, peer: &PublicKey) -> Result<bool> {
+        Ok(self.remove(peer))
+    }
+
     fn tofu_pin(&mut self, peer: &PublicKey, now_unix: i64) -> Result<PinOutcome> {
         if self.position(peer).is_some() {
             return Ok(PinOutcome::AlreadyPinned);
@@ -343,6 +372,20 @@ mod tests {
     #[test]
     fn stato_senza_segreto_non_si_carica() {
         assert!(parse(&format!("{MAGIC}\npeer ybnd 1 0 tizio\n")).is_none());
+    }
+
+    #[test]
+    fn dimenticare_un_contatto_lo_toglie_e_lascia_gli_altri() {
+        let mut keyring = FileKeyring::default();
+        keyring.tofu_pin(&peer(1), 1).unwrap();
+        keyring.tofu_pin(&peer(2), 2).unwrap();
+        keyring.assign_label(&peer(2), "marco").unwrap();
+
+        assert!(keyring.remove(&peer(1)));
+        // Due volte non e' un errore: la seconda dice solo che non c'era.
+        assert!(!keyring.remove(&peer(1)));
+        assert_eq!(keyring.peers().len(), 1);
+        assert_eq!(keyring.peers()[0].label.as_deref(), Some("marco"));
     }
 
     #[test]

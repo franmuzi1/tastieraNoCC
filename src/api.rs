@@ -312,6 +312,18 @@ impl<K: Keyring> Session<K> {
         })
     }
 
+    /// Dimentica un peer, e smette di usarlo come destinatario.
+    ///
+    /// Togliere la seconda parte sarebbe un guasto silenzioso: il contatto
+    /// sparisce dall'elenco ma si continua a cifrare verso quella chiave,
+    /// perche' il destinatario corrente e' una mappa a parte. Si scoprirebbe
+    /// solo dall'altro lato, quando qualcuno riceve messaggi che non doveva.
+    pub fn forget_peer(&mut self, peer: &PublicKey) -> Result<bool> {
+        let c_era = self.keyring.forget(peer)?;
+        self.current_peer.retain(|_, corrente| corrente != peer);
+        Ok(c_era)
+    }
+
     pub fn current_peer(&self, app_package: &str) -> Option<&PublicKey> {
         self.current_peer.get(app_package)
     }
@@ -373,6 +385,16 @@ mod tests {
     }
 
     impl Keyring for KeyringInMemoria {
+        fn forget(&mut self, peer: &PublicKey) -> Result<bool> {
+            match self.peers.iter().position(|p| &p.public == peer) {
+                Some(i) => {
+                    self.peers.remove(i);
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+
         fn tofu_pin(&mut self, peer: &PublicKey, now_unix: i64) -> Result<PinOutcome> {
             if self.peers.iter().any(|r| &r.public == peer) {
                 return Ok(PinOutcome::AlreadyPinned);

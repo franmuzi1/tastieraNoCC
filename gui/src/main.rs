@@ -31,6 +31,7 @@
 use eframe::egui;
 use keyboard_cipher_cli::store::{self, FileKeyring, State};
 use keyboard_cipher_core::api::{IncomingItem, SenderStatus, Session};
+use keyboard_cipher_core::format::SENTINEL;
 use keyboard_cipher_core::keys::{Fingerprint, LabelOutcome, PinOutcome, PublicKey};
 use rand_core::OsRng;
 
@@ -83,6 +84,8 @@ struct App {
     avviso: Option<(String, bool)>,
     nuovo_nome: String,
     conflitto: Option<Conflitto>,
+    /// Contatto che si sta per dimenticare, in attesa di conferma.
+    da_dimenticare: Option<usize>,
 }
 
 struct Letto {
@@ -117,6 +120,7 @@ impl App {
             avviso: None,
             nuovo_nome: String::new(),
             conflitto: None,
+            da_dimenticare: None,
         };
         app.ricarica();
         app
@@ -354,6 +358,32 @@ impl App {
         }
     }
 
+    /// Dimentica un contatto, dopo conferma.
+    ///
+    /// La conferma non e' cortesia: cancellare un contatto **perde il pin**, e
+    /// il prossimo messaggio da quella persona verra' rifissato in silenzio
+    /// come se fosse nuovo. Cioe' si riapre la finestra che il pin serviva a
+    /// chiudere, e si perde anche "confrontato di persona". Chi lo fa deve
+    /// saperlo prima, non scoprirlo dopo.
+    fn dimentica(&mut self, indice: usize) {
+        let Some(contatto) = self.contatti.get(indice) else { return };
+        let chiave = contatto.chiave.clone();
+        let nome = contatto
+            .nome
+            .clone()
+            .unwrap_or_else(|| contatto.fingerprint.clone());
+        let Some(mut stato) = self.stato() else { return };
+        let secret = stato.secret_bytes();
+        if !stato.keyring.remove(&chiave) {
+            self.avviso = Some(("Quel contatto non c'e' piu'.".to_owned(), true));
+            return;
+        }
+        self.salva(&secret, &stato.keyring);
+        self.destinatario = None;
+        self.ricarica();
+        self.avviso = Some((format!("{nome} dimenticato."), false));
+    }
+
     fn verifica(&mut self, indice: usize) {
         let Some(contatto) = self.contatti.get(indice) else { return };
         let chiave = contatto.chiave.clone();
@@ -425,6 +455,7 @@ impl eframe::App for App {
         });
 
         self.finestra_conflitto(ctx);
+        self.finestra_dimentica(ctx);
     }
 }
 
@@ -467,12 +498,20 @@ impl App {
 
     fn scheda_leggi(&mut self, ui: &mut egui::Ui) {
         ui.label("Incolla qui il messaggio ricevuto:");
-        ui.add(
+        let campo = ui.add(
             egui::TextEdit::multiline(&mut self.incollato)
                 .desired_rows(5)
                 .desired_width(f32::INFINITY)
                 .hint_text("kc/…"),
         );
+        // Se quello che hai incollato e' un nostro messaggio, si decifra da
+        // solo: chiedere di premere un pulsante quando la risposta e' gia'
+        // certa e' un passaggio che non serve a niente. Il riconoscimento e'
+        // lo stesso della tastiera — il sentinel — e non tocca il keyring:
+        // se non e' nostro, non succede niente.
+        if campo.changed() && self.incollato.contains(SENTINEL) {
+            self.decifra();
+        }
         ui.add_space(8.0);
         if ui.button("Decifra").clicked() {
             self.decifra();
@@ -511,6 +550,7 @@ impl App {
         }
         let mut da_rinominare: Option<usize> = None;
         let mut da_verificare: Option<usize> = None;
+        let mut da_dimenticare: Option<usize> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, contatto) in self.contatti.iter().enumerate() {
                 ui.group(|ui| {
@@ -528,6 +568,9 @@ impl App {
                         if ui.button("Ho confrontato di persona").clicked() {
                             da_verificare = Some(i);
                         }
+                        if ui.button("Dimentica").clicked() {
+                            da_dimenticare = Some(i);
+                        }
                     });
                 });
             }
@@ -542,6 +585,60 @@ impl App {
         }
         if let Some(i) = da_verificare {
             self.verifica(i);
+        }
+        if let Some(i) = da_dimenticare {
+            self.da_dimenticare = Some(i);
+        }
+    }
+
+    /// Conferma prima di dimenticare, con la conseguenza scritta per esteso.
+    fn finestra_dimentica(&mut self, ctx: &egui::Context) {
+        let Some(indice) = self.da_dimenticare else { return };
+        let Some(contatto) = self.contatti.get(indice) else {
+            self.da_dimenticare = None;
+            return;
+        };
+        let nome = contatto
+            .nome
+            .clone()
+            .unwrap_or_else(|| "(senza nome)".to_owned());
+        let fingerprint = contatto.fingerprint.clone();
+        let mut conferma = false;
+        let mut annulla = false;
+        egui::Window::new("Dimenticare questo contatto?")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.strong(&nome);
+                ui.monospace(&fingerprint);
+                ui.add_space(8.0);
+                ui.label(
+                    "Perdi il collegamento fra questa chiave e questa persona. Il prossimo \
+                     messaggio che ti manda ricomparira' come mittente mai visto e verra' \
+                     memorizzato di nuovo senza dire niente: e' la stessa cosa che vedresti \
+                     se qualcuno si stesse spacciando per lei.",
+                );
+                ui.add_space(4.0);
+                ui.small(
+                    "Si perde anche «confrontato di persona», e per riaverlo bisogna \
+                     riconfrontare il codice.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Annulla").clicked() {
+                        annulla = true;
+                    }
+                    if ui.button("Dimentica").clicked() {
+                        conferma = true;
+                    }
+                });
+            });
+        if annulla {
+            self.da_dimenticare = None;
+        }
+        if conferma {
+            self.da_dimenticare = None;
+            self.dimentica(indice);
         }
     }
 

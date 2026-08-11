@@ -129,6 +129,16 @@ impl MemoryKeyring {
 }
 
 impl Keyring for MemoryKeyring {
+    fn forget(&mut self, peer: &PublicKey) -> Result<bool> {
+        match self.peers.iter().position(|p| &p.public == peer) {
+            Some(indice) => {
+                self.peers.remove(indice);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     fn tofu_pin(&mut self, peer: &PublicKey, now_unix: i64) -> Result<PinOutcome> {
         if self.find(peer).is_some() {
             return Ok(PinOutcome::AlreadyPinned);
