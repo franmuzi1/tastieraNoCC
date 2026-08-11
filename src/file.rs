@@ -106,6 +106,62 @@ pub fn seal_file<R: rand_core::RngCore + rand_core::CryptoRng>(
     baseline::seal_file(sender, recipient, &inner, now_unix, rng)
 }
 
+/// Come [`seal_file`], ma con la catena di forward secrecy.
+///
+/// `prekey_destinatario` e' l'ultima chiave temporanea che quel contatto ci ha
+/// mandato: se c'e' si ottiene la forward secrecy piena, se manca si ripiega
+/// sul mittente effimero — che e' comunque meglio dello statico-statico, e fa
+/// **partire** la catena portando la nostra.
+///
+/// Gli allegati passano dallo stesso stato dei messaggi, non da uno loro: sono
+/// la stessa conversazione con la stessa persona, e due catene separate
+/// significherebbero due volte le chiavi da conservare e due volte le occasioni
+/// di non buttarle.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_file_forward<R: rand_core::RngCore + rand_core::CryptoRng>(
+    sender: &Identity,
+    recipient: &PublicKey,
+    prekey_destinatario: Option<&PublicKey>,
+    mia_prekey: &PublicKey,
+    meta: &FileMeta,
+    content: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<Vec<u8>> {
+    let inner = componi(meta, content)?;
+    match prekey_destinatario {
+        Some(loro) => baseline::seal_file_forward(
+            sender, recipient, loro, mia_prekey, &inner, now_unix, rng,
+        ),
+        None => {
+            baseline::seal_file_ephemeral(sender, recipient, mia_prekey, &inner, now_unix, rng)
+        }
+    }
+}
+
+/// Nome, tipo e contenuto in un blocco solo, con i controlli di lunghezza.
+fn componi(meta: &FileMeta, content: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let name = meta.name.as_bytes();
+    let mime = meta.mime.as_bytes();
+    if name.len() > MAX_META_LEN || mime.len() > MAX_META_LEN {
+        return Err(Error::Format("nome o tipo del file troppo lunghi"));
+    }
+    let name_len = u16::try_from(name.len()).map_err(|_| Error::Format("nome troppo lungo"))?;
+    let mime_len = u16::try_from(mime.len()).map_err(|_| Error::Format("tipo troppo lungo"))?;
+    let capacity = LEN_FIELD
+        .saturating_mul(2)
+        .saturating_add(name.len())
+        .saturating_add(mime.len())
+        .saturating_add(content.len());
+    let mut inner = Zeroizing::new(Vec::with_capacity(capacity));
+    inner.extend_from_slice(&name_len.to_le_bytes());
+    inner.extend_from_slice(name);
+    inner.extend_from_slice(&mime_len.to_le_bytes());
+    inner.extend_from_slice(mime);
+    inner.extend_from_slice(content);
+    Ok(inner)
+}
+
 /// Legge l'involucro di un allegato senza decifrarlo.
 ///
 /// Serve a chi riceve per sapere **da chi** arriva prima di poterlo aprire: la
@@ -120,7 +176,33 @@ pub fn open_file(
     sender_pub: &PublicKey,
     parsed: &ParsedEnvelope<'_>,
 ) -> Result<DecryptedFile> {
-    let plaintext = baseline::open_file(recipient, sender_pub, parsed)?;
+    monta(baseline::open_file(recipient, sender_pub, parsed)?)
+}
+
+/// Apre un allegato a mittente effimero **supponendo** che l'abbia mandato
+/// `candidato`. Ritorna anche la sua prossima chiave temporanea.
+pub fn open_file_ephemeral(
+    recipient: &Identity,
+    candidato: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, DecryptedFile)> {
+    let (prekey, plaintext) = baseline::open_file_ephemeral(recipient, candidato, parsed)?;
+    Ok((prekey, monta(plaintext)?))
+}
+
+/// Apre un allegato a forward secrecy piena con una nostra chiave temporanea.
+pub fn open_file_forward(
+    mia_prekey: &crate::keys::EphemeralSecret,
+    candidato: &PublicKey,
+    destinatario: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, DecryptedFile)> {
+    let (prekey, plaintext) =
+        baseline::open_file_forward(mia_prekey, candidato, destinatario, parsed)?;
+    Ok((prekey, monta(plaintext)?))
+}
+
+fn monta(plaintext: crate::baseline::Plaintext) -> Result<DecryptedFile> {
     let (meta, content) = split_inner(plaintext.as_bytes())?;
     Ok(DecryptedFile {
         meta,

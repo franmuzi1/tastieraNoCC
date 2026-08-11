@@ -198,6 +198,51 @@ pub fn seal_ephemeral<R: RngCore + CryptoRng>(
     now_unix: i64,
     rng: &mut R,
 ) -> Result<String> {
+    let (header, ciphertext) = sigilla_effimero(
+        Kind::Message,
+        sender,
+        recipient,
+        mia_prekey,
+        plaintext,
+        now_unix,
+        rng,
+    )?;
+    Ok(format::serialize_message(&header, &ciphertext))
+}
+
+/// [`seal_ephemeral`] per un allegato: stessa derivazione, framing binario.
+pub fn seal_file_ephemeral<R: RngCore + CryptoRng>(
+    sender: &Identity,
+    recipient: &PublicKey,
+    mia_prekey: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<Vec<u8>> {
+    let (header, ciphertext) = sigilla_effimero(
+        Kind::File,
+        sender,
+        recipient,
+        mia_prekey,
+        plaintext,
+        now_unix,
+        rng,
+    )?;
+    Ok(format::serialize_file(&header, &ciphertext))
+}
+
+/// Il corpo comune. `kind` entra nell'AAD, quindi un allegato non puo' essere
+/// riletto come messaggio ne' viceversa.
+#[allow(clippy::too_many_arguments)]
+fn sigilla_effimero<R: RngCore + CryptoRng>(
+    kind: Kind,
+    sender: &Identity,
+    recipient: &PublicKey,
+    mia_prekey: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<(Header, Vec<u8>)> {
     let mut nonce = [0u8; NONCE_LEN];
     rng.fill_bytes(&mut nonce);
     let effimera = Ephemeral::generate(rng)?;
@@ -207,7 +252,7 @@ pub fn seal_ephemeral<R: RngCore + CryptoRng>(
         origin: Origin::Effimera(effimera.public()),
         nonce,
     };
-    let aad = format::build_aad(Kind::Message, &header);
+    let aad = format::build_aad(kind, &header);
     let key = derive_ephemeral_key(
         &*effimera.diffie_hellman(recipient)?,
         &*sender.diffie_hellman(recipient)?,
@@ -240,7 +285,7 @@ pub fn seal_ephemeral<R: RngCore + CryptoRng>(
         )
         .map_err(|_| Error::Crypto)?;
 
-    Ok(format::serialize_message(&header, &ciphertext))
+    Ok((header, ciphertext))
 }
 
 /// Prova ad aprire un messaggio a mittente effimero **supponendo** che l'abbia
@@ -255,6 +300,24 @@ pub fn open_ephemeral(
     candidato: &PublicKey,
     parsed: &ParsedEnvelope<'_>,
 ) -> Result<(PublicKey, Plaintext)> {
+    apri_effimero(Kind::Message, recipient, candidato, parsed)
+}
+
+/// [`open_ephemeral`] per un allegato.
+pub fn open_file_ephemeral(
+    recipient: &Identity,
+    candidato: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    apri_effimero(Kind::File, recipient, candidato, parsed)
+}
+
+fn apri_effimero(
+    kind: Kind,
+    recipient: &Identity,
+    candidato: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
     if parsed.header.tier != Tier::Baseline {
         return Err(Error::TierUnsupported);
     }
@@ -265,7 +328,7 @@ pub fn open_ephemeral(
         return Err(Error::Crypto);
     }
 
-    let aad = format::build_aad(Kind::Message, &parsed.header);
+    let aad = format::build_aad(kind, &parsed.header);
     let key = derive_ephemeral_key(
         &*recipient.diffie_hellman(effimera)?,
         &*recipient.diffie_hellman(candidato)?,
@@ -332,6 +395,54 @@ pub fn seal_forward<R: RngCore + CryptoRng>(
     now_unix: i64,
     rng: &mut R,
 ) -> Result<String> {
+    let (header, ciphertext) = sigilla_avanti(
+        Kind::Message,
+        sender,
+        recipient,
+        prekey_destinatario,
+        mia_prekey,
+        plaintext,
+        now_unix,
+        rng,
+    )?;
+    Ok(format::serialize_message(&header, &ciphertext))
+}
+
+/// [`seal_forward`] per un allegato.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_file_forward<R: RngCore + CryptoRng>(
+    sender: &Identity,
+    recipient: &PublicKey,
+    prekey_destinatario: &PublicKey,
+    mia_prekey: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<Vec<u8>> {
+    let (header, ciphertext) = sigilla_avanti(
+        Kind::File,
+        sender,
+        recipient,
+        prekey_destinatario,
+        mia_prekey,
+        plaintext,
+        now_unix,
+        rng,
+    )?;
+    Ok(format::serialize_file(&header, &ciphertext))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sigilla_avanti<R: RngCore + CryptoRng>(
+    kind: Kind,
+    sender: &Identity,
+    recipient: &PublicKey,
+    prekey_destinatario: &PublicKey,
+    mia_prekey: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<(Header, Vec<u8>)> {
     let mut nonce = [0u8; NONCE_LEN];
     rng.fill_bytes(&mut nonce);
     let effimera = Ephemeral::generate(rng)?;
@@ -341,7 +452,7 @@ pub fn seal_forward<R: RngCore + CryptoRng>(
         origin: Origin::EffimeraConPrekey(effimera.public()),
         nonce,
     };
-    let aad = format::build_aad(Kind::Message, &header);
+    let aad = format::build_aad(kind, &header);
     let key = derive_ephemeral_key(
         &*effimera.diffie_hellman(prekey_destinatario)?,
         &*sender.diffie_hellman(prekey_destinatario)?,
@@ -369,7 +480,7 @@ pub fn seal_forward<R: RngCore + CryptoRng>(
         )
         .map_err(|_| Error::Crypto)?;
 
-    Ok(format::serialize_message(&header, &ciphertext))
+    Ok((header, ciphertext))
 }
 
 /// Prova ad aprire un messaggio a forward secrecy piena, supponendo che
@@ -378,6 +489,26 @@ pub fn seal_forward<R: RngCore + CryptoRng>(
 /// Ritorna anche la **prossima prekey del mittente**, presa da dentro il
 /// cifrato: e' quella con cui rispondere, ed e' autenticata dall'AEAD.
 pub fn open_forward(
+    mia_prekey: &EphemeralSecret,
+    candidato: &PublicKey,
+    destinatario: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    apri_avanti(Kind::Message, mia_prekey, candidato, destinatario, parsed)
+}
+
+/// [`open_forward`] per un allegato.
+pub fn open_file_forward(
+    mia_prekey: &EphemeralSecret,
+    candidato: &PublicKey,
+    destinatario: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    apri_avanti(Kind::File, mia_prekey, candidato, destinatario, parsed)
+}
+
+fn apri_avanti(
+    kind: Kind,
     mia_prekey: &EphemeralSecret,
     candidato: &PublicKey,
     destinatario: &PublicKey,
@@ -393,7 +524,7 @@ pub fn open_forward(
         return Err(Error::Crypto);
     }
 
-    let aad = format::build_aad(Kind::Message, &parsed.header);
+    let aad = format::build_aad(kind, &parsed.header);
     let key = derive_ephemeral_key(
         &*mia_prekey.diffie_hellman(effimera)?,
         &*mia_prekey.diffie_hellman(candidato)?,

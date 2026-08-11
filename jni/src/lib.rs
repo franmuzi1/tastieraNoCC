@@ -322,6 +322,9 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHasCurren
 /// Niente destinatario implicito (decisione G4): questo percorso parte da una
 /// schermata, non dalla tastiera, quindi il contesto dell'app da cui dedurlo
 /// non esiste — e un file mandato alla persona sbagliata non si ritira.
+///
+/// Con `forward` diverso da zero **modifica il keyring**, come
+/// `nativeEncryptForApp`: chi chiama deve persistere subito.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFile(
     mut env: JNIEnv,
@@ -331,6 +334,7 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFi
     mime: JString,
     content: JByteArray,
     now_unix: jlong,
+    forward: jboolean,
 ) -> jbyteArray {
     guard(std::ptr::null_mut(), || {
         let Ok(chiave) = read_key(&mut env, &peer) else {
@@ -347,7 +351,7 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFi
         };
         let meta = FileMeta { name: nome, mime: tipo };
         let esito = with_session(|session| {
-            session.encrypt_file(&chiave, &meta, &bytes, now_unix, &mut OsRng)
+            session.encrypt_file_with(&chiave, &meta, &bytes, now_unix, &mut OsRng, forward != 0)
         });
         match esito {
             Ok(blob) => new_byte_array(&env, &blob),

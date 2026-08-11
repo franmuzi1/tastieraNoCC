@@ -73,7 +73,7 @@ kc — l'altra parte di keyboard-cipher, per provare la tastiera da soli.
   kc encrypt --to <chi> [testo]   cifra (se manca il testo, legge da stdin)
                                   --no-fs: senza forward secrecy, rileggibile
   kc decrypt [blob]        decifra un messaggio o fissa una presentazione
-  kc sealfile --to <chi> <file>    cifra un file, scrive <file>.kc
+  kc sealfile --to <chi> <file>    cifra un file, scrive <file>.kc (--no-fs)
   kc openfile <file.kc> [dove]     apre un allegato cifrato
   kc archive <esportazione>        decifra tutti i messaggi di una chat esportata
 
@@ -343,12 +343,17 @@ fn cmd_decrypt(args: &[String]) -> Result<(), String> {
 fn cmd_sealfile(args: &[String]) -> Result<(), String> {
     let mut who: Option<&str> = None;
     let mut percorso: Option<&str> = None;
+    let mut forward = true;
     let mut i = 0;
     while let Some(arg) = args.get(i) {
         match arg.as_str() {
             "--to" | "-t" => {
                 who = args.get(i.saturating_add(1)).map(String::as_str);
                 i = i.saturating_add(2);
+            }
+            "--no-fs" => {
+                forward = false;
+                i = i.saturating_add(1);
             }
             altro => {
                 percorso = Some(altro);
@@ -361,6 +366,7 @@ fn cmd_sealfile(args: &[String]) -> Result<(), String> {
     let contenuto = std::fs::read(percorso).map_err(|e| format!("{percorso}: {e}"))?;
 
     let state = load()?;
+    let secret = state.secret_bytes();
     let peer = resolve(&state.keyring, who)?;
     let nome = std::path::Path::new(percorso)
         .file_name()
@@ -372,10 +378,13 @@ fn cmd_sealfile(args: &[String]) -> Result<(), String> {
         // tipi e inventarne una sarebbe peggio che dire "non lo so".
         mime: "application/octet-stream".to_owned(),
     };
-    let session = Session::new(state.identity, state.keyring);
+    let mut session = Session::new(state.identity, state.keyring);
     let blob = session
-        .encrypt_file(&peer, &meta, &contenuto, now_unix(), &mut OsRng)
+        .encrypt_file_with(&peer, &meta, &contenuto, now_unix(), &mut OsRng, forward)
         .map_err(|e| format!("{e}"))?;
+    // La chiave temporanea appena generata va salvata prima che l'allegato
+    // esista su disco: e' con quella che l'altro rispondera'.
+    persist(&secret, &session)?;
 
     let uscita = format!("{percorso}.kc");
     std::fs::write(&uscita, &blob).map_err(|e| format!("{uscita}: {e}"))?;

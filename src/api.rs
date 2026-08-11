@@ -385,6 +385,49 @@ impl<K: Keyring> Session<K> {
         file::seal_file(&self.identity, peer, meta, content, now_unix, rng)
     }
 
+    /// [`Self::encrypt_file`] con la catena di forward secrecy.
+    ///
+    /// Un allegato senza catena e' un buco piu' grosso di un messaggio senza:
+    /// una foto vale piu' di una riga di testo, e resta sul telefono di chi la
+    /// riceve. Con `forward = false` si torna allo statico-statico, per chi
+    /// scrive a una versione vecchia.
+    ///
+    /// **Usa lo stesso stato dei messaggi**, non uno suo: e' la stessa
+    /// conversazione con la stessa persona, e due catene separate
+    /// significherebbero due volte le chiavi da conservare e due volte le
+    /// occasioni di non buttarle.
+    pub fn encrypt_file_with<R: RngCore + CryptoRng>(
+        &mut self,
+        peer: &PublicKey,
+        meta: &FileMeta,
+        content: &[u8],
+        now_unix: i64,
+        rng: &mut R,
+        forward: bool,
+    ) -> Result<Vec<u8>> {
+        if self.keyring.get(peer)?.is_none() {
+            return Err(Error::UnknownPeer);
+        }
+        if !forward {
+            return file::seal_file(&self.identity, peer, meta, content, now_unix, rng);
+        }
+        let sua = self.keyring.peer_prekey(peer)?;
+        let mia = keys::EphemeralSecret::from_bytes(nuovo_segreto(rng));
+        let blob = file::seal_file_forward(
+            &self.identity,
+            peer,
+            sua.as_ref(),
+            &mia.public(),
+            meta,
+            content,
+            now_unix,
+            rng,
+        )?;
+        // Dopo aver cifrato: se fallisse, avremmo salvato una chiave inutile.
+        self.keyring.push_my_prekey(peer, *mia.to_bytes())?;
+        Ok(blob)
+    }
+
     /// Apre un allegato ricevuto.
     ///
     /// Stesso ordine critico dei messaggi: **si decifra prima di toccare il
@@ -397,13 +440,26 @@ impl<K: Keyring> Session<K> {
     /// il modo per far cifrare il messaggio successivo alla persona sbagliata.
     pub fn handle_incoming_file(&mut self, bytes: &[u8], now_unix: i64) -> Result<IncomingFile> {
         let parsed = file::parse_file(bytes)?;
-        let sender = parsed
-            .header
-            .sender_pub()
-            .cloned()
-            .ok_or(Error::Format("allegato senza pubkey del mittente"))?;
 
-        let decrypted = file::open_file(&self.identity, &sender, &parsed)?;
+        // Come per i messaggi: se il mittente e' effimero non c'e' scritto chi
+        // ha mandato il file, e lo si scopre provando i propri contatti. Chi
+        // non e' nel keyring resta sconosciuto, ed e' voluto — altrimenti
+        // chiunque potrebbe farsi fissare spedendo un allegato.
+        let (sender, decrypted) = if parsed.header.origin.uses_prekey() {
+            self.prova_le_prekey_sul_file(&parsed)?
+        } else if parsed.header.origin.is_ephemeral() {
+            let (chi, prekey, aperto) = self.prova_i_contatti_sul_file(&parsed)?;
+            self.keyring.set_peer_prekey(&chi, &prekey)?;
+            (chi, aperto)
+        } else {
+            let sender = parsed
+                .header
+                .sender_pub()
+                .cloned()
+                .ok_or(Error::Format("allegato senza pubkey del mittente"))?;
+            let aperto = file::open_file(&self.identity, &sender, &parsed)?;
+            (sender, aperto)
+        };
         let sender_status = self.pin_and_classify(&sender, now_unix)?;
 
         Ok(IncomingFile {
@@ -411,6 +467,45 @@ impl<K: Keyring> Session<K> {
             sender_status,
             file: decrypted,
         })
+    }
+
+    /// [`Self::prova_i_contatti`] per gli allegati.
+    fn prova_i_contatti_sul_file(
+        &self,
+        parsed: &crate::format::ParsedEnvelope<'_>,
+    ) -> Result<(PublicKey, PublicKey, file::DecryptedFile)> {
+        for candidato in self.keyring.peers()? {
+            if let Ok((prekey, aperto)) =
+                file::open_file_ephemeral(&self.identity, &candidato, parsed)
+            {
+                return Ok((candidato, prekey, aperto));
+            }
+        }
+        Err(Error::Crypto)
+    }
+
+    /// [`Self::prova_con_le_prekey`] per gli allegati: stessa catena, stesso
+    /// gesto di buttare le chiavi vecchie.
+    fn prova_le_prekey_sul_file(
+        &mut self,
+        parsed: &crate::format::ParsedEnvelope<'_>,
+    ) -> Result<(PublicKey, file::DecryptedFile)> {
+        let mio = self.identity.public();
+        for candidato in self.keyring.peers()? {
+            for segreto in self.keyring.my_prekeys(&candidato)? {
+                let prekey = keys::EphemeralSecret::from_bytes(segreto);
+                let Ok((prossima, aperto)) =
+                    file::open_file_forward(&prekey, &candidato, &mio, parsed)
+                else {
+                    continue;
+                };
+                self.keyring.set_peer_prekey(&candidato, &prossima)?;
+                self.keyring
+                    .drop_my_prekeys_older_than(&candidato, &segreto)?;
+                return Ok((candidato, aperto));
+            }
+        }
+        Err(Error::Crypto)
     }
 
     /// Dimentica un peer, e smette di usarlo come destinatario.
@@ -935,6 +1030,76 @@ mod tests {
         };
         assert_eq!(messaggio.plaintext.as_bytes(), b"risposta");
         assert_eq!(messaggio.sender, chiave_bob);
+    }
+
+    /// Un allegato deve avere la stessa catena di un messaggio: una foto vale
+    /// piu' di una riga di testo, e resta sul telefono di chi la riceve.
+    #[test]
+    fn anche_gli_allegati_hanno_la_catena() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity().public();
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+
+        let meta = crate::file::FileMeta {
+            name: "foto.jpg".to_owned(),
+            mime: "image/jpeg".to_owned(),
+        };
+
+        // Primo allegato: nessuna chiave di Bob, quindi mittente effimero —
+        // ma porta gia' la propria, e la catena parte.
+        let uno = alice
+            .encrypt_file_with(&chiave_bob, &meta, b"contenuto", 10, &mut rng(9), true)
+            .unwrap();
+        let letto = bob.handle_incoming_file(&uno, 11).unwrap();
+        assert_eq!(letto.sender, chiave_alice);
+        assert_eq!(letto.file.meta.name, "foto.jpg");
+        assert_eq!(&*letto.file.content, b"contenuto");
+        assert!(
+            bob.keyring.peer_prekey(&chiave_alice).unwrap().is_some(),
+            "anche un allegato deve far partire la catena"
+        );
+
+        // La risposta di Bob usa quella chiave: forward secrecy piena.
+        let due = bob
+            .encrypt_file_with(&chiave_alice, &meta, b"risposta", 12, &mut rng(8), true)
+            .unwrap();
+        let piena = crate::file::parse_file(&due).unwrap().header.origin.uses_prekey();
+        assert!(piena, "il secondo allegato doveva essere a forward secrecy piena");
+
+        let letto = alice.handle_incoming_file(&due, 13).unwrap();
+        assert_eq!(letto.sender, chiave_bob);
+        assert_eq!(&*letto.file.content, b"risposta");
+    }
+
+    /// Un allegato non deve poter essere riletto come messaggio: `kind` sta
+    /// nell'AAD anche negli schemi a mittente effimero, e se ci finisse solo in
+    /// quelli statici questo test lo direbbe.
+    #[test]
+    fn un_allegato_non_e_un_messaggio_nemmeno_con_la_catena() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity().public();
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+
+        let meta = crate::file::FileMeta {
+            name: "a".to_owned(),
+            mime: "b".to_owned(),
+        };
+        let allegato = alice
+            .encrypt_file_with(&chiave_bob, &meta, b"segreto", 10, &mut rng(9), true)
+            .unwrap();
+
+        // Stesso corpo, riservito come messaggio: l'AAD non torna.
+        let come_messaggio = {
+            let parsed = crate::file::parse_file(&allegato).unwrap();
+            format::serialize_message(&parsed.header, parsed.ciphertext)
+        };
+        assert!(bob.handle_incoming_text(WHATSAPP, &come_messaggio, 11).is_err());
     }
 
     /// **Il prezzo accettato:** quando la catena avanza, i messaggi vecchi non
