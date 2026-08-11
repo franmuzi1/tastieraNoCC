@@ -56,10 +56,13 @@ NON protegge da — per scelta esplicita, non per dimenticanza:
   l'identità dell'account mittente, quindi una pubkey pseudonima non le
   aggiunge informazione. Contro un avversario mirato la valutazione sarebbe
   diversa;
-- compromissione futura delle chiavi long-term. È il rischio che la ritenzione
-  in blocco fa maturare nel tempo: archivio conservato oggi + chiavi
-  compromesse domani = decifratura retroattiva. **È la ragione per cui il tier
-  forward-secrecy esiste nel formato**, anche se non è ancora implementato;
+- compromissione futura delle chiavi long-term — **non piu', se la forward
+  secrecy è accesa** (decisione I). È il rischio che la ritenzione in blocco fa
+  maturare nel tempo: archivio conservato oggi + chiavi compromesse domani =
+  decifratura retroattiva. Con la catena attiva le chiavi long-term non bastano
+  più ad aprire nulla dal secondo messaggio in poi. Resta scoperto ciò che si
+  manda con l'interruttore spento, e **gli allegati**, che la catena non ce
+  l'hanno ancora;
 - **replay** di un blob valido. Un blob resta valido per sempre e ripubblicarlo
   funziona. Priorità bassa in questo threat model, perché il replay è un'azione
   attiva e mirata, non qualcosa che emerge dallo scanning di massa. Mitigazione
@@ -134,11 +137,66 @@ dei miei contatti" da "corrotto" direbbe a chi attacca qualcosa sul keyring.
 
 **Cosa NON risolve:** chi ottiene la chiave del **destinatario** apre tutto lo
 stesso, perche' entrambi gli scambi passano di li'. Per quello serve una chiave
-temporanea anche dal lato di chi riceve — decisione a parte, ramo a parte.
+temporanea anche dal lato di chi riceve — ed e' la decisione I qui sotto.
 
 **Compatibilita':** un messaggio effimero non lo apre una versione precedente.
 La scelta sta quindi nel chiamante, non nel core: il core non sa che versione
 abbia il destinatario, e indovinarlo produrrebbe messaggi illeggibili.
+
+### Forward secrecy piena (decisione I, chiusa)
+
+Chiude il buco lasciato dalla H: la chiave temporanea la mette **anche chi
+riceve**. Segnalata dal bit `PREKEY`, che implica sempre `EPHEMERAL` — "prekey
+senza effimera" e' un header incoerente e il parser lo rifiuta.
+
+```text
+segreto = DH(effimera, prekey_destinatario) || DH(mittente, prekey_destinatario)
+```
+
+**La prekey viaggia dentro il cifrato, non nell'header.** In chiaro sarebbe un
+identificatore che cambia a ogni messaggio ma lega fra loro i due capi di una
+conversazione — regalerebbe allo scanning esattamente il tipo di correlazione
+che il mittente effimero toglie.
+
+**Come parte la catena.** Il primo messaggio non puo' essere a forward secrecy
+piena: una prekey dell'altro non ce l'abbiamo ancora. Ripiega sullo schema H, e
+**porta comunque la propria prekey dentro il cifrato**. Da qui la regola che ha
+gia' prodotto un bug: *ogni* messaggio ne porta una, anche quelli che non ne
+usano una. Facendola viaggiare solo nei messaggi che gia' la usavano, la catena
+non sarebbe mai partita — nessuno avrebbe mai avuto la prima.
+
+Il ripiego **non e' un downgrade forzabile**: dipende da cosa ci ha mandato
+l'altro in passato, non da cosa dichiara il messaggio in arrivo.
+
+**Lo stato per contatto** vive in `Keyring` (`PrekeyStore` nel core: struttura
+dati, nessun I/O, cosi' le tre implementazioni non ne hanno tre versioni
+diverse). Se ne tengono `MAX_PREKEY_MIE` = 3, ed e' **la finestra in cui la
+forward secrecy non c'e' ancora**: una sola romperebbe il caso normale — mando
+due messaggi di fila, l'altro apre il secondo, il primo e' gia' morto — e molte
+allungherebbero il periodo in cui un telefono sequestrato apre il passato.
+
+**Il gesto che produce la proprieta' e' `drop_my_prekeys_older_than`**, cioe'
+buttare, non cifrare. Finche' quelle chiavi esistono i messaggi che le usavano
+si riaprono. Si butta il vecchio e non tutto: in un mezzo fatto di copia-incolla
+i messaggi arrivano in ordine sparso di continuo.
+
+**Cifrare non e' piu' un'operazione di sola lettura.** Genera una prekey nuova e
+la mette nel keyring, quindi ogni chiamante deve persistere subito: un processo
+che muore prima si porta nella tomba la chiave con cui l'altro rispondera'. Vale
+per tutti e tre (tastiera, GUI, `kc`), ed e' scritto sulla firma JNI perche' da
+li' non si indovina.
+
+**Il prezzo, accettato esplicitamente dall'utente:** un messaggio si apre una
+volta sola. Niente cronologia, e `kc archive` / "ricostruisci chat" non riaprono
+niente di cio' che e' stato mandato cosi'. Per questo l'interruttore esiste
+(uno solo, acceso di default) e il suo testo dice il prezzo, non solo il
+vantaggio.
+
+**Residuo: gli allegati non ce l'hanno.** `encrypt_file` resta statico-statico.
+Un file mandato oggi si riapre con la chiave d'identita' di domani. Non e' una
+dimenticanza: il percorso dei file ha un'altra via d'ingresso e un'altra
+identificazione del mittente, e andava fatto insieme o non fatto. Da chiudere,
+non da ignorare.
 
 ### Autenticazione mittente (baseline)
 
@@ -430,8 +488,11 @@ chiede: cifrare per la persona sbagliata e' il fallimento peggiore possibile.
 - Byte di versione in testa.
 - Marcatore di tier dentro la parte **autenticata** (AAD), per impedire
   downgrade forzato da un attaccante attivo.
-- Il tier forward-secrecy è previsto nel formato ma **non implementato**:
-  parsing riconosciuto, esecuzione → `TierUnsupported`.
+- Il **tier** forward-secrecy resta non implementato: parsing riconosciuto,
+  esecuzione → `TierUnsupported`. Da non confondere con la decisione I, che la
+  forward secrecy la fa **dentro il tier baseline**, con i bit di flag: il tier
+  e' un posto libero nel formato per uno schema futuro, non il meccanismo in
+  uso.
 
 ### Errori
 
