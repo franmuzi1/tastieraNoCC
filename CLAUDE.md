@@ -60,9 +60,8 @@ NON protegge da — per scelta esplicita, non per dimenticanza:
   secrecy è accesa** (decisione I). È il rischio che la ritenzione in blocco fa
   maturare nel tempo: archivio conservato oggi + chiavi compromesse domani =
   decifratura retroattiva. Con la catena attiva le chiavi long-term non bastano
-  più ad aprire nulla dal secondo messaggio in poi. Resta scoperto ciò che si
-  manda con l'interruttore spento, e **gli allegati**, che la catena non ce
-  l'hanno ancora;
+  più ad aprire nulla dal secondo messaggio in poi, allegati compresi. Resta
+  scoperto solo ciò che si manda con l'interruttore spento;
 - **replay** di un blob valido. Un blob resta valido per sempre e ripubblicarlo
   funziona. Priorità bassa in questo threat model, perché il replay è un'azione
   attiva e mirata, non qualcosa che emerge dallo scanning di massa. Mitigazione
@@ -192,11 +191,14 @@ niente di cio' che e' stato mandato cosi'. Per questo l'interruttore esiste
 (uno solo, acceso di default) e il suo testo dice il prezzo, non solo il
 vantaggio.
 
-**Residuo: gli allegati non ce l'hanno.** `encrypt_file` resta statico-statico.
-Un file mandato oggi si riapre con la chiave d'identita' di domani. Non e' una
-dimenticanza: il percorso dei file ha un'altra via d'ingresso e un'altra
-identificazione del mittente, e andava fatto insieme o non fatto. Da chiudere,
-non da ignorare.
+**Vale anche per gli allegati** (`encrypt_file_with`): un file senza catena e'
+un buco piu' grosso di un messaggio senza — una foto vale piu' di una riga di
+testo, e resta sul telefono di chi la riceve. Gli allegati usano **lo stesso
+stato per contatto** dei messaggi, non uno loro: e' la stessa conversazione con
+la stessa persona, e due catene separate significherebbero due volte le chiavi
+da conservare e due volte le occasioni di non buttarle. `kind` resta nell'AAD
+anche qui, quindi un allegato non si rilegge come messaggio nemmeno con la
+catena — c'e' il test.
 
 ### Autenticazione mittente (baseline)
 
