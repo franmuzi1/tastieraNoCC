@@ -101,6 +101,45 @@ NON protegge da — per scelta esplicita, non per dimenticanza:
   viene da differential testing contro la crate `zbase32` (dev-dependency), non
   da vettori inventati.
 
+### Mittente effimero (decisione H, chiusa)
+
+Schema alternativo, **nello stesso tier**: la chiave nell'header e' usa-e-getta
+e l'identita' del mittente non compare in chiaro. Segnalato dal bit di flag
+`EPHEMERAL`, che si accompagna sempre a `SENDER_PUB` — "effimera senza chiave"
+e' un header incoerente e il parser lo rifiuta.
+
+La chiave AEAD nasce da **due scambi concatenati**:
+
+```text
+segreto = DH(effimera, destinatario) || DH(mittente, destinatario)
+```
+
+Il primo da' la mezza forward secrecy: l'effimera si butta subito, quindi chi
+domani ottiene la chiave stabile del *mittente* non riapre i messaggi di ieri.
+Il secondo e' la **prova d'identita'**: solo chi ha la privata del mittente puo'
+produrre quel segreto, quindi il successo della decifratura dimostra chi ha
+scritto.
+
+**Perche' non una firma** (decisione H, chiusa): richiederebbe Ed25519 accanto a
+X25519, cioe' una primitiva in piu' e un campo da verificare. Qui la prova viene
+dalla derivazione stessa, senza aggiungere superficie.
+
+**Come fa il destinatario a sapere chi ha scritto:** non lo sa, prova. Una
+decifratura per ciascun contatto fissato; la prima che riesce identifica il
+mittente. Con qualche decina di contatti non si nota. Chi non e' nel keyring non
+viene riconosciuto, ed e' voluto: un mittente sconosciuto va presentato con una
+card prima, altrimenti chiunque potrebbe far comparire messaggi nel keyring.
+Fallendo tutte, l'errore e' `Crypto` come qualunque altro — distinguere "nessuno
+dei miei contatti" da "corrotto" direbbe a chi attacca qualcosa sul keyring.
+
+**Cosa NON risolve:** chi ottiene la chiave del **destinatario** apre tutto lo
+stesso, perche' entrambi gli scambi passano di li'. Per quello serve una chiave
+temporanea anche dal lato di chi riceve — decisione a parte, ramo a parte.
+
+**Compatibilita':** un messaggio effimero non lo apre una versione precedente.
+La scelta sta quindi nel chiamante, non nel core: il core non sa che versione
+abbia il destinatario, e indovinarlo produrrebbe messaggi illeggibili.
+
 ### Autenticazione mittente (baseline)
 
 - `crypto_box` statico-statico: ECDH fra il nostro segreto e la pubkey del

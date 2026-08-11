@@ -2,7 +2,7 @@
 
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 
@@ -105,6 +105,44 @@ impl Identity {
     /// AEAD che qualsiasi altro puo' derivare. X25519 non lo impedisce da
     /// solo — accetta qualunque sequenza di 32 byte — quindi il controllo va
     /// fatto sul risultato, ed e' qui l'unico punto in cui puo' stare.
+    pub(crate) fn diffie_hellman(&self, peer: &PublicKey) -> Result<Zeroizing<[u8; KEY_LEN]>> {
+        let shared = self.secret.0.diffie_hellman(&XPublicKey::from(*peer.as_bytes()));
+        if !shared.was_contributory() {
+            return Err(Error::Crypto);
+        }
+        Ok(Zeroizing::new(shared.to_bytes()))
+    }
+}
+
+/// Coppia effimera: vive il tempo di cifrare un messaggio e poi sparisce.
+///
+/// Il segreto non esce mai da qui e viene azzerato alla distruzione: e' cio'
+/// che rende il messaggio illeggibile anche a chi domani ottenesse la chiave
+/// stabile del mittente. Se questo segreto venisse conservato, la mezza
+/// forward secrecy che lo giustifica non ci sarebbe.
+pub struct Ephemeral {
+    secret: SecretKey,
+    public: PublicKey,
+}
+
+impl Ephemeral {
+    pub fn generate<R: rand_core::RngCore + rand_core::CryptoRng>(rng: &mut R) -> Result<Self> {
+        let mut bytes = [0u8; KEY_LEN];
+        rng.fill_bytes(&mut bytes);
+        let secret = StaticSecret::from(bytes);
+        // Il seme non serve piu': `StaticSecret` ne ha fatto una copia sua.
+        bytes.zeroize();
+        let public = PublicKey(XPublicKey::from(&secret).to_bytes());
+        Ok(Self {
+            secret: SecretKey(secret),
+            public,
+        })
+    }
+
+    pub fn public(&self) -> PublicKey {
+        self.public.clone()
+    }
+
     pub(crate) fn diffie_hellman(&self, peer: &PublicKey) -> Result<Zeroizing<[u8; KEY_LEN]>> {
         let shared = self.secret.0.diffie_hellman(&XPublicKey::from(*peer.as_bytes()));
         if !shared.was_contributory() {
@@ -264,6 +302,13 @@ pub trait Keyring {
     /// si spaccia per lei, cioe' si riapre esattamente la finestra che il pin
     /// serviva a chiudere.
     fn forget(&mut self, peer: &PublicKey) -> Result<bool>;
+
+    /// Le chiavi fissate, per chi deve provarle tutte.
+    ///
+    /// Serve ai messaggi a mittente effimero: chi riceve non sa chi ha
+    /// scritto, e lo scopre tentando. Ritorna un `Vec` e non un iteratore
+    /// perche' il trait deve restare object-safe.
+    fn peers(&self) -> Result<Vec<PublicKey>>;
 
     fn get(&self, peer: &PublicKey) -> Result<Option<PeerRecord>>;
 

@@ -164,8 +164,23 @@ impl Flags {
     pub const NONE: Flags = Flags(0);
     /// Il body contiene `sender_pub` in chiaro.
     pub const SENDER_PUB: Flags = Flags(0b0000_0001);
+    /// La chiave nell'header e' **effimera**, non l'identita' del mittente.
+    ///
+    /// Chi riceve non sa piu' chi ha scritto prima di aver decifrato: lo
+    /// scopre provando i propri contatti. La chiave AEAD si deriva da due
+    /// scambi insieme — quello effimero e quello con la chiave stabile del
+    /// mittente — quindi il fatto stesso che la decifratura riesca **dimostra**
+    /// chi e' stato, senza bisogno di una firma.
+    ///
+    /// Toglie di mezzo la correlabilita': senza `sender_pub` in chiaro, due
+    /// messaggi dello stesso mittente non si possono piu' legare guardando il
+    /// traffico. Ed e' mezza forward secrecy: chi ottiene domani la chiave del
+    /// MITTENTE non apre i messaggi di ieri, perche' l'effimera e' stata
+    /// buttata. Chi ottiene quella del destinatario si', ed e' il motivo per
+    /// cui questo non basta e la prekey resta da fare.
+    pub const EPHEMERAL: Flags = Flags(0b0000_0010);
     /// Bit definiti nella versione 1. Tutto il resto deve essere zero.
-    pub const KNOWN: Flags = Flags(0b0000_0001);
+    pub const KNOWN: Flags = Flags(0b0000_0011);
 
     pub fn contains(self, other: Flags) -> bool {
         self.0 & other.0 == other.0
@@ -176,26 +191,73 @@ impl Flags {
     }
 }
 
+/// Che cos'e' la chiave pubblica nell'header, se c'e'.
+///
+/// Un tipo solo invece di una chiave piu' un flag: con due campi si potrebbe
+/// scrivere "effimera" senza chiave, o una chiave senza dire cosa sia. Qui
+/// quegli stati non si possono nemmeno esprimere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Nessuna chiave in chiaro. Nessuno schema attuale la produce; resta
+    /// rappresentabile perche' un tier futuro potrebbe.
+    Assente,
+    /// La chiave del mittente, in chiaro. Serve al primo contatto TOFU, e
+    /// rende i messaggi dello stesso mittente correlabili fra loro — residuo
+    /// accettato nel modello di minaccia.
+    Mittente(PublicKey),
+    /// Una chiave **effimera**, buttata dal mittente subito dopo l'invio.
+    ///
+    /// Chi riceve non sa chi ha scritto finche' non decifra: lo scopre
+    /// provando i propri contatti. La chiave AEAD nasce da due scambi insieme,
+    /// quello effimero e quello con la chiave stabile del mittente, quindi il
+    /// successo della decifratura **dimostra** chi e' stato senza firme.
+    Effimera(PublicKey),
+}
+
+impl Origin {
+    pub fn is_ephemeral(&self) -> bool {
+        matches!(self, Origin::Effimera(_))
+    }
+
+    /// La chiave da mettere nel body, se c'e'.
+    pub fn key(&self) -> Option<&PublicKey> {
+        match self {
+            Origin::Assente => None,
+            Origin::Mittente(k) | Origin::Effimera(k) => Some(k),
+        }
+    }
+}
+
 /// Header in chiaro di un messaggio. Tutto quello che sta qui e' visibile a
 /// chi intercetta: tenerlo minimo.
 ///
-/// `flags` non e' un campo ma una funzione di `sender_pub`: due fonti di
-/// verita' per lo stesso fatto sarebbero un modo per produrre un header
-/// incoerente, e un header incoerente fa fallire l'autenticazione in modo
-/// opaco. Un solo posto in cui la presenza e' rappresentata.
+/// `flags` non e' un campo ma una funzione di `origin`: due fonti di verita'
+/// per lo stesso fatto sarebbero un modo per produrre un header incoerente, e
+/// un header incoerente fa fallire l'autenticazione in modo opaco. Un solo
+/// posto in cui la natura della chiave e' rappresentata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
     pub tier: Tier,
-    pub sender_pub: Option<PublicKey>,
+    pub origin: Origin,
     pub nonce: [u8; NONCE_LEN],
 }
 
 impl Header {
     pub fn flags(&self) -> Flags {
-        if self.sender_pub.is_some() {
-            Flags::SENDER_PUB
-        } else {
-            Flags::NONE
+        match self.origin {
+            Origin::Assente => Flags::NONE,
+            Origin::Mittente(_) => Flags::SENDER_PUB,
+            Origin::Effimera(_) => Flags(Flags::SENDER_PUB.0 | Flags::EPHEMERAL.0),
+        }
+    }
+
+    /// La chiave del mittente, se l'header la dichiara come tale. `None` per
+    /// una chiave effimera: quella non dice chi ha scritto, e trattarla come
+    /// identita' significherebbe fissare nel keyring una chiave usa-e-getta.
+    pub fn sender_pub(&self) -> Option<&PublicKey> {
+        match &self.origin {
+            Origin::Mittente(k) => Some(k),
+            _ => None,
         }
     }
 }
@@ -236,8 +298,8 @@ pub fn build_aad(kind: Kind, header: &Header) -> Vec<u8> {
     aad.push(kind as u8);
     aad.push(header.tier as u8);
     aad.push(header.flags().0);
-    if let Some(sender) = &header.sender_pub {
-        aad.extend_from_slice(sender.as_bytes());
+    if let Some(chiave) = header.origin.key() {
+        aad.extend_from_slice(chiave.as_bytes());
     }
     aad
 }
@@ -254,8 +316,8 @@ pub fn serialize_message(header: &Header, ciphertext: &[u8]) -> String {
     body.push(Kind::Message as u8);
     body.push(header.tier as u8);
     body.push(header.flags().0);
-    if let Some(sender) = &header.sender_pub {
-        body.extend_from_slice(sender.as_bytes());
+    if let Some(chiave) = header.origin.key() {
+        body.extend_from_slice(chiave.as_bytes());
     }
     body.extend_from_slice(&header.nonce);
     body.extend_from_slice(ciphertext);
@@ -397,8 +459,8 @@ pub fn serialize_file(header: &Header, ciphertext: &[u8]) -> Vec<u8> {
     body.push(Kind::File as u8);
     body.push(header.tier as u8);
     body.push(header.flags().0);
-    if let Some(sender) = &header.sender_pub {
-        body.extend_from_slice(sender.as_bytes());
+    if let Some(chiave) = header.origin.key() {
+        body.extend_from_slice(chiave.as_bytes());
     }
     body.extend_from_slice(&header.nonce);
     body.extend_from_slice(ciphertext);
@@ -458,12 +520,26 @@ fn parse_message<'a>(mut cursor: Cursor<'a>) -> Result<ParsedEnvelope<'a>> {
         return Err(Error::Format("flag non definiti in questa versione"));
     }
 
-    let sender_pub = if flags.contains(Flags::SENDER_PUB) {
-        let mut bytes = [0u8; KEY_LEN];
-        bytes.copy_from_slice(cursor.take(KEY_LEN)?);
-        Some(PublicKey::from_bytes(bytes))
-    } else {
-        None
+    // La natura della chiave si ricava dai flag, e i due bit non sono
+    // indipendenti: "effimera" senza "chiave presente" e' un header incoerente,
+    // e va rifiutato qui invece di produrre un `Origin` che non descrive il
+    // body — un errore di formato e' diagnosticabile, un fallimento AEAD no.
+    let origin = match (
+        flags.contains(Flags::SENDER_PUB),
+        flags.contains(Flags::EPHEMERAL),
+    ) {
+        (false, true) => return Err(Error::Format("effimera senza chiave")),
+        (false, false) => Origin::Assente,
+        (true, effimera) => {
+            let mut bytes = [0u8; KEY_LEN];
+            bytes.copy_from_slice(cursor.take(KEY_LEN)?);
+            let chiave = PublicKey::from_bytes(bytes);
+            if effimera {
+                Origin::Effimera(chiave)
+            } else {
+                Origin::Mittente(chiave)
+            }
+        }
     };
 
     let mut nonce = [0u8; NONCE_LEN];
@@ -476,11 +552,7 @@ fn parse_message<'a>(mut cursor: Cursor<'a>) -> Result<ParsedEnvelope<'a>> {
     }
 
     Ok(ParsedEnvelope {
-        header: Header {
-            tier,
-            sender_pub,
-            nonce,
-        },
+        header: Header { tier, origin, nonce },
         ciphertext,
     })
 }
@@ -590,7 +662,10 @@ mod tests {
     fn header(sender: Option<PublicKey>) -> Header {
         Header {
             tier: Tier::Baseline,
-            sender_pub: sender,
+            origin: match sender {
+                Some(k) => Origin::Mittente(k),
+                None => Origin::Assente,
+            },
             nonce: [7u8; NONCE_LEN],
         }
     }
@@ -968,13 +1043,13 @@ mod tests {
         assert_ne!(build_aad(Kind::Message, &altro_tier), riferimento);
 
         let altro_sender = Header {
-            sender_pub: Some(pubkey(0x44)),
+            origin: Origin::Mittente(pubkey(0x44)),
             ..base.clone()
         };
         assert_ne!(build_aad(Kind::Message, &altro_sender), riferimento);
 
         let senza_sender = Header {
-            sender_pub: None,
+            origin: Origin::Assente,
             ..base.clone()
         };
         assert_ne!(build_aad(Kind::Message, &senza_sender), riferimento);
@@ -1003,7 +1078,7 @@ mod tests {
     fn kat_formato() {
         let h = Header {
             tier: Tier::Baseline,
-            sender_pub: Some(PublicKey::from_bytes([0x42; KEY_LEN])),
+            origin: Origin::Mittente(PublicKey::from_bytes([0x42; KEY_LEN])),
             nonce: [0x24; NONCE_LEN],
         };
         let ct: Vec<u8> = (0..32u8).collect();

@@ -102,6 +102,10 @@ impl FileKeyring {
 }
 
 impl Keyring for FileKeyring {
+    fn peers(&self) -> Result<Vec<PublicKey>> {
+        Ok(self.peers.iter().map(|p| p.public.clone()).collect())
+    }
+
     fn forget(&mut self, peer: &PublicKey) -> Result<bool> {
         Ok(self.remove(peer))
     }

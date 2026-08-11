@@ -160,11 +160,25 @@ impl<K: Keyring> Session<K> {
     ) -> Result<IncomingItem> {
         let mut buf = Vec::new();
         match format::parse(text, &mut buf)? {
+            ParsedBlob::Message(parsed) if parsed.header.origin.is_ephemeral() => {
+                // Mittente effimero: chi ha scritto non e' dichiarato, si
+                // scopre provando. La prima chiave che apre il messaggio E'
+                // il mittente, perche' la derivazione richiede la sua privata.
+                let (sender, plaintext) = self.prova_i_contatti(&parsed)?;
+                let sender_status = self.pin_and_classify(&sender, now_unix)?;
+                self.current_peer
+                    .insert(app_package.to_owned(), sender.clone());
+                Ok(IncomingItem::Message(DecryptedMessage {
+                    sender,
+                    sender_status,
+                    plaintext,
+                }))
+            }
             ParsedBlob::Message(parsed) => {
                 let sender = parsed
                     .header
-                    .sender_pub
-                    .clone()
+                    .sender_pub()
+                    .cloned()
                     .ok_or(Error::Format("messaggio senza pubkey del mittente"))?;
 
                 // ORDINE CRITICO: si decifra PRIMA di toccare il keyring.
@@ -257,8 +271,31 @@ impl<K: Keyring> Session<K> {
         now_unix: i64,
         rng: &mut R,
     ) -> Result<String> {
+        self.encrypt_for_app_with(app_package, plaintext, now_unix, rng, false)
+    }
+
+    /// Come [`Self::encrypt_for_app`], scegliendo se usare il mittente
+    /// effimero.
+    ///
+    /// La scelta e' del chiamante e non del core perche' e' una questione di
+    /// **compatibilita'**, non di crittografia: un messaggio a mittente
+    /// effimero non lo apre una versione precedente, quindi finche' l'altro
+    /// lato non e' aggiornato va lasciato spento. Il core non sa che versione
+    /// abbia il destinatario, e indovinarlo produrrebbe messaggi illeggibili.
+    pub fn encrypt_for_app_with<R: RngCore + CryptoRng>(
+        &self,
+        app_package: &str,
+        plaintext: &[u8],
+        now_unix: i64,
+        rng: &mut R,
+        effimero: bool,
+    ) -> Result<String> {
         let peer = self.current_peer.get(app_package).ok_or(Error::UnknownPeer)?;
-        baseline::seal(&self.identity, peer, plaintext, now_unix, rng)
+        if effimero {
+            baseline::seal_ephemeral(&self.identity, peer, plaintext, now_unix, rng)
+        } else {
+            baseline::seal(&self.identity, peer, plaintext, now_unix, rng)
+        }
     }
 
     /// Cifra un file per un peer **scelto esplicitamente** (decisione G4).
@@ -298,8 +335,8 @@ impl<K: Keyring> Session<K> {
         let parsed = file::parse_file(bytes)?;
         let sender = parsed
             .header
-            .sender_pub
-            .clone()
+            .sender_pub()
+            .cloned()
             .ok_or(Error::Format("allegato senza pubkey del mittente"))?;
 
         let decrypted = file::open_file(&self.identity, &sender, &parsed)?;
@@ -322,6 +359,29 @@ impl<K: Keyring> Session<K> {
         let c_era = self.keyring.forget(peer)?;
         self.current_peer.retain(|_, corrente| corrente != peer);
         Ok(c_era)
+    }
+
+    /// Prova ad aprire un messaggio a mittente effimero con ciascun contatto.
+    ///
+    /// Costa una decifratura per contatto, e con qualche decina di contatti
+    /// non si nota. Chi non e' nel keyring non viene riconosciuto: e' voluto,
+    /// perche' un mittente sconosciuto va presentato con una card prima —
+    /// altrimenti chiunque potrebbe far comparire messaggi nel keyring.
+    ///
+    /// Fallendo tutte, l'errore e' [`Error::Crypto`] come qualunque altro
+    /// fallimento: non si distingue "nessuno dei miei contatti" da "messaggio
+    /// corrotto", perche' distinguerli direbbe a chi attacca qualcosa sul
+    /// contenuto del keyring.
+    fn prova_i_contatti(
+        &self,
+        parsed: &crate::format::ParsedEnvelope<'_>,
+    ) -> Result<(PublicKey, Plaintext)> {
+        for candidato in self.keyring.peers()? {
+            if let Ok(plaintext) = baseline::open_ephemeral(&self.identity, &candidato, parsed) {
+                return Ok((candidato, plaintext));
+            }
+        }
+        Err(Error::Crypto)
     }
 
     pub fn current_peer(&self, app_package: &str) -> Option<&PublicKey> {
@@ -385,6 +445,10 @@ mod tests {
     }
 
     impl Keyring for KeyringInMemoria {
+        fn peers(&self) -> Result<Vec<PublicKey>> {
+            Ok(self.peers.iter().map(|p| p.public.clone()).collect())
+        }
+
         fn forget(&mut self, peer: &PublicKey) -> Result<bool> {
             match self.peers.iter().position(|p| &p.public == peer) {
                 Some(i) => {

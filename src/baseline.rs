@@ -28,8 +28,8 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
-use crate::format::{self, Header, Kind, ParsedEnvelope, Tier, NONCE_LEN, TAG_LEN};
-use crate::keys::{Identity, PublicKey};
+use crate::format::{self, Header, Kind, Origin, ParsedEnvelope, Tier, NONCE_LEN, TAG_LEN};
+use crate::keys::{Ephemeral, Identity, PublicKey};
 
 /// Stringa di domain separation per la HKDF. Congelata: cambiarla cambia tutte
 /// le chiavi derivate e rompe la compatibilita' con la versione 1.
@@ -142,7 +142,7 @@ fn seal_inner<R: RngCore + CryptoRng>(
 
     let header = Header {
         tier: Tier::Baseline,
-        sender_pub: Some(sender.public()),
+        origin: Origin::Mittente(sender.public()),
         nonce,
     };
     let aad = format::build_aad(kind, &header);
@@ -168,6 +168,145 @@ fn seal_inner<R: RngCore + CryptoRng>(
         .map_err(|_| Error::Crypto)?;
 
     Ok((header, ciphertext))
+}
+
+/// Cifra con **mittente effimero**: la chiave nell'header e' usa-e-getta e la
+/// tua identita' non compare in chiaro.
+///
+/// La chiave AEAD nasce da due scambi messi insieme:
+///
+/// ```text
+/// segreto = DH(effimera, destinatario) || DH(mittente, destinatario)
+/// ```
+///
+/// Il primo da' la mezza forward secrecy: l'effimera viene buttata subito,
+/// quindi chi domani ottiene la tua chiave stabile non riapre i messaggi di
+/// ieri. Il secondo e' la prova d'identita': solo chi possiede la privata del
+/// mittente puo' produrre quel segreto, quindi il fatto stesso che la
+/// decifratura riesca dimostra chi ha scritto — **senza firme**, che
+/// richiederebbero una primitiva in piu' e un campo da verificare.
+///
+/// Resta scoperto il caso opposto: chi ottiene la chiave del **destinatario**
+/// apre tutto lo stesso, perche' entrambi gli scambi passano da li'. Per
+/// quello serve una chiave temporanea anche dal lato di chi riceve, che e' una
+/// decisione a parte.
+pub fn seal_ephemeral<R: RngCore + CryptoRng>(
+    sender: &Identity,
+    recipient: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<String> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rng.fill_bytes(&mut nonce);
+    let effimera = Ephemeral::generate(rng)?;
+
+    let header = Header {
+        tier: Tier::Baseline,
+        origin: Origin::Effimera(effimera.public()),
+        nonce,
+    };
+    let aad = format::build_aad(Kind::Message, &header);
+    let key = derive_ephemeral_key(
+        &*effimera.diffie_hellman(recipient)?,
+        &*sender.diffie_hellman(recipient)?,
+        &nonce,
+        &aad,
+        recipient,
+    )?;
+
+    let mut inner = Zeroizing::new(Vec::with_capacity(
+        TIMESTAMP_LEN.saturating_add(plaintext.len()),
+    ));
+    inner.extend_from_slice(&now_unix.to_le_bytes());
+    inner.extend_from_slice(plaintext);
+
+    let ciphertext = XChaCha20Poly1305::new((&*key).into())
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &inner,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| Error::Crypto)?;
+
+    Ok(format::serialize_message(&header, &ciphertext))
+}
+
+/// Prova ad aprire un messaggio a mittente effimero **supponendo** che l'abbia
+/// scritto `candidato`.
+///
+/// Chi riceve non sa chi ha scritto: chiama questa per ciascuno dei propri
+/// contatti finche' una riesce. Il fallimento e' [`Error::Crypto`] come
+/// qualunque altro, e non distingue "non e' lui" da "messaggio corrotto" —
+/// distinguerli darebbe a chi attacca un oracolo su chi c'e' nel keyring.
+pub fn open_ephemeral(
+    recipient: &Identity,
+    candidato: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<Plaintext> {
+    if parsed.header.tier != Tier::Baseline {
+        return Err(Error::TierUnsupported);
+    }
+    let Origin::Effimera(effimera) = &parsed.header.origin else {
+        return Err(Error::Crypto);
+    };
+    if parsed.ciphertext.len() < TAG_LEN {
+        return Err(Error::Crypto);
+    }
+
+    let aad = format::build_aad(Kind::Message, &parsed.header);
+    let key = derive_ephemeral_key(
+        &*recipient.diffie_hellman(effimera)?,
+        &*recipient.diffie_hellman(candidato)?,
+        &parsed.header.nonce,
+        &aad,
+        &recipient.public(),
+    )?;
+
+    let aperto = XChaCha20Poly1305::new((&*key).into())
+        .decrypt(
+            XNonce::from_slice(&parsed.header.nonce),
+            Payload {
+                msg: parsed.ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| Error::Crypto)?;
+    stacca_timestamp(&aperto)
+}
+
+/// Come [`derive_key`], ma il materiale iniziale sono i due segreti in fila.
+///
+/// Concatenati e non sommati o mescolati: HKDF e' fatto per prendere materiale
+/// grezzo di lunghezza qualunque, e qualsiasi combinazione inventata qui
+/// sarebbe una primitiva nuova senza motivo.
+fn derive_ephemeral_key(
+    dh_effimero: &[u8; 32],
+    dh_statico: &[u8; 32],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    recipient: &PublicKey,
+) -> Result<Zeroizing<[u8; AEAD_KEY_LEN]>> {
+    let mut materiale = Zeroizing::new(Vec::with_capacity(64));
+    materiale.extend_from_slice(dh_effimero);
+    materiale.extend_from_slice(dh_statico);
+
+    let mut info = Vec::with_capacity(
+        KDF_DOMAIN
+            .len()
+            .saturating_add(aad.len())
+            .saturating_add(recipient.as_bytes().len()),
+    );
+    info.extend_from_slice(KDF_DOMAIN);
+    info.extend_from_slice(aad);
+    info.extend_from_slice(recipient.as_bytes());
+
+    let hkdf = Hkdf::<Sha256>::new(Some(nonce), &materiale);
+    let mut key = Zeroizing::new([0u8; AEAD_KEY_LEN]);
+    hkdf.expand(&info, key.as_mut()).map_err(|_| Error::Crypto)?;
+    Ok(key)
 }
 
 /// Inverte [`seal`].
@@ -235,8 +374,14 @@ fn open_inner(
             .map_err(|_| Error::Crypto)?,
     );
 
-    // Il tag ha gia' autenticato tutto: se qui manca il timestamp, e' il
-    // mittente ad aver prodotto un plaintext malformato, non un attacco.
+    stacca_timestamp(&inner)
+}
+
+/// Separa il timestamp dal testo, in coda a una decifratura riuscita.
+///
+/// Il tag ha gia' autenticato tutto: se qui manca il timestamp e' il mittente
+/// ad aver prodotto un plaintext malformato, non un attacco.
+fn stacca_timestamp(inner: &[u8]) -> Result<Plaintext> {
     let stampa = inner.get(..TIMESTAMP_LEN).ok_or(Error::Format(
         "plaintext senza timestamp: mittente malformato",
     ))?;
@@ -312,10 +457,9 @@ mod tests {
         // motivo per andare in panic.
         let sender = parsed
             .header
-            .sender_pub
-            .clone()
+            .sender_pub()
             .ok_or(Error::Format("sender_pub assente"))?;
-        open(destinatario, &sender, &parsed)
+        open(destinatario, sender, &parsed)
     }
 
     #[test]
@@ -384,6 +528,106 @@ mod tests {
     /// Ogni singolo bit del blob e' protetto: cambiarne uno qualsiasi deve
     /// impedire la decifratura. Copre in un colpo solo ciphertext, tag, nonce,
     /// pubkey del mittente, flag e byte di tier.
+    /// Il giro completo dello schema a mittente effimero.
+    #[test]
+    fn effimero_round_trip() {
+        let alice = identita(1);
+        let bob = identita(2);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
+        let blob = seal_ephemeral(&alice, &bob.public(), b"ciao", 99, &mut rng).unwrap();
+
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&blob, &mut buf).unwrap() else {
+            panic!("doveva essere un messaggio");
+        };
+        let aperto = open_ephemeral(&bob, &alice.public(), &parsed).unwrap();
+        assert_eq!(aperto.as_bytes(), b"ciao");
+        assert_eq!(aperto.sent_at_unix(), 99);
+    }
+
+    /// La chiave di Alice non compare da nessuna parte in chiaro: e' cio' che
+    /// toglie la correlabilita' fra i suoi messaggi.
+    #[test]
+    fn effimero_non_mostra_il_mittente() {
+        let alice = identita(1);
+        let bob = identita(2);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
+        let blob = seal_ephemeral(&alice, &bob.public(), b"ciao", 1, &mut rng).unwrap();
+
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&blob, &mut buf).unwrap() else {
+            panic!("doveva essere un messaggio");
+        };
+        assert!(parsed.header.sender_pub().is_none());
+        assert!(parsed.header.origin.is_ephemeral());
+        let effimera = parsed.header.origin.key().unwrap();
+        assert_ne!(effimera, &alice.public());
+        assert!(!buf.windows(32).any(|w| w == alice.public().as_bytes()));
+    }
+
+    /// Provare con la chiave sbagliata fallisce: e' cio' che rende la
+    /// decifratura a tentativi una prova d'identita' e non un'ipotesi.
+    #[test]
+    fn effimero_col_candidato_sbagliato_non_si_apre() {
+        let alice = identita(1);
+        let bob = identita(2);
+        let carol = identita(3);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
+        let blob = seal_ephemeral(&alice, &bob.public(), b"ciao", 1, &mut rng).unwrap();
+
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&blob, &mut buf).unwrap() else {
+            panic!("doveva essere un messaggio");
+        };
+        assert!(matches!(
+            open_ephemeral(&bob, &carol.public(), &parsed),
+            Err(Error::Crypto)
+        ));
+    }
+
+    /// Due messaggi identici non producono lo stesso blob, e nemmeno la stessa
+    /// chiave effimera: se si ripetesse, la forward secrecy non ci sarebbe.
+    #[test]
+    fn effimero_ogni_messaggio_ha_la_sua_chiave() {
+        let alice = identita(1);
+        let bob = identita(2);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
+        let uno = seal_ephemeral(&alice, &bob.public(), b"ciao", 1, &mut rng).unwrap();
+        let due = seal_ephemeral(&alice, &bob.public(), b"ciao", 1, &mut rng).unwrap();
+        assert_ne!(uno, due);
+
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let ParsedBlob::Message(p1) = format::parse(&uno, &mut a).unwrap() else { panic!() };
+        let ParsedBlob::Message(p2) = format::parse(&due, &mut b).unwrap() else { panic!() };
+        assert_ne!(p1.header.origin.key(), p2.header.origin.key());
+    }
+
+    /// Un messaggio effimero non si apre con la strada normale, e viceversa:
+    /// i flag entrano nell'AAD, quindi le due forme non sono intercambiabili.
+    #[test]
+    fn effimero_e_normale_non_si_scambiano() {
+        let alice = identita(1);
+        let bob = identita(2);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([7; 32]);
+
+        let effimero = seal_ephemeral(&alice, &bob.public(), b"ciao", 1, &mut rng).unwrap();
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&effimero, &mut buf).unwrap() else {
+            panic!()
+        };
+        assert!(matches!(open(&bob, &alice.public(), &parsed), Err(Error::Crypto)));
+
+        let normale = seal(&alice, &bob.public(), b"ciao", 1, &mut rng).unwrap();
+        let mut buf2 = Vec::new();
+        let ParsedBlob::Message(p2) = format::parse(&normale, &mut buf2).unwrap() else {
+            panic!()
+        };
+        assert!(matches!(
+            open_ephemeral(&bob, &alice.public(), &p2),
+            Err(Error::Crypto)
+        ));
+    }
+
     #[test]
     fn ogni_bit_flip_e_intercettato() {
         let alice = identita(13);

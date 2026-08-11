@@ -129,6 +129,10 @@ impl MemoryKeyring {
 }
 
 impl Keyring for MemoryKeyring {
+    fn peers(&self) -> Result<Vec<PublicKey>> {
+        Ok(self.peers.iter().map(|p| p.public.clone()).collect())
+    }
+
     fn forget(&mut self, peer: &PublicKey) -> Result<bool> {
         match self.peers.iter().position(|p| &p.public == peer) {
             Some(indice) => {
