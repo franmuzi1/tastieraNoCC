@@ -931,9 +931,16 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeExportKey
     })
 }
 
-/// Elenco dei peer noti per la UI contatti, nello stesso formato di
-/// `nativeExportKeyring`: record a lunghezza fissa che Kotlin scorre senza
-/// bisogno di un parser.
+/// Elenco dei peer noti per la UI contatti, **nello stesso blob** di
+/// `nativeExportKeyring`.
+///
+/// Riusare il formato di storage per la UI e' comodo e ha un costo che va
+/// tenuto presente: `PeerList.parse` lato Kotlin e' un secondo lettore di
+/// questo formato, e cambiarlo lo rompe senza che niente qui lo segnali. Si
+/// manifesta come "Cifratura non disponibile" nella schermata contatti, cioe'
+/// come un guasto che sembra della crypto ed e' del parser. E' successo con la
+/// versione 2: se questo formato cambia ancora, quel file va aggiornato
+/// insieme.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeListPeers(
     env: JNIEnv,
