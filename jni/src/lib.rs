@@ -74,6 +74,8 @@ mod code {
     /// Un messaggio nostro, riaperto. `senderKey` e l'etichetta sono quelli
     /// del DESTINATARIO: qui non c'e' un mittente da mostrare.
     pub const ITEM_OWN_MESSAGE: jint = 3;
+    /// Un allegato nostro, riaperto. Come sopra: il peer e' il destinatario.
+    pub const ITEM_OWN_FILE: jint = 4;
 
     /// Esiti di `assignLabel`.
     pub const LABEL_ASSIGNED: jint = 0;
@@ -395,8 +397,13 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeDecryptFi
             SenderStatus::New => (None, false),
             SenderStatus::Known { label, verified } => (label.clone(), *verified),
         };
+        let genere = if incoming.nostro {
+            code::ITEM_OWN_FILE
+        } else {
+            code::ITEM_FILE
+        };
         if env
-            .set_field(&result, "kind", "I", code::ITEM_FILE.into())
+            .set_field(&result, "kind", "I", genere.into())
             .is_err()
             || env
                 .set_field(&result, "verified", "I", jint::from(verificato).into())

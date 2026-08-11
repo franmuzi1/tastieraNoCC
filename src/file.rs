@@ -202,6 +202,16 @@ pub fn open_file_forward(
     Ok((prekey, monta(plaintext)?))
 }
 
+/// Riapre un allegato **che abbiamo mandato noi**, provando `recipient` come
+/// destinatario. Vale solo senza catena, come per i messaggi.
+pub fn open_file_as_sender(
+    sender: &Identity,
+    recipient: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<DecryptedFile> {
+    monta(baseline::open_file_as_sender(sender, recipient, parsed)?)
+}
+
 fn monta(plaintext: crate::baseline::Plaintext) -> Result<DecryptedFile> {
     let (meta, content) = split_inner(plaintext.as_bytes())?;
     Ok(DecryptedFile {

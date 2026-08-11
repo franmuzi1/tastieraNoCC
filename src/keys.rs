@@ -305,13 +305,23 @@ pub enum LabelOutcome {
 /// Niente `-> impl Iterator` nei metodi, che romperebbe la object safety.
 /// Quante nostre chiavi temporanee si tengono per ogni contatto.
 ///
-/// Non e' un parametro da regolare a gusto: e' **la finestra dentro cui la
-/// forward secrecy non c'e' ancora**. Tenerne una sola romperebbe il caso
-/// normale — mando due messaggi di fila, l'altro apre il secondo, il primo e'
-/// gia' morto — e tenerne molte allungherebbe il periodo in cui un telefono
-/// sequestrato apre i messaggi passati. Tre copre i messaggi in viaggio senza
-/// diventare un archivio.
-pub const MAX_PREKEY_MIE: usize = 3;
+/// **Non e' una manopola di sicurezza: e' quanti messaggi di fila puoi mandare
+/// prima che l'altro risponda.** Chi risponde usa l'ultima chiave che *ha
+/// visto*, non l'ultima che esiste: se ne hai gia' buttate di piu' recenti, la
+/// sua risposta non si apre. Con tre — il valore iniziale — bastavano quattro
+/// messaggi di fila per rompere la conversazione, che in chat non e' un caso
+/// limite ma la norma.
+///
+/// Alzarlo **non costa forward secrecy**, ed e' il punto che rende la scelta
+/// facile: una nostra chiave temporanea apre solo i messaggi che l'altro ha
+/// cifrato con quella, e quando una risposta arriva si butta tutto cio' che e'
+/// piu' vecchio di quella usata. Le chiavi in eccedenza sono quindi chiavi che
+/// nessun messaggio ha mai usato: non proteggono niente che esista. In una
+/// conversazione normale la finestra si richiude da sola al primo scambio.
+///
+/// Il limite serve solo a impedire che lo stato cresca senza fine verso un
+/// contatto che non risponde mai. 32 chiavi sono 1 KB per contatto.
+pub const MAX_PREKEY_MIE: usize = 32;
 
 /// Lo stato per contatto della catena di forward secrecy.
 ///
@@ -533,14 +543,22 @@ mod tests {
         assert_eq!(store.my_prekeys(&peer(1)), vec![[10; KEY_LEN]]);
     }
 
+    /// Il limite esiste solo perche' lo stato non cresca senza fine verso chi
+    /// non risponde mai: non e' una manopola di sicurezza, e' quanti messaggi
+    /// di fila si possono mandare prima di una risposta.
     #[test]
     fn la_finestra_non_diventa_un_archivio() {
         let mut store = PrekeyStore::default();
-        for i in 0..10u8 {
+        let quante = u8::try_from(MAX_PREKEY_MIE).unwrap().saturating_add(8);
+        for i in 0..quante {
             store.push_my_prekey(&peer(1), [i; KEY_LEN]);
         }
         assert_eq!(store.my_prekeys(&peer(1)).len(), MAX_PREKEY_MIE);
-        assert_eq!(store.my_prekeys(&peer(1))[0], [9; KEY_LEN]);
+        // La piu' recente resta in testa: e' l'ordine in cui si prova.
+        assert_eq!(
+            store.my_prekeys(&peer(1))[0],
+            [quante.saturating_sub(1); KEY_LEN]
+        );
     }
 
     /// Dimenticare un contatto deve portarsi via anche le chiavi private verso

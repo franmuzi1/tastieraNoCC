@@ -120,11 +120,16 @@ struct RigaArchivio {
 }
 
 struct Letto {
+    /// Chi ha scritto — **oppure** a chi abbiamo scritto noi, se `nostro`.
     mittente: String,
     fingerprint: String,
     verificato: bool,
     quando: String,
     testo: String,
+    /// L'abbiamo scritto noi e l'abbiamo riaperto: succede solo senza forward
+    /// secrecy, e va detto, altrimenti "da: Marco" su un messaggio nostro
+    /// sarebbe semplicemente falso.
+    nostro: bool,
 }
 
 /// Due chiavi che rivendicano lo stesso nome. **Non e' un errore**: e' lo stato
@@ -319,6 +324,28 @@ impl App {
                     verificato,
                     quando: data(messaggio.plaintext.sent_at_unix()),
                     testo,
+                    nostro: false,
+                });
+                self.salva(&secret, session.keyring());
+                self.incollato.clear();
+                self.ricarica();
+                self.avviso = None;
+            }
+            Ok(IncomingItem::OwnMessage {
+                recipient,
+                recipient_label,
+                plaintext,
+            }) => {
+                let testo = String::from_utf8_lossy(plaintext.as_bytes()).into_owned();
+                self.letto = Some(Letto {
+                    mittente: recipient_label.unwrap_or_else(|| "(senza nome)".to_owned()),
+                    fingerprint: Fingerprint::of(&recipient).display(),
+                    // Niente spunta: su un messaggio nostro non c'e' nessuna
+                    // identita' da verificare.
+                    verificato: false,
+                    quando: data(plaintext.sent_at_unix()),
+                    testo,
+                    nostro: true,
                 });
                 self.salva(&secret, session.keyring());
                 self.incollato.clear();
@@ -715,7 +742,7 @@ impl App {
             ui.add_space(12.0);
             ui.separator();
             ui.horizontal_wrapped(|ui| {
-                ui.label("Da:");
+                ui.label(if letto.nostro { "A:" } else { "Da:" });
                 ui.strong(&letto.mittente);
                 if letto.verificato {
                     ui.label("✓ confrontato di persona");
@@ -728,7 +755,15 @@ impl App {
             // Autenticato ma NON verificabile: nessuno puo' dimostrare che
             // l'orologio del mittente fosse giusto. Si mostra, non ci si decide
             // niente.
-            ui.small(format!("Scritto il {} (secondo il mittente)", letto.quando));
+            if letto.nostro {
+                ui.small(format!("Scritto il {} — l'hai scritto tu", letto.quando));
+                ui.small(
+                    "Si riapre perche' la forward secrecy era spenta: con quella accesa \
+                     non sarebbe possibile, nemmeno per te.",
+                );
+            } else {
+                ui.small(format!("Scritto il {} (secondo il mittente)", letto.quando));
+            }
             ui.add_space(8.0);
             ui.group(|ui| {
                 ui.add(

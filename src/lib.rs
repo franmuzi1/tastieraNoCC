@@ -1,17 +1,22 @@
 //! keyboard-cipher core — cifratura/formato per IME Android (via JNI).
 //!
-//! SCHELETRO: moduli, firme, error types. Nessuna implementazione.
-//!
 //! Decisioni di design congelate: vedi CLAUDE.md. In sintesi:
-//!   - Baseline: X25519 statico-statico + XChaCha20-Poly1305, stateless.
-//!   - Identita': TOFU, pubkey del mittente in-band e in chiaro.
+//!   - Baseline: X25519 + XChaCha20-Poly1305.
+//!   - Identita': TOFU, con la pubkey del mittente in chiaro **solo** negli
+//!     schemi statici.
+//!   - Forward secrecy dentro il tier baseline, segnalata dai bit di flag: una
+//!     chiave usa-e-getta per messaggio, piu' una chiave temporanea del
+//!     destinatario che viaggia dentro il cifrato. Il gesto che la produce e'
+//!     buttare le chiavi vecchie, non cifrare.
 //!   - Encoding di superficie: z-base-32.
 //!   - Versione in testa, tier dentro l'AAD (anti-downgrade).
-//!   - Tier forward-secrecy: previsto nel formato, NON implementato.
+//!   - Il **tier** forward-secrecy resta un posto libero nel formato, non
+//!     implementato: da non confondere con la forward secrecy qui sopra.
 //!
 //! Threat model: scanning di massa lato piattaforma, non avversario mirato.
 //!
-//! Questo crate non fa I/O. RNG e tempo sono iniettati dal chiamante.
+//! Questo crate non fa I/O. RNG e tempo sono iniettati dal chiamante: senza,
+//! i vettori di test del formato non sarebbero scrivibili.
 
 #![forbid(unsafe_code)]
 #![deny(

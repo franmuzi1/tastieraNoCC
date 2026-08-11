@@ -86,9 +86,14 @@ fn nuovo_segreto<R: RngCore + CryptoRng>(rng: &mut R) -> [u8; 32] {
 
 /// Un allegato decifrato, con lo stato TOFU di chi l'ha mandato.
 pub struct IncomingFile {
+    /// Chi l'ha mandato — **oppure**, quando `nostro` e' vero, a chi l'abbiamo
+    /// mandato noi. Un campo solo perche' e' sempre "l'altra persona": chi
+    /// mostra il risultato sa gia' da `nostro` come chiamarla.
     pub sender: PublicKey,
     pub sender_status: SenderStatus,
     pub file: DecryptedFile,
+    /// L'abbiamo mandato noi e l'abbiamo riaperto. Solo senza forward secrecy.
+    pub nostro: bool,
 }
 
 /// Cosa e' risultato essere il testo in arrivo.
@@ -196,7 +201,7 @@ impl<K: Keyring> Session<K> {
                 let (sender, prekey, plaintext) = self.prova_i_contatti(&parsed)?;
                 // Da qui in poi gli si puo' rispondere con la forward secrecy
                 // piena: la catena e' partita.
-                self.keyring.set_peer_prekey(&sender, &prekey)?;
+                self.ricorda_prekey(&sender, &prekey)?;
                 let sender_status = self.pin_and_classify(&sender, now_unix)?;
                 self.current_peer
                     .insert(app_package.to_owned(), sender.clone());
@@ -345,7 +350,7 @@ impl<K: Keyring> Session<K> {
         // ripiega su quella a meta', che protegge comunque cio' che mandiamo.
         // Il ripiego non e' un downgrade forzabile: dipende da cosa CI ha
         // mandato lui, non da cosa dichiara il messaggio.
-        match self.keyring.peer_prekey(&peer)? {
+        match self.keyring.peer_prekey(&peer)?.filter(|k| self.identity.diffie_hellman(k).is_ok()) {
             Some(sua_prekey) => {
                 let mia = keys::EphemeralSecret::from_bytes(nuovo_segreto(rng));
                 let blob = baseline::seal_forward(
@@ -431,7 +436,14 @@ impl<K: Keyring> Session<K> {
         if !forward {
             return file::seal_file(&self.identity, peer, meta, content, now_unix, rng);
         }
-        let sua = self.keyring.peer_prekey(peer)?;
+        // Il `filter` non e' ridondante con `ricorda_prekey`: uno stato salvato
+        // da una versione precedente puo' gia' contenere una chiave inservibile,
+        // e li' l'unica cosa sensata e' ripiegare invece di non poter piu'
+        // mandare niente a quella persona.
+        let sua = self
+            .keyring
+            .peer_prekey(peer)?
+            .filter(|k| self.identity.diffie_hellman(k).is_ok());
         let mia = keys::EphemeralSecret::from_bytes(nuovo_segreto(rng));
         let blob = file::seal_file_forward(
             &self.identity,
@@ -469,7 +481,7 @@ impl<K: Keyring> Session<K> {
             self.prova_le_prekey_sul_file(&parsed)?
         } else if parsed.header.origin.is_ephemeral() {
             let (chi, prekey, aperto) = self.prova_i_contatti_sul_file(&parsed)?;
-            self.keyring.set_peer_prekey(&chi, &prekey)?;
+            self.ricorda_prekey(&chi, &prekey)?;
             (chi, aperto)
         } else {
             let sender = parsed
@@ -477,6 +489,27 @@ impl<K: Keyring> Session<K> {
                 .sender_pub()
                 .cloned()
                 .ok_or(Error::Format("allegato senza pubkey del mittente"))?;
+            // L'abbiamo mandato noi: si riapre provando i contatti come
+            // destinatari, esattamente come per un messaggio. Un messaggio
+            // nostro rileggibile e una foto nostra no sarebbe una differenza
+            // che nessuno saprebbe spiegare.
+            if sender == self.identity.public() {
+                for candidato in self.keyring.peers()? {
+                    let Ok(aperto) =
+                        file::open_file_as_sender(&self.identity, &candidato, &parsed)
+                    else {
+                        continue;
+                    };
+                    let sender_status = self.pin_and_classify(&candidato, now_unix)?;
+                    return Ok(IncomingFile {
+                        sender: candidato,
+                        sender_status,
+                        file: aperto,
+                        nostro: true,
+                    });
+                }
+                return Err(Error::OwnMessage);
+            }
             let aperto = file::open_file(&self.identity, &sender, &parsed)?;
             (sender, aperto)
         };
@@ -486,6 +519,7 @@ impl<K: Keyring> Session<K> {
             sender,
             sender_status,
             file: decrypted,
+            nostro: false,
         })
     }
 
@@ -523,6 +557,27 @@ impl<K: Keyring> Session<K> {
         Err(Error::OwnMessage)
     }
 
+    /// Memorizza la chiave temporanea di un peer **dopo averla controllata**.
+    ///
+    /// Una pubkey X25519 di ordine basso produce un segreto condiviso tutto
+    /// zero, e la libreria lo rifiuta: se una finisse nel keyring, ogni
+    /// messaggio futuro verso quel contatto fallirebbe: per sempre, con un
+    /// errore opaco, e senza che l'utente possa capire perche' il lucchetto ha
+    /// smesso di funzionare con una persona sola.
+    ///
+    /// La prekey viaggia dentro il cifrato, quindi solo quel contatto puo'
+    /// spedircene una: non e' un attacco da estraneo, e' un contatto che si
+    /// disabilita da solo. Sarebbe comunque il modo peggiore di rompersi, e
+    /// costa una riga rifiutarla all'ingresso invece di inciamparci dopo.
+    ///
+    /// Rifiutandola si tiene quella di prima, e la conversazione continua.
+    fn ricorda_prekey(&mut self, peer: &PublicKey, prekey: &PublicKey) -> Result<()> {
+        if self.identity.diffie_hellman(prekey).is_err() {
+            return Ok(());
+        }
+        self.keyring.set_peer_prekey(peer, prekey)
+    }
+
     /// [`Self::prova_i_contatti`] per gli allegati.
     fn prova_i_contatti_sul_file(
         &self,
@@ -553,7 +608,7 @@ impl<K: Keyring> Session<K> {
                 else {
                     continue;
                 };
-                self.keyring.set_peer_prekey(&candidato, &prossima)?;
+                self.ricorda_prekey(&candidato, &prossima)?;
                 self.keyring
                     .drop_my_prekeys_older_than(&candidato, &segreto)?;
                 return Ok((candidato, aperto));
@@ -622,7 +677,7 @@ impl<K: Keyring> Session<K> {
                 else {
                     continue;
                 };
-                self.keyring.set_peer_prekey(&candidato, &prossima)?;
+                self.ricorda_prekey(&candidato, &prossima)?;
                 self.keyring
                     .drop_my_prekeys_older_than(&candidato, &segreto)?;
                 return Ok((candidato, plaintext));
@@ -1253,6 +1308,104 @@ mod tests {
         // serve a mettere il messaggio nella colonna giusta.
         assert_eq!(chi, chiave_bob);
         assert_eq!(testo.as_bytes(), b"scritto da me");
+    }
+
+    /// Mandare piu' messaggi di fila prima che l'altro risponda e' la norma in
+    /// chat, non un caso limite. Chi risponde usa l'ultima chiave che **ha
+    /// visto**: se ne abbiamo gia' buttate di piu' recenti, la sua risposta non
+    /// si apre. Con la finestra a 3 bastavano quattro messaggi.
+    #[test]
+    fn molti_messaggi_di_fila_non_rompono_la_risposta() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity().public();
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+        bob.set_current_peer(WHATSAPP, &chiave_alice).unwrap();
+
+        // Alice scrive molte volte di fila, ben oltre la vecchia finestra.
+        let mut mandati = Vec::new();
+        for i in 0..20u8 {
+            mandati.push(
+                alice
+                    .encrypt_for_app_with(WHATSAPP, b"ciao", 10, &mut rng(i), true)
+                    .unwrap(),
+            );
+        }
+        // Bob legge solo il PRIMO — gli altri sono ancora da leggere.
+        let primo = mandati.first().unwrap();
+        bob.handle_incoming_text(WHATSAPP, primo, 11).unwrap();
+        // E risponde.
+        let risposta = bob
+            .encrypt_for_app_with(WHATSAPP, b"risposta", 12, &mut rng(99), true)
+            .unwrap();
+
+        let letto = alice.handle_incoming_text(WHATSAPP, &risposta, 13).unwrap();
+        let IncomingItem::Message(messaggio) = letto else {
+            panic!("doveva essere un messaggio")
+        };
+        assert_eq!(messaggio.plaintext.as_bytes(), b"risposta");
+    }
+
+    /// Una chiave temporanea inservibile non deve poter zittire una
+    /// conversazione: si ripiega, non si smette di poter scrivere.
+    #[test]
+    fn una_prekey_inservibile_non_ci_zittisce() {
+        let mut alice = sessione(1);
+        let chiave_bob = sessione(2).identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+        // Punto di ordine basso: il DH con questa da' un segreto tutto zero.
+        let veleno = PublicKey::from_bytes([0u8; 32]);
+        alice.keyring.set_peer_prekey(&chiave_bob, &veleno).unwrap();
+
+        // Un contatto non deve poterci impedire di scrivergli.
+        let blob = alice
+            .encrypt_for_app_with(WHATSAPP, b"ciao", 10, &mut rng(1), true)
+            .unwrap();
+        // Ha ripiegato sullo schema a meta', non sulla catena avvelenata.
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&blob, &mut buf).unwrap() else {
+            panic!()
+        };
+        assert!(!parsed.header.origin.uses_prekey());
+
+        // E una prekey inservibile in arrivo non entra proprio nel keyring.
+        let mut carla = sessione(3);
+        let chiave_carla = carla.identity().public();
+        alice.keyring.tofu_pin(&chiave_carla, 1).unwrap();
+        carla.keyring.tofu_pin(&alice.identity().public(), 1).unwrap();
+        carla.set_current_peer(WHATSAPP, &alice.identity().public()).unwrap();
+        alice.ricorda_prekey(&chiave_carla, &veleno).unwrap();
+        assert!(alice.keyring.peer_prekey(&chiave_carla).unwrap().is_none());
+    }
+
+    /// Un allegato nostro si rilegge come un messaggio nostro: senza catena
+    /// si puo', e la differenza fra i due sarebbe inspiegabile.
+    #[test]
+    fn anche_un_allegato_mio_si_riapre() {
+        let mut alice = sessione(1);
+        let chiave_bob = sessione(2).identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        let meta = crate::file::FileMeta {
+            name: "a.jpg".to_owned(),
+            mime: "image/jpeg".to_owned(),
+        };
+        let mio = alice
+            .encrypt_file_with(&chiave_bob, &meta, b"foto", 10, &mut rng(1), false)
+            .unwrap();
+        let letto = alice.handle_incoming_file(&mio, 11).unwrap();
+        assert!(letto.nostro, "e' un allegato nostro, non ricevuto");
+        assert_eq!(letto.sender, chiave_bob, "il peer e' il destinatario");
+        assert_eq!(&*letto.file.content, b"foto");
+
+        // Con la catena accesa resta chiuso, come per i messaggi.
+        let con_catena = alice
+            .encrypt_file_with(&chiave_bob, &meta, b"foto", 12, &mut rng(2), true)
+            .unwrap();
+        assert!(alice.handle_incoming_file(&con_catena, 13).is_err());
     }
 
     /// Leggere un archivio non deve far avanzare la catena: se lo facesse,

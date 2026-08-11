@@ -289,6 +289,30 @@ fn cmd_decrypt(args: &[String]) -> Result<(), String> {
         .handle_incoming_text(APP, &input, now_unix())
         .map_err(|e| format!("{e}"))?;
     match item {
+        // L'abbiamo scritto noi: qui non c'e' un mittente da mostrare, c'e' un
+        // destinatario, e chiamarlo mittente sarebbe falso.
+        IncomingItem::OwnMessage {
+            recipient,
+            recipient_label,
+            plaintext,
+        } => {
+            persist(&secret, &session)?;
+            println!(
+                "a:        {}",
+                recipient_label.unwrap_or_else(|| "(senza nome)".to_owned())
+            );
+            println!("chiave:   {}", Fingerprint::of(&recipient).display());
+            println!(
+                "scritto:  {} (l'hai scritto tu)",
+                format_unix(plaintext.sent_at_unix())
+            );
+            println!("nota:     si riapre perche' la forward secrecy era spenta.");
+            println!();
+            match std::str::from_utf8(plaintext.as_bytes()) {
+                Ok(text) => println!("{text}"),
+                Err(_) => println!("(il messaggio non e' testo UTF-8)"),
+            }
+        }
         IncomingItem::Message(message) => {
             let who = match &message.sender_status {
                 SenderStatus::New => "mittente mai visto, ora fissato".to_owned(),
@@ -434,9 +458,18 @@ fn cmd_openfile(args: &[String]) -> Result<(), String> {
     std::fs::write(&destinazione, &incoming.file.content)
         .map_err(|e| format!("{}: {e}", destinazione.display()))?;
 
-    println!("da:       {chi}");
+    if incoming.nostro {
+        println!("a:        {chi}");
+    } else {
+        println!("da:       {chi}");
+    }
     println!("chiave:   {}", Fingerprint::of(&incoming.sender).display());
-    println!("scritto:  {} (secondo il mittente)", format_unix(incoming.file.sent_at_unix));
+    let quando = format_unix(incoming.file.sent_at_unix);
+    if incoming.nostro {
+        println!("scritto:  {quando} (l'hai mandato tu)");
+    } else {
+        println!("scritto:  {quando} (secondo il mittente)");
+    }
     println!("nome:     {} ({})", incoming.file.meta.name, incoming.file.meta.mime);
     println!("salvato:  {}", destinazione.display());
     Ok(())

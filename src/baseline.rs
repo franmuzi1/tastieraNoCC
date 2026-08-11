@@ -636,6 +636,25 @@ pub fn open_as_sender(
     recipient: &PublicKey,
     parsed: &ParsedEnvelope<'_>,
 ) -> Result<Plaintext> {
+    apri_come_mittente(Kind::Message, sender, recipient, parsed)
+}
+
+/// [`open_as_sender`] per un allegato. Un messaggio nostro si rilegge e una
+/// foto nostra no sarebbe una differenza che nessuno saprebbe spiegare.
+pub fn open_file_as_sender(
+    sender: &Identity,
+    recipient: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<Plaintext> {
+    apri_come_mittente(Kind::File, sender, recipient, parsed)
+}
+
+fn apri_come_mittente(
+    kind: Kind,
+    sender: &Identity,
+    recipient: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<Plaintext> {
     if parsed.header.tier != Tier::Baseline {
         return Err(Error::TierUnsupported);
     }
@@ -643,7 +662,7 @@ pub fn open_as_sender(
         return Err(Error::Crypto);
     }
 
-    let aad = format::build_aad(Kind::Message, &parsed.header);
+    let aad = format::build_aad(kind, &parsed.header);
     let shared = sender.diffie_hellman(recipient)?;
     let key = derive_key(&shared, &parsed.header.nonce, &aad, recipient)?;
 
