@@ -950,11 +950,8 @@ mod tests {
         let ParsedBlob::Message(parsed) = format::parse(&due, &mut buf).unwrap() else {
             panic!()
         };
-        assert!(
-            parsed.header.origin.uses_prekey(),
-            "la risposta doveva essere a forward secrecy piena"
-        );
-        drop(parsed);
+        let piena = parsed.header.origin.uses_prekey();
+        assert!(piena, "la risposta doveva essere a forward secrecy piena");
 
         let letto = alice.handle_incoming_text(WHATSAPP, &due, 13).unwrap();
         let IncomingItem::Message(messaggio) = letto else {
