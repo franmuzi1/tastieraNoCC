@@ -152,6 +152,39 @@ impl Ephemeral {
     }
 }
 
+/// La parte privata di una chiave temporanea, che si conserva finche' serve.
+///
+/// Esiste separata da [`Ephemeral`] perche' i due usi sono opposti: l'effimera
+/// del mittente si butta **subito**, questa il destinatario la tiene finche'
+/// non ha letto — e la butta appena letto, ed e' quel gesto a produrre la
+/// forward secrecy. Tenerla per sempre significherebbe non averla.
+pub struct EphemeralSecret(SecretKey);
+
+impl EphemeralSecret {
+    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        Self(SecretKey(StaticSecret::from(bytes)))
+    }
+
+    pub fn public(&self) -> PublicKey {
+        PublicKey(XPublicKey::from(&self.0 .0).to_bytes())
+    }
+
+    /// I byte, per poterla **persistere**. E' l'unico punto in cui una privata
+    /// esce dal crate, e vale solo per le temporanee: quella d'identita' non ha
+    /// nulla di simile, apposta.
+    pub fn to_bytes(&self) -> Zeroizing<[u8; KEY_LEN]> {
+        Zeroizing::new(self.0 .0.to_bytes())
+    }
+
+    pub(crate) fn diffie_hellman(&self, peer: &PublicKey) -> Result<Zeroizing<[u8; KEY_LEN]>> {
+        let shared = self.0 .0.diffie_hellman(&XPublicKey::from(*peer.as_bytes()));
+        if !shared.was_contributory() {
+            return Err(Error::Crypto);
+        }
+        Ok(Zeroizing::new(shared.to_bytes()))
+    }
+}
+
 /// Domain separation del fingerprint. Congelato.
 const FINGERPRINT_DOMAIN: &[u8] = b"keyboard-cipher/v1/fingerprint";
 

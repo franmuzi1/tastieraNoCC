@@ -179,8 +179,15 @@ impl Flags {
     /// buttata. Chi ottiene quella del destinatario si', ed e' il motivo per
     /// cui questo non basta e la prekey resta da fare.
     pub const EPHEMERAL: Flags = Flags(0b0000_0010);
+    /// Il messaggio usa anche una **chiave temporanea del destinatario**.
+    ///
+    /// E' la forward secrecy piena: quando chi riceve butta quella chiave, il
+    /// messaggio non lo apre piu' nessuno — nemmeno lui. Va sempre insieme a
+    /// [`Flags::EPHEMERAL`], perche' senza la chiave usa-e-getta del mittente
+    /// meta' della proprieta' non ci sarebbe.
+    pub const PREKEY: Flags = Flags(0b0000_0100);
     /// Bit definiti nella versione 1. Tutto il resto deve essere zero.
-    pub const KNOWN: Flags = Flags(0b0000_0011);
+    pub const KNOWN: Flags = Flags(0b0000_0111);
 
     pub fn contains(self, other: Flags) -> bool {
         self.0 & other.0 == other.0
@@ -212,18 +219,30 @@ pub enum Origin {
     /// quello effimero e quello con la chiave stabile del mittente, quindi il
     /// successo della decifratura **dimostra** chi e' stato senza firme.
     Effimera(PublicKey),
+    /// Chiave effimera del mittente **piu'** l'uso di una chiave temporanea del
+    /// destinatario: forward secrecy piena.
+    ///
+    /// La chiave AEAD nasce da due scambi che passano entrambi dalla temporanea
+    /// di chi riceve. Quando lui la butta, il messaggio e' illeggibile a
+    /// chiunque — compreso lui: **la cronologia non si rilegge**, ed e' il
+    /// prezzo accettato con la decisione I.
+    EffimeraConPrekey(PublicKey),
 }
 
 impl Origin {
     pub fn is_ephemeral(&self) -> bool {
-        matches!(self, Origin::Effimera(_))
+        matches!(self, Origin::Effimera(_) | Origin::EffimeraConPrekey(_))
+    }
+
+    pub fn uses_prekey(&self) -> bool {
+        matches!(self, Origin::EffimeraConPrekey(_))
     }
 
     /// La chiave da mettere nel body, se c'e'.
     pub fn key(&self) -> Option<&PublicKey> {
         match self {
             Origin::Assente => None,
-            Origin::Mittente(k) | Origin::Effimera(k) => Some(k),
+            Origin::Mittente(k) | Origin::Effimera(k) | Origin::EffimeraConPrekey(k) => Some(k),
         }
     }
 }
@@ -248,6 +267,9 @@ impl Header {
             Origin::Assente => Flags::NONE,
             Origin::Mittente(_) => Flags::SENDER_PUB,
             Origin::Effimera(_) => Flags(Flags::SENDER_PUB.0 | Flags::EPHEMERAL.0),
+            Origin::EffimeraConPrekey(_) => {
+                Flags(Flags::SENDER_PUB.0 | Flags::EPHEMERAL.0 | Flags::PREKEY.0)
+            }
         }
     }
 
@@ -524,21 +546,27 @@ fn parse_message<'a>(mut cursor: Cursor<'a>) -> Result<ParsedEnvelope<'a>> {
     // indipendenti: "effimera" senza "chiave presente" e' un header incoerente,
     // e va rifiutato qui invece di produrre un `Origin` che non descrive il
     // body — un errore di formato e' diagnosticabile, un fallimento AEAD no.
-    let origin = match (
-        flags.contains(Flags::SENDER_PUB),
-        flags.contains(Flags::EPHEMERAL),
-    ) {
-        (false, true) => return Err(Error::Format("effimera senza chiave")),
-        (false, false) => Origin::Assente,
-        (true, effimera) => {
-            let mut bytes = [0u8; KEY_LEN];
-            bytes.copy_from_slice(cursor.take(KEY_LEN)?);
-            let chiave = PublicKey::from_bytes(bytes);
-            if effimera {
-                Origin::Effimera(chiave)
-            } else {
-                Origin::Mittente(chiave)
-            }
+    let ha_chiave = flags.contains(Flags::SENDER_PUB);
+    let effimera = flags.contains(Flags::EPHEMERAL);
+    let prekey = flags.contains(Flags::PREKEY);
+    if !ha_chiave && (effimera || prekey) {
+        return Err(Error::Format("effimera senza chiave"));
+    }
+    // La prekey presuppone l'effimera: senza, meta' della forward secrecy non
+    // ci sarebbe e il messaggio dichiarerebbe una proprieta' che non ha.
+    if prekey && !effimera {
+        return Err(Error::Format("prekey senza effimera"));
+    }
+    let origin = if !ha_chiave {
+        Origin::Assente
+    } else {
+        let mut bytes = [0u8; KEY_LEN];
+        bytes.copy_from_slice(cursor.take(KEY_LEN)?);
+        let chiave = PublicKey::from_bytes(bytes);
+        match (effimera, prekey) {
+            (false, _) => Origin::Mittente(chiave),
+            (true, false) => Origin::Effimera(chiave),
+            (true, true) => Origin::EffimeraConPrekey(chiave),
         }
     };
 

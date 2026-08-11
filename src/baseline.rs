@@ -29,7 +29,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::format::{self, Header, Kind, Origin, ParsedEnvelope, Tier, NONCE_LEN, TAG_LEN};
-use crate::keys::{Ephemeral, Identity, PublicKey};
+use crate::keys::{Ephemeral, EphemeralSecret, Identity, PublicKey, KEY_LEN};
 
 /// Stringa di domain separation per la HKDF. Congelata: cambiarla cambia tutte
 /// le chiavi derivate e rompe la compatibilita' con la versione 1.
@@ -275,6 +275,134 @@ pub fn open_ephemeral(
         )
         .map_err(|_| Error::Crypto)?;
     stacca_timestamp(&aperto)
+}
+
+/// Cifra con **forward secrecy piena**: effimera del mittente e chiave
+/// temporanea del destinatario.
+///
+/// ```text
+/// segreto = DH(effimera, prekey) || DH(mittente, prekey)
+/// ```
+///
+/// Entrambi gli scambi passano dalla **prekey del destinatario**. Quando lui la
+/// butta, il messaggio non lo apre piu' nessuno: ne' un avversario che abbia le
+/// chiavi stabili di tutti e due, ne' lui stesso. E' la forward secrecy vera, e
+/// il prezzo e' che **la cronologia non si rilegge** (decisione I).
+///
+/// Il secondo scambio resta la prova d'identita': solo chi ha la privata del
+/// mittente lo puo' produrre.
+///
+/// `mia_prekey` viaggia **dentro** il cifrato, in testa al plaintext: e' la
+/// chiave con cui il destinatario rispondera', e va autenticata — se viaggiasse
+/// in chiaro, chiunque potrebbe sostituirla e dirottare la conversazione
+/// successiva.
+pub fn seal_forward<R: RngCore + CryptoRng>(
+    sender: &Identity,
+    recipient: &PublicKey,
+    prekey_destinatario: &PublicKey,
+    mia_prekey: &PublicKey,
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<String> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rng.fill_bytes(&mut nonce);
+    let effimera = Ephemeral::generate(rng)?;
+
+    let header = Header {
+        tier: Tier::Baseline,
+        origin: Origin::EffimeraConPrekey(effimera.public()),
+        nonce,
+    };
+    let aad = format::build_aad(Kind::Message, &header);
+    let key = derive_ephemeral_key(
+        &*effimera.diffie_hellman(prekey_destinatario)?,
+        &*sender.diffie_hellman(prekey_destinatario)?,
+        &nonce,
+        &aad,
+        recipient,
+    )?;
+
+    let mut inner = Zeroizing::new(Vec::with_capacity(
+        TIMESTAMP_LEN
+            .saturating_add(KEY_LEN)
+            .saturating_add(plaintext.len()),
+    ));
+    inner.extend_from_slice(&now_unix.to_le_bytes());
+    inner.extend_from_slice(mia_prekey.as_bytes());
+    inner.extend_from_slice(plaintext);
+
+    let ciphertext = XChaCha20Poly1305::new((&*key).into())
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &inner,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| Error::Crypto)?;
+
+    Ok(format::serialize_message(&header, &ciphertext))
+}
+
+/// Prova ad aprire un messaggio a forward secrecy piena, supponendo che
+/// l'abbia scritto `candidato` e che abbia usato la nostra prekey `mia_prekey`.
+///
+/// Ritorna anche la **prossima prekey del mittente**, presa da dentro il
+/// cifrato: e' quella con cui rispondere, ed e' autenticata dall'AEAD.
+pub fn open_forward(
+    mia_prekey: &EphemeralSecret,
+    candidato: &PublicKey,
+    destinatario: &PublicKey,
+    parsed: &ParsedEnvelope<'_>,
+) -> Result<(PublicKey, Plaintext)> {
+    if parsed.header.tier != Tier::Baseline {
+        return Err(Error::TierUnsupported);
+    }
+    let Origin::EffimeraConPrekey(effimera) = &parsed.header.origin else {
+        return Err(Error::Crypto);
+    };
+    if parsed.ciphertext.len() < TAG_LEN {
+        return Err(Error::Crypto);
+    }
+
+    let aad = format::build_aad(Kind::Message, &parsed.header);
+    let key = derive_ephemeral_key(
+        &*mia_prekey.diffie_hellman(effimera)?,
+        &*mia_prekey.diffie_hellman(candidato)?,
+        &parsed.header.nonce,
+        &aad,
+        destinatario,
+    )?;
+
+    let aperto = Zeroizing::new(
+        XChaCha20Poly1305::new((&*key).into())
+            .decrypt(
+                XNonce::from_slice(&parsed.header.nonce),
+                Payload {
+                    msg: parsed.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::Crypto)?,
+    );
+
+    // Timestamp, poi la prekey del mittente, poi il testo. Tutto autenticato:
+    // se qui manca qualcosa e' il mittente ad aver prodotto un plaintext
+    // malformato, non un attacco.
+    let inizio = TIMESTAMP_LEN;
+    let fine = inizio.saturating_add(KEY_LEN);
+    let chiave = aperto
+        .get(inizio..fine)
+        .ok_or(Error::Format("plaintext senza prekey: mittente malformato"))?;
+    let mut bytes = [0u8; KEY_LEN];
+    bytes.copy_from_slice(chiave);
+    let prossima = PublicKey::from_bytes(bytes);
+
+    let mut senza_prekey = Zeroizing::new(Vec::with_capacity(aperto.len()));
+    senza_prekey.extend_from_slice(aperto.get(..inizio).unwrap_or(&[]));
+    senza_prekey.extend_from_slice(aperto.get(fine..).unwrap_or(&[]));
+    Ok((prossima, stacca_timestamp(&senza_prekey)?))
 }
 
 /// Come [`derive_key`], ma il materiale iniziale sono i due segreti in fila.
@@ -624,6 +752,114 @@ mod tests {
         };
         assert!(matches!(
             open_ephemeral(&bob, &alice.public(), &p2),
+            Err(Error::Crypto)
+        ));
+    }
+
+    fn prekey(seed: u8) -> EphemeralSecret {
+        EphemeralSecret::from_bytes([seed; 32])
+    }
+
+    /// Giro completo della forward secrecy piena, con la prekey di risposta
+    /// che torna dal cifrato.
+    #[test]
+    fn forward_round_trip() {
+        let alice = identita(1);
+        let bob = identita(2);
+        let prekey_bob = prekey(9);
+        let prekey_alice = prekey(8);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([5; 32]);
+
+        let blob = seal_forward(
+            &alice,
+            &bob.public(),
+            &prekey_bob.public(),
+            &prekey_alice.public(),
+            b"ciao",
+            77,
+            &mut rng,
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&blob, &mut buf).unwrap() else {
+            panic!()
+        };
+        let (prossima, aperto) =
+            open_forward(&prekey_bob, &alice.public(), &bob.public(), &parsed).unwrap();
+        assert_eq!(aperto.as_bytes(), b"ciao");
+        assert_eq!(aperto.sent_at_unix(), 77);
+        // La prekey con cui Bob rispondera' e' quella che Alice ha messo dentro
+        // il cifrato, quindi autenticata: nessuno ha potuto sostituirla.
+        assert_eq!(prossima, prekey_alice.public());
+    }
+
+    /// **La proprieta' che giustifica tutto.** Senza la prekey del destinatario
+    /// il messaggio non si apre — nemmeno avendo entrambe le chiavi stabili.
+    #[test]
+    fn buttata_la_prekey_il_messaggio_e_morto() {
+        let alice = identita(1);
+        let bob = identita(2);
+        let prekey_bob = prekey(9);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([5; 32]);
+        let blob = seal_forward(
+            &alice,
+            &bob.public(),
+            &prekey_bob.public(),
+            &prekey(8).public(),
+            b"segreto",
+            1,
+            &mut rng,
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&blob, &mut buf).unwrap() else {
+            panic!()
+        };
+        // Bob ha buttato quella prekey e ne ha un'altra: la sua identita' non
+        // basta piu'.
+        let altra = prekey(77);
+        assert!(matches!(
+            open_forward(&altra, &alice.public(), &bob.public(), &parsed),
+            Err(Error::Crypto)
+        ));
+        // E nemmeno la strada senza prekey funziona, perche' i flag stanno
+        // nell'AAD.
+        assert!(matches!(
+            open_ephemeral(&bob, &alice.public(), &parsed),
+            Err(Error::Crypto)
+        ));
+        assert!(matches!(
+            open(&bob, &alice.public(), &parsed),
+            Err(Error::Crypto)
+        ));
+    }
+
+    /// Il mittente resta dimostrato: con il candidato sbagliato non si apre.
+    #[test]
+    fn forward_col_candidato_sbagliato_non_si_apre() {
+        let alice = identita(1);
+        let bob = identita(2);
+        let carol = identita(3);
+        let prekey_bob = prekey(9);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([5; 32]);
+        let blob = seal_forward(
+            &alice,
+            &bob.public(),
+            &prekey_bob.public(),
+            &prekey(8).public(),
+            b"ciao",
+            1,
+            &mut rng,
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&blob, &mut buf).unwrap() else {
+            panic!()
+        };
+        assert!(matches!(
+            open_forward(&prekey_bob, &carol.public(), &bob.public(), &parsed),
             Err(Error::Crypto)
         ));
     }
