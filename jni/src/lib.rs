@@ -79,6 +79,8 @@ mod code {
     /// L'altro ha chiesto di bruciare la conversazione, e l'abbiamo fatto.
     /// Non c'e' testo: e' un gesto, non un messaggio.
     pub const ITEM_BURNED: jint = 5;
+    /// La propria card, riaperta: non e' stato fissato nessun contatto.
+    pub const ITEM_OWN_IDENTITY_CARD: jint = 6;
 
     /// Esiti di `assignLabel`.
     pub const LABEL_ASSIGNED: jint = 0;
@@ -874,7 +876,18 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
                 {
                     return code::INTERNAL;
                 }
-                if !fill_strings(&mut env, &result, &fingerprint.display(), None) {
+                // L'etichetta ci vuole: e' il ramo che dice "questa chiave ce
+                // l'hai gia'", e senza il nome con cui e' salvata la frase e'
+                // vera e inservibile — l'utente vede un'impronta e non sa a chi
+                // appartenga. Passava `None` da sempre, quindi la schermata
+                // aveva il posto per il nome e non lo riceveva mai.
+                let etichetta = session_label(&peer).unwrap_or_default();
+                if !fill_strings(
+                    &mut env,
+                    &result,
+                    &fingerprint.display(),
+                    etichetta.as_deref(),
+                ) {
                     return code::INTERNAL;
                 }
                 let Ok(chiave) = env.byte_array_from_slice(peer.as_bytes()) else {
@@ -884,6 +897,21 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
                     .set_field(&result, "senderKey", "[B", (&chiave).into())
                     .is_err()
                 {
+                    return code::INTERNAL;
+                }
+                code::OK
+            }
+            IncomingItem::OwnIdentityCard { fingerprint } => {
+                // Nessun `senderKey`: non c'e' nessun peer, e riempirlo con la
+                // propria chiave inviterebbe a trattarla come un contatto —
+                // che e' esattamente il difetto da cui nasce questo ramo.
+                if !set_int("kind", code::ITEM_OWN_IDENTITY_CARD)
+                    || !set_int("alreadyPinned", 0)
+                    || !set_int("verified", 0)
+                {
+                    return code::INTERNAL;
+                }
+                if !fill_strings(&mut env, &result, &fingerprint.display(), None) {
                     return code::INTERNAL;
                 }
                 code::OK

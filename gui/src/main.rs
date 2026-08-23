@@ -371,6 +371,19 @@ impl App {
                 self.ricarica();
                 self.avviso = None;
             }
+            Ok(IncomingItem::OwnIdentityCard { fingerprint }) => {
+                // Non si salva e non si va in Contatti: non c'e' nessun
+                // contatto nuovo da mostrare.
+                self.incollato.clear();
+                self.avviso = Some((
+                    format!(
+                        "Questa e' la TUA chiave ({}), non quella di un contatto: \
+                         non e' stato aggiunto niente.",
+                        fingerprint.display()
+                    ),
+                    true,
+                ));
+            }
             Ok(IncomingItem::IdentityCard {
                 fingerprint,
                 outcome,

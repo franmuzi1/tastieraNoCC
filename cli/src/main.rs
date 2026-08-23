@@ -388,6 +388,13 @@ fn cmd_decrypt(args: &[String]) -> Result<(), String> {
                 Err(_) => println!("(il messaggio non e' testo UTF-8)"),
             }
         }
+        IncomingItem::OwnIdentityCard { fingerprint } => {
+            // Niente `persist`: non e' stato fissato niente, e salvare qui
+            // direbbe il falso al lettore del codice.
+            println!("Questa e' la TUA chiave, non quella di un contatto.");
+            println!("{}", fingerprint.display());
+            println!("\nNon e' stato aggiunto nessun contatto.");
+        }
         IncomingItem::IdentityCard {
             fingerprint,
             outcome,

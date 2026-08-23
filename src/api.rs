@@ -117,6 +117,9 @@ pub enum IncomingItem {
     Burned { peer: PublicKey },
     /// Una presentazione: nessun messaggio da mostrare, solo una chiave da
     /// fissare. La UI mostra il fingerprint e l'esito del pin.
+    /// La propria card, riaperta. Non si fissa niente: vedi il perche' nel
+    /// ramo che la produce.
+    OwnIdentityCard { fingerprint: Fingerprint },
     IdentityCard {
         peer: PublicKey,
         fingerprint: Fingerprint,
@@ -306,6 +309,22 @@ impl<K: Keyring> Session<K> {
                 // TOFU e il suo rischio e' quello dichiarato; la scelta del
                 // destinatario passa da un gesto esplicito dell'utente
                 // (`set_current_peer`).
+                // La propria card non si fissa. Copiare la propria chiave e
+                // riaprirla creava un contatto che e' se stessi: un nome nella
+                // rubrica a cui si puo' perfino scegliere di cifrare, senza che
+                // niente lo dica. Non e' un buco di sicurezza — la chiave e'
+                // gia' nostra e non si impara niente — ma e' una rubrica che
+                // mente, e da qui in poi "per chi sto cifrando" non ha piu' una
+                // risposta affidabile.
+                //
+                // Si distingue dal caso "gia' nota" e non ci si appoggia:
+                // sono due frasi diverse da dire all'utente, e "questa chiave
+                // ce l'hai gia'" per la propria chiave sarebbe vera e inutile.
+                if card.public == self.identity.public() {
+                    return Ok(IncomingItem::OwnIdentityCard {
+                        fingerprint: Fingerprint::of(&card.public),
+                    });
+                }
                 let outcome = self.keyring.tofu_pin(&card.public, now_unix)?;
                 Ok(IncomingItem::IdentityCard {
                     fingerprint: Fingerprint::of(&card.public),
@@ -1347,6 +1366,27 @@ mod tests {
         assert_eq!(bob.current_peer(WHATSAPP), Some(&alice.public()));
         bob.handle_incoming_text(WHATSAPP, &da_carol, 2).unwrap();
         assert_eq!(bob.current_peer(WHATSAPP), Some(&carol.public()));
+    }
+
+    /// Copiare la propria chiave e riaprirla creava un contatto che e' se
+    /// stessi: una rubrica che mente, e da li' in poi "per chi sto cifrando"
+    /// non ha piu' una risposta affidabile.
+    #[test]
+    fn la_propria_card_non_diventa_un_contatto() {
+        let mut alice = sessione(1);
+        let card = alice.identity_card(&mut rng(7));
+
+        let esito = alice.handle_incoming_text(WHATSAPP, &card, 50).unwrap();
+        let IncomingItem::OwnIdentityCard { fingerprint } = esito else {
+            panic!("attesa la propria card, non un contatto");
+        };
+        assert_eq!(fingerprint, alice.my_fingerprint());
+
+        // La riga che conta: la rubrica non e' cresciuta. Riconoscerla e poi
+        // fissarla lo stesso sarebbe il difetto con un messaggio piu' gentile.
+        assert!(alice.keyring.peers().unwrap().is_empty());
+        // E non si e' scelto niente come destinatario.
+        assert_eq!(alice.current_peer(WHATSAPP), None);
     }
 
     #[test]
