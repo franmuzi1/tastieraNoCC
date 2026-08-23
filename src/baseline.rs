@@ -753,18 +753,55 @@ fn apri_epoca(
     epoca_destinatario: &PublicKey,
     parsed: &ParsedEnvelope<'_>,
 ) -> Result<(PublicKey, Plaintext)> {
-    if !parsed.header.origin.uses_epoch() {
-        return Err(Error::Crypto);
-    }
-    apri_epoca_con(Kind::Message, shared, epoca_destinatario, parsed)
+    apri_epoca_con(
+        Kind::Message,
+        SchemaEpoca::Epoca,
+        shared,
+        epoca_destinatario,
+        parsed,
+    )
+}
+
+/// Quale dei due schemi a epoca ci si aspetta di aprire.
+///
+/// Esiste perche' i due **derivano la stessa chiave**: `seal` verso l'identita'
+/// e `seal_epoch_bootstrap` fanno entrambi `DH(identita_mittente,
+/// identita_destinatario)`, con lo stesso `recipient` nella info e lo stesso
+/// `kind`. L'unica differenza e' il byte dei flag — che sta nell'AAD, ma l'AAD
+/// si costruisce da `parsed.header`, cioe' dai flag che **il blob dichiara di
+/// se'**, non da quelli che chi apre si aspetta. Quindi il tag torna e il testo
+/// viene interpretato con il layout sbagliato: 32 byte di messaggio letti come
+/// una chiave d'epoca, o viceversa.
+///
+/// Finora la protezione stava in un `if` di `api.rs` che smistava sul tipo
+/// giusto. Funzionava, ma viveva lontano da qui, in un altro modulo, mentre
+/// queste funzioni sono `pub` e chiamabili da `jni/`, `cli/` e `gui/`. Ora e'
+/// dentro l'unica strada che tutti percorrono.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SchemaEpoca {
+    /// Cifrato verso la chiave d'epoca dell'altro: `Origin::MittenteConPrekey`.
+    Epoca,
+    /// Primo messaggio, cifrato verso la sua identita': `Origin::MittenteConEpoca`.
+    Bootstrap,
 }
 
 fn apri_epoca_con(
     kind: Kind,
+    schema: SchemaEpoca,
     shared: &[u8; KEY_LEN],
     epoca_destinatario: &PublicKey,
     parsed: &ParsedEnvelope<'_>,
 ) -> Result<(PublicKey, Plaintext)> {
+    // Prima di ogni altra cosa: se lo schema non e' quello atteso, la chiave
+    // coinciderebbe e il tag tornerebbe. `Error::Crypto` e non `Format` —
+    // distinguere direbbe a chi prova quale schema ha indovinato.
+    let coerente = match schema {
+        SchemaEpoca::Epoca => parsed.header.origin.uses_epoch(),
+        SchemaEpoca::Bootstrap => parsed.header.origin.is_epoch_bootstrap(),
+    };
+    if !coerente {
+        return Err(Error::Crypto);
+    }
     if parsed.header.tier != Tier::Baseline {
         return Err(Error::TierUnsupported);
     }
@@ -825,6 +862,7 @@ pub fn open_epoch_bootstrap(
 ) -> Result<(PublicKey, Plaintext)> {
     apri_epoca_con(
         Kind::Message,
+        SchemaEpoca::Bootstrap,
         &*recipient.diffie_hellman(mittente)?,
         &recipient.public(),
         parsed,
@@ -839,6 +877,7 @@ pub fn open_epoch_bootstrap_as_sender(
 ) -> Result<(PublicKey, Plaintext)> {
     apri_epoca_con(
         Kind::Message,
+        SchemaEpoca::Bootstrap,
         &*sender.diffie_hellman(destinatario)?,
         destinatario,
         parsed,
@@ -909,6 +948,7 @@ pub fn open_burn_static(
     parsed: &ParsedEnvelope<'_>,
 ) -> Result<(PublicKey, Plaintext)> {
     apri_rogo(
+        SchemaEpoca::Bootstrap,
         &*recipient.diffie_hellman(mittente)?,
         &recipient.public(),
         parsed,
@@ -922,6 +962,7 @@ pub fn open_burn_epoch(
     parsed: &ParsedEnvelope<'_>,
 ) -> Result<(PublicKey, Plaintext)> {
     apri_rogo(
+        SchemaEpoca::Epoca,
         &*mia_epoca.diffie_hellman(mittente)?,
         &mia_epoca.public(),
         parsed,
@@ -929,11 +970,12 @@ pub fn open_burn_epoch(
 }
 
 fn apri_rogo(
+    schema: SchemaEpoca,
     shared: &[u8; KEY_LEN],
     destinatario: &PublicKey,
     parsed: &ParsedEnvelope<'_>,
 ) -> Result<(PublicKey, Plaintext)> {
-    apri_epoca_con(Kind::Burn, shared, destinatario, parsed)
+    apri_epoca_con(Kind::Burn, schema, shared, destinatario, parsed)
 }
 
 /// Riapre un messaggio **che abbiamo scritto noi**, provando `recipient` come
@@ -1014,6 +1056,14 @@ fn open_inner(
         return Err(Error::TierUnsupported);
     }
     if parsed.ciphertext.len() < TAG_LEN {
+        return Err(Error::Crypto);
+    }
+
+    // Lo schema statico e' `Origin::Mittente` e basta. Senza questo controllo un
+    // bootstrap a epoca — che deriva la stessa chiave, vedi [`SchemaEpoca`] —
+    // si aprirebbe di qui e i suoi primi 32 byte (una chiave d'epoca) finirebbero
+    // in testa al testo mostrato all'utente.
+    if !matches!(parsed.header.origin, Origin::Mittente(_)) {
         return Err(Error::Crypto);
     }
 
@@ -1102,6 +1152,53 @@ mod tests {
 
     fn identita(seed: u8) -> Identity {
         Identity::from_secret_bytes([seed; 32]).unwrap()
+    }
+
+    /// I due schemi che derivano la STESSA chiave non devono essere
+    /// intercambiabili. Senza il controllo dello schema il tag torna, perche'
+    /// l'AAD si costruisce dai flag che il blob dichiara di se': il messaggio
+    /// viene letto con il layout sbagliato e i primi 32 byte del testo
+    /// dell'utente diventano una "chiave d'epoca" — o viceversa.
+    #[test]
+    fn statico_e_bootstrap_a_epoca_non_sono_intercambiabili() {
+        let alice = identita(0x11);
+        let bob = identita(0x22);
+        let mia_epoca = EphemeralSecret::from_bytes([0x33; KEY_LEN]);
+
+        // Statico letto come bootstrap.
+        let statico = seal(&alice, &bob.public(), b"IL CANCELLO E 1234", 1, &mut rng(1)).unwrap();
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&statico, &mut buf).unwrap() else {
+            panic!("atteso un messaggio")
+        };
+        assert!(
+            open_epoch_bootstrap(&bob, &alice.public(), &parsed).is_err(),
+            "un messaggio statico non deve aprirsi come bootstrap a epoca",
+        );
+        // E dallo stesso blob la via giusta continua a funzionare: il controllo
+        // nuovo non ha chiuso anche quella.
+        assert!(open(&bob, &alice.public(), &parsed).is_ok());
+
+        // Bootstrap letto come statico.
+        let (header, ciphertext) = seal_epoch_bootstrap(
+            &alice,
+            &bob.public(),
+            &mia_epoca.public(),
+            b"ciao",
+            1,
+            &mut rng(2),
+        )
+        .unwrap();
+        let bootstrap = format::serialize_message(&header, &ciphertext);
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&bootstrap, &mut buf).unwrap() else {
+            panic!("atteso un messaggio")
+        };
+        assert!(
+            open(&bob, &alice.public(), &parsed).is_err(),
+            "un bootstrap a epoca non deve aprirsi come statico",
+        );
+        assert!(open_epoch_bootstrap(&bob, &alice.public(), &parsed).is_ok());
     }
 
     /// Decifra una stringa prodotta da `seal`, prendendo il mittente

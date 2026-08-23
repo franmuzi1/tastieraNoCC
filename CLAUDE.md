@@ -531,6 +531,19 @@ chiede: cifrare per la persona sbagliata e' il fallimento peggiore possibile.
   costo zero da uno scanning di massa.
 - `kind` entra nell'AAD: un messaggio non deve poter essere reinterpretato
   come blob di tipo diverso.
+- **Ma il `kind` protegge il TIPO, non lo SCHEMA**, e la differenza e' costata
+  un difetto. Due schemi possono avere lo stesso `kind` e derivare la stessa
+  identica chiave: `seal` verso l'identita' e `seal_epoch_bootstrap` fanno
+  entrambi `DH(identita_mittente, identita_destinatario)` con lo stesso
+  `recipient` nella info. L'unica differenza e' il byte dei flag — che sta
+  nell'AAD, ma l'AAD si costruisce da `parsed.header`, cioe' dai flag che **il
+  blob dichiara di se'**. Quindi il tag torna e il testo viene letto con il
+  layout sbagliato: 32 byte di messaggio scambiati per una chiave d'epoca.
+  Percio' **ogni funzione che apre verifica lo schema che si aspetta**, dentro
+  di se' e non nel chiamante: `SchemaEpoca` per le due varianti a epoca, e il
+  controllo su `Origin::Mittente` per la via statica. Farlo smistare a
+  `api.rs` funzionava e non bastava — quelle funzioni sono `pub` e le chiamano
+  anche `jni/`, `cli/` e `gui/`.
 - I **flag non sono un campo** di `Header`: sono una funzione di
   `sender_pub.is_some()`. Due fonti di verità per lo stesso fatto
   permetterebbero di costruire un header incoerente, e un header incoerente
