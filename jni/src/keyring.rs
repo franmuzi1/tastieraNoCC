@@ -47,8 +47,35 @@ impl MemoryKeyring {
         Self::default()
     }
 
-    /// Serializza per la persistenza lato Java.
+    /// Serializza per la persistenza lato Java. **Contiene chiavi private**:
+    /// vedi [`Self::export_pubblico`] per la variante da dare a chi deve solo
+    /// mostrare dei nomi.
     pub fn export(&self) -> Vec<u8> {
+        let mut out = self.scrivi_peers();
+        self.scrivi_catena(&mut out);
+        out
+    }
+
+    /// Solo l'elenco dei contatti: pubkey, data, verificato, etichetta.
+    ///
+    /// Esiste perche' chi disegna la schermata contatti non ha bisogno delle
+    /// prekey, e le prekey sono chiavi PRIVATE. Prima questa funzione non
+    /// c'era e l'elenco si serviva con [`Self::export`], cioe' il blob di
+    /// persistenza: aprire la schermata contatti copiava le chiavi private in
+    /// un `byte[]` della JVM, che nessuno azzera, per estrarne dei nomi.
+    ///
+    /// Il taglio e' compatibile all'indietro per costruzione: il lettore Java
+    /// (`PeerList`) legge fino all'ultimo peer e **ignora la coda**, per una
+    /// regola scritta li' apposta. Qui la coda semplicemente non c'e'.
+    ///
+    /// La versione resta `STORAGE_VERSION` e non una nuova: questo blob non e'
+    /// un formato diverso, e' lo stesso troncato. Dargli un numero suo
+    /// costringerebbe il lettore a conoscerne due.
+    pub fn export_pubblico(&self) -> Vec<u8> {
+        self.scrivi_peers()
+    }
+
+    fn scrivi_peers(&self) -> Vec<u8> {
         let capacity = self
             .peers
             .len()
@@ -69,6 +96,10 @@ impl MemoryKeyring {
                 out.extend_from_slice(etichetta);
             }
         }
+        out
+    }
+
+    fn scrivi_catena(&self, out: &mut Vec<u8>) {
         let catena = self.prekey.dump();
         let quante = u32::try_from(catena.len()).unwrap_or(0);
         out.extend_from_slice(&quante.to_le_bytes());
@@ -89,7 +120,6 @@ impl MemoryKeyring {
                 out.extend_from_slice(segreto);
             }
         }
-        out
     }
 
     /// Ricostruisce da un blob prodotto da [`Self::export`].
@@ -335,6 +365,38 @@ mod tests {
 
     fn key(seed: u8) -> PublicKey {
         PublicKey::from_bytes([seed; KEY_LEN])
+    }
+
+    /// Il difetto trovato dall'audit del 23 agosto 2026: l'elenco per la
+    /// schermata contatti era il blob di persistenza, prekey private incluse.
+    #[test]
+    fn elenco_pubblico_non_contiene_prekey() {
+        const SEGRETO: [u8; KEY_LEN] = [0xAB; KEY_LEN];
+        let mut keyring = MemoryKeyring::new();
+        keyring.tofu_pin(&key(1), 100).unwrap();
+        keyring.assign_label(&key(1), "Marco").unwrap();
+        keyring.push_my_prekey(&key(1), SEGRETO).unwrap();
+
+        let completo = keyring.export();
+        let pubblico = keyring.export_pubblico();
+
+        // Il presupposto del test: se il segreto non fosse nemmeno nel blob
+        // completo, l'assenza dall'altro non direbbe niente.
+        assert!(
+            completo.windows(KEY_LEN).any(|f| f == SEGRETO),
+            "il blob di persistenza deve contenere la prekey",
+        );
+        assert!(
+            !pubblico.windows(KEY_LEN).any(|f| f == SEGRETO),
+            "la prekey PRIVATA non deve uscire verso la UI",
+        );
+
+        // Prefisso, non "formato simile": e' cio' che rende il taglio
+        // compatibile col lettore Java, che ignora la coda.
+        assert_eq!(pubblico[..], completo[..pubblico.len()]);
+
+        // E l'elenco deve restare utile: i nomi ci sono ancora.
+        assert!(pubblico.windows(5).any(|f| f == b"Marco"));
     }
 
     #[test]

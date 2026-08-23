@@ -1004,9 +1004,17 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeMarkVerif
 
 /// Esporta il keyring perche' la JVM lo cifri e lo persista.
 ///
-/// Non contiene segreti — sono tutte chiavi pubbliche — ma va comunque
-/// protetto: l'elenco dei peer con cui parli e' esattamente il metadato che il
-/// progetto cerca di non regalare.
+/// **Contiene chiavi PRIVATE**: le prekey della catena di forward secrecy
+/// stanno in coda al blob. Fino all'audit del 23 agosto 2026 questa riga
+/// diceva il contrario — "non contiene segreti, sono tutte chiavi pubbliche" —
+/// ed e' su quella frase che si e' appoggiato chi ha servito lo stesso blob a
+/// `nativeListPeers`, per la schermata contatti.
+///
+/// Quindi: questo blob va cifrato prima di toccare il disco, e non va dato a
+/// nessuno che debba solo leggere dei nomi (per quello c'e' `export_pubblico`).
+/// Anche il solo elenco dei peer resterebbe da proteggere comunque — con chi
+/// parli e' il metadato che tutto il progetto cerca di non regalare — ma non e'
+/// piu' quello il motivo principale.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeExportKeyring(
     env: JNIEnv,
@@ -1081,6 +1089,18 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeBurnConve
 /// come un guasto che sembra della crypto ed e' del parser. E' successo con la
 /// versione 2: se questo formato cambia ancora, quel file va aggiornato
 /// insieme.
+///
+/// **Qui NON esce nessuna chiave privata**, e non e' sempre stato vero. Fino
+/// all'audit del 23 agosto 2026 questa funzione aveva il corpo identico a
+/// `nativeExportKeyring`, cioe' serviva il blob di persistenza: ogni apertura
+/// della schermata contatti copiava le prekey private in un `byte[]` della JVM
+/// — che nessuno azzera, e che nessuno aveva motivo di sospettare — per
+/// estrarne dei nomi. Ora si serve `export_pubblico`, che si ferma prima della
+/// catena.
+///
+/// Se un giorno servisse qui un dato in piu', si aggiunge a `export_pubblico`.
+/// Tornare a `export()` perche' "tanto c'e' gia'" e' esattamente il passo che
+/// ha prodotto il difetto.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeListPeers(
     env: JNIEnv,
@@ -1092,7 +1112,7 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeListPeers
             Err(poisoned) => poisoned.into_inner(),
         };
         match guard.as_mut() {
-            Some(session) => new_byte_array(&env, &session.keyring().export()),
+            Some(session) => new_byte_array(&env, &session.keyring().export_pubblico()),
             None => std::ptr::null_mut(),
         }
     })
