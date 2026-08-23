@@ -626,12 +626,109 @@ chiede: cifrare per la persona sbagliata e' il fallimento peggiore possibile.
   non azzerabile. Verso la JVM si passa **`byte[]`**, mai `String`. Per questo
   l'API pubblica restituisce `Plaintext`, non `String`.
 
+### Decisione G — file cifrati (immagini e audio). **CHIUSA**
+
+**G1, chiusa: sì, come documento allegato.** Si sceglie il file dall'Activity
+contatti, si cifra in un contenitore binario, si consegna alla chat con lo share
+sheet — che lo manda come *documento*, e i documenti Telegram e WhatsApp non li
+ricomprimono. Chi riceve lo passa alla nostra app dallo share sheet.
+
+**Residuo accettato con la chiusura di G1:** in chat si vede un allegato che non
+si apre con nient'altro, ed è un marcatore molto più forte del blob di testo.
+Accettato perché l'alternativa osservata è peggiore: senza questa via le foto si
+mandano lo stesso, in chiaro, nella stessa conversazione.
+
+G2–G6 sono chiuse anche loro: vedi in fondo.
+
+**Cosa è già risolto e non è in discussione.** Il core cifra byte, non testo:
+`seal` prende `&[u8]`. La crittografia non è il problema.
+
+**Due vincoli tecnici, entrambi accertati e non aggirabili.**
+
+1. *Un IME non può allegare un file.* Può inserire testo e, su Android 7.1+,
+   immagini con `commitContent` — la via delle tastiere di GIF. Ma l'app
+   ricevente tratta quel contenuto **come immagine e lo ricomprime**, e una
+   ricompressione distrugge il ciphertext. L'audio non si può inserire affatto.
+   Quindi qualunque soluzione passa dall'Activity companion e dallo share
+   sheet, **non dalla tastiera**.
+2. *Il formato attuale è testo.* z-base-32 gonfia di 1,6×, e una foto da
+   500 KB diventerebbe 800 KB di caratteri. Fuori scala per un campo di chat.
+
+**Il costo vero, che è quello che decide.** Un allegato è molto più visibile di
+un messaggio di testo. Il blob testuale si nasconde dietro uno pseudo-link in
+mezzo a milioni di messaggi; un documento di 300 KB che non si apre con niente
+è un marcatore evidente di "queste due persone si scambiano file cifrati",
+raccolto a costo zero da uno scanning automatico. È lo stesso segnale che il
+riempimento casuale della identity card e il `kind` dentro il cifrato servono a
+non emettere.
+
+In più la **dimensione** rivela molto più della lunghezza di un testo, e il
+file la piattaforma lo conserva.
+
+**G2-G6, chiuse.** Erano marcate "da decidere" mentre il codice le aveva già
+decise tutte: qui si mette per iscritto ciò che è costruito, con il motivo. Un
+documento che dice "aperto" su qualcosa di già fatto è peggio di un documento
+incompleto — la sessione successiva legge "da decidere", decide diversamente, e
+riscrive codice che funzionava.
+
+**G2, chiusa: contenitore binario, stesso envelope, `kind = File`.** Niente
+z-base-32 e nessun formato separato. Il `kind` sta nell'AAD, quindi un allegato
+non si rilegge come messaggio nemmeno con la catena accesa — c'è il test. Un
+formato separato avrebbe voluto dire un secondo parser da tenere in pari con il
+primo, cioè due modi di sbagliare la stessa cosa.
+
+**G3, chiusa: estensione `.kc` dichiarata, e nome del file BUTTATO.** L'allegato
+si chiama `kc-<casuale>.kc`.
+
+Le due metà rispondono a domande diverse, e vale la pena tenerle distinte.
+L'estensione è dichiarata perché mimetizzarsi non è una proprietà che questo
+progetto conti come sicurezza: il sentinel è dichiaratamente estetica, e
+un'estensione `.dat` non ingannerebbe nessuno che guardi i primi byte. Il nome
+invece è un metadato vero, e va tolto: `IMG_20260810_compleanno-di-marco.jpg.kc`
+racconterebbe da solo quasi tutto — data, occasione, persona — a chiunque veda
+passare l'allegato in chat.
+
+**G4, chiusa: il destinatario è sempre esplicito, e il destinatario ricordato
+per l'app NON si usa nemmeno quando c'è.** Dall'Activity companion il contesto
+dell'app non esiste, ma la ragione vera è un'altra e vale anche dove il contesto
+ci fosse: un file mandato alla persona sbagliata non si ritira, e a differenza
+di un messaggio **resta sul telefono di chi lo riceve**. Per un messaggio la
+scorciatoia vale il rischio; per un file no.
+
+**G5, chiusa, e più stretta di com'era proposta.** La proposta diceva "storage
+interno dell'app": il codice fa meglio, il chiaro ricevuto **non tocca il
+disco**. Vive in memoria, si mostra in una finestra `FLAG_SECURE`, e finisce su
+disco solo se l'utente lo salva — attraverso il selettore di documenti del
+sistema, quindi con un gesto esplicito e una destinazione scelta da lui. Il
+messaggio che accompagna il salvataggio dice cosa comporta: da quel momento è un
+file come gli altri, entra nella galleria e nei backup.
+
+In uscita il ciphertext passa da `cacheDir/cipher-share`, che viene **svuotata a
+ogni condivisione** tenendo solo l'ultimo file. Non è un segreto — è cifrato —
+ma una cartella che si accumula è l'elenco di quanti file hai mandato e quando.
+
+**G6, chiusa: il minore fra 50 MB e un quarto dell'heap, nessuno
+spezzettamento.** Il tetto non è un numero fisso perché cifrare tiene in memoria
+il chiaro, il cifrato e le copie del passaggio JNI: quattro volte il file, per
+stima prudente. Su un telefono che non regge il limite scelto si dice **prima**,
+invece di far aspettare la cifratura e poi morire di OutOfMemory — lo stesso
+fallimento, molto più tardi e senza spiegazione.
+
+Niente spezzettamento: moltiplicherebbe il marcatore che G1 accetta già a
+malincuore. Tre allegati che non si aprono con niente sono un segnale tre volte
+più forte di uno.
+
+*Da rivedere con dati veri, non con una stima:* i 50 MB. Se l'uso mostra
+rallentamenti o fallimenti sotto quella soglia, quel numero si abbassa — è
+l'unica parte di G che non poggia su un ragionamento ma su una congettura.
+
 ## Decisioni aperte — non implementare prima di chiuderle
 
 Se una sessione le trova aperte, si ferma e chiede. Non sceglie per conto
 proprio.
 
-C, D, E e F sono chiuse; le loro motivazioni stanno nelle sezioni sopra.
+C, D, E, F e **G** sono chiuse; le loro motivazioni stanno nelle sezioni sopra.
+Resta aperta la sola **K**, e solo in parte.
 
 *(La decisione E su z-base-32 è chiusa: vedi sotto.)*
 
@@ -760,64 +857,6 @@ in gioco sono due. La decisione va presa li', non qui.
 
 Il resto della decisione (formato degli slot, tetto al numero di destinatari,
 slot civetta, gruppi predefiniti nell'interfaccia) resta **aperto**.
-
-### Decisione G — file cifrati (immagini e audio). **G1 CHIUSA, il resto aperto**
-
-**G1, chiusa: sì, come documento allegato.** Si sceglie il file dall'Activity
-contatti, si cifra in un contenitore binario, si consegna alla chat con lo share
-sheet — che lo manda come *documento*, e i documenti Telegram e WhatsApp non li
-ricomprimono. Chi riceve lo passa alla nostra app dallo share sheet.
-
-**Residuo accettato con la chiusura di G1:** in chat si vede un allegato che non
-si apre con nient'altro, ed è un marcatore molto più forte del blob di testo.
-Accettato perché l'alternativa osservata è peggiore: senza questa via le foto si
-mandano lo stesso, in chiaro, nella stessa conversazione.
-
-Il resto della decisione (G2–G6) resta aperto.
-
-**Cosa è già risolto e non è in discussione.** Il core cifra byte, non testo:
-`seal` prende `&[u8]`. La crittografia non è il problema.
-
-**Due vincoli tecnici, entrambi accertati e non aggirabili.**
-
-1. *Un IME non può allegare un file.* Può inserire testo e, su Android 7.1+,
-   immagini con `commitContent` — la via delle tastiere di GIF. Ma l'app
-   ricevente tratta quel contenuto **come immagine e lo ricomprime**, e una
-   ricompressione distrugge il ciphertext. L'audio non si può inserire affatto.
-   Quindi qualunque soluzione passa dall'Activity companion e dallo share
-   sheet, **non dalla tastiera**.
-2. *Il formato attuale è testo.* z-base-32 gonfia di 1,6×, e una foto da
-   500 KB diventerebbe 800 KB di caratteri. Fuori scala per un campo di chat.
-
-**Il costo vero, che è quello che decide.** Un allegato è molto più visibile di
-un messaggio di testo. Il blob testuale si nasconde dietro uno pseudo-link in
-mezzo a milioni di messaggi; un documento di 300 KB che non si apre con niente
-è un marcatore evidente di "queste due persone si scambiano file cifrati",
-raccolto a costo zero da uno scanning automatico. È lo stesso segnale che il
-riempimento casuale della identity card e il `kind` dentro il cifrato servono a
-non emettere.
-
-In più la **dimensione** rivela molto più della lunghezza di un testo, e il
-file la piattaforma lo conserva.
-
-**Da decidere, in quest'ordine:**
-
-- G1. *Esiste?* Vedi le opzioni sotto.
-- G2. Se sì: contenitore **binario** (niente z-base-32) con un `kind` nuovo
-  dentro lo stesso envelope, oppure un formato di file separato.
-- G3. Nome ed estensione dell'allegato: dichiarata (`.kc`), neutra (`.dat`), o
-  mimetizzata. Attenzione: la mimetizzazione è una proprietà che questo
-  progetto ha sempre rifiutato di contare come sicurezza — il sentinel è
-  dichiaratamente solo estetica.
-- G4. Destinatario: dall'Activity companion non c'è il contesto dell'app, quindi
-  la scelta del contatto è **sempre esplicita**. Va confermato che sia
-  accettabile.
-- G5. Dove finisce il chiaro in ricezione. Proposta non negoziabile: storage
-  interno dell'app, visualizzatore `FLAG_SECURE`, salvataggio fuori solo su
-  gesto esplicito e con avviso — un file decifrato in Download è un file che
-  finisce nel backup cloud e nella galleria.
-- G6. Limite di dimensione, e se spezzare i file grandi (che moltiplica il
-  marcatore, quindi probabilmente no).
 
 ## Regole di implementazione
 
