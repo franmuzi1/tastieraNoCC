@@ -746,12 +746,13 @@ l'unica parte di G che non poggia su un ragionamento ma su una congettura.
 Se una sessione le trova aperte, si ferma e chiede. Non sceglie per conto
 proprio.
 
-C, D, E, F e **G** sono chiuse; le loro motivazioni stanno nelle sezioni sopra.
-Resta aperta la sola **K**, e solo in parte.
+C, D, E, F, **G** e **K** sono chiuse; le loro motivazioni stanno nelle sezioni
+sopra. Al momento non ce ne sono di aperte: questa sezione resta perche' la
+prossima ci finira'.
 
 *(La decisione E su z-base-32 è chiusa: vedi sotto.)*
 
-### Decisione K — messaggio di gruppo (piu' destinatari). **K1 CHIUSA, il resto aperto**
+### Decisione K — messaggio di gruppo (piu' destinatari). **CHIUSA**
 
 Un solo blob, letto da piu' persone, **incollato in UNA conversazione di
 gruppo**. Non e' lo stesso blob mandato in N chat separate: quello sarebbe
@@ -874,8 +875,57 @@ distrutta alla prima lettura renderebbe illeggibile la cronologia a chi la
 rilegge. Fra due persone il problema resta ma e' molto piu' piccolo, e le parti
 in gioco sono due. La decisione va presa li', non qui.
 
-Il resto della decisione (formato degli slot, tetto al numero di destinatari,
-slot civetta, gruppi predefiniti nell'interfaccia) resta **aperto**.
+### Il resto di K, chiuso il 23 agosto 2026
+
+**K2, formato degli slot.**
+
+```text
+envelope version = 2
+  header      come la 1, con l'effimera del mittente in Origin
+  n_slot      1 byte
+  slot[i]     48 byte: chiave di contenuto (32) incapsulata + tag (16)
+  payload     il testo, cifrato UNA volta con la chiave di contenuto
+```
+
+La chiave di ogni slot deriva da `DH(effimera, destinatario) || DH(mittente,
+destinatario)`, come gia' fissato dal divieto sugli identificatori: chi apre
+**prova gli slot uno per uno**. Il costo e' trascurabile e non e' un'ipotesi —
+il numero di X25519 non dipende dagli slot, cambia solo il numero di tentativi
+simmetrici.
+
+Il nonce di ogni slot si ricava dal nonce dell'envelope e **dall'indice**, e
+l'indice entra nell'AAD insieme a `n_slot`. Le due cose servono a difetti
+diversi e servono entrambe: legare l'indice impedisce di riordinare gli slot,
+legare il conteggio impedisce di troncarne via qualcuno — un destinatario tolto
+dal blob non deve poter sembrare un blob nato senza di lui.
+
+Gli slot sono in **ordine casuale**, non nell'ordine in cui l'utente ha spuntato
+i nomi: la posizione non deve dire niente su chi c'e' dentro.
+
+**Il mittente ha uno slot suo**, ed e' il nono. Senza, chi manda non potrebbe
+rileggere cio' che ha scritto: l'effimera si butta dopo l'invio, quindi non puo'
+ricalcolare gli slot altrui. In un formato che per scelta NON ha forward secrecy
+— dove cioe' la cronologia esiste apposta — un messaggio illeggibile a chi l'ha
+scritto sarebbe incoerente. Non rivela niente di nuovo: che il mittente sia nel
+gruppo si sa gia'.
+
+**K3, tetto: 8 destinatari** piu' lo slot del mittente, quindi 9 slot. Con 48
+byte per slot sono 432 byte, che dopo la codifica restano largamente dentro i
+4096 caratteri lasciando spazio a un messaggio vero. Il tetto si puo' alzare
+dopo senza rompere i blob gia' mandati: `n_slot` e' un byte.
+
+**K4, niente slot civetta.** La lunghezza del blob rivela quante persone sono.
+E' un metadato debole — chi guarda vede gia' che e' una conversazione di gruppo,
+perche' e' li' che il blob e' stato incollato — e il riempimento costerebbe
+spazio a ogni messaggio, anche a quelli di due persone. Registrato come
+**scelta**, non come dimenticanza: chi un giorno volesse nasconderlo aggiunga
+slot fino a un numero fisso, e paghi.
+
+**K5, gruppi salvati E selezione al momento.** Si spuntano piu' contatti quando
+si sceglie il destinatario, e quella selezione si puo' salvare con un nome
+(«Famiglia»). Il gruppo salvato e' un'etichetta locale sopra un insieme di
+chiavi, esattamente come il nome di un contatto e' un'etichetta locale sopra
+una chiave: non viaggia, non entra nel cifrato, e non lo conosce nessun altro.
 
 ## Regole di implementazione
 
