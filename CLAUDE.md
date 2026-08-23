@@ -578,6 +578,68 @@ C, D, E e F sono chiuse; le loro motivazioni stanno nelle sezioni sopra.
 
 *(La decisione E su z-base-32 è chiusa: vedi sotto.)*
 
+### Decisione K — messaggio di gruppo (piu' destinatari). **K1 CHIUSA, il resto aperto**
+
+Un solo blob, letto da piu' persone, **incollato in UNA conversazione di
+gruppo**. Non e' lo stesso blob mandato in N chat separate: quello sarebbe
+peggio che cifrare N volte, perche' la stessa stringa in N conversazioni
+consegna l'intero insieme dei destinatari a chiunque guardi il traffico, con un
+confronto per uguaglianza. **Vincolo di formato, non consiglio d'uso:** un blob
+multi-destinatario va a una conversazione sola.
+
+**K1, chiusa: un messaggio di gruppo ha meta' forward secrecy.** Una sola
+chiave effimera del mittente per tutto l'envelope; ogni destinatario riceve la
+chiave di contenuto incapsulata verso la propria **identita'**, non verso una
+sua prechiave. Niente prechiavi per slot, niente modo per slot.
+
+Tre motivi, in ordine di peso.
+
+1. **La forward secrecy piena non si comprerebbe comunque.** Il testo e' cifrato
+   una volta sola sotto una chiave di contenuto, e quella chiave si ricava da
+   *qualunque* slot. Quindi il messaggio resta apribile finche' anche uno solo
+   dei destinatari non ha fatto avanzare la propria catena: vale quanto il
+   membro peggiore. La congiunzione e' una proprieta' del riuso della chiave di
+   contenuto — cioe' proprio di cio' che rende economico il multi-destinatario —
+   non dell'incapsulamento. Le prechiavi per slot proteggerebbero l'involucro,
+   non il messaggio.
+
+2. **Romperebbe un invariante scelto apposta.** `Header::flags` e' una funzione
+   di `origin` e non un campo, perche' "due fonti di verita' per lo stesso fatto
+   sarebbero un modo per produrre un header incoerente". Un modo per slot
+   reintroduce esattamente quella possibilita', e la reintroduce nel punto in
+   cui un errore non si vede: un header valido che dice il falso su quale
+   schema e' stato usato.
+
+3. **Direbbe qualcosa sui terzi.** Con un modo per slot, ogni destinatario
+   scoprirebbe quanti co-destinatari sono in forward secrecy piena e quanti nel
+   ripiego. E' informazione debole, ma e' informazione su persone che non sono
+   ne' lui ne' il mittente.
+
+**Cosa NON cambia:** i messaggi a un destinatario restano `version = 1`, byte
+per byte, con la forward secrecy piena di oggi. Il gruppo e' un formato nuovo
+(`version = 2`), non una modifica di quello esistente — ed e' anche l'unico modo
+perche' una versione vecchia dica "aggiorna l'app" invece di "messaggio
+corrotto": un `kind` nuovo o un bit di flag darebbero `Error::Format`, che
+l'interfaccia mostra con la stessa frase di un blob rovinato.
+
+**Residuo accettato con la chiusura di K1.** Un messaggio di gruppo si apre a
+chi ottenga l'identita' di **un qualsiasi** membro, e resta apribile finche' non
+tutti hanno risposto. Va scritto dove l'utente lo legge, non solo qui: oggi
+l'interruttore della forward secrecy promette che "dal secondo messaggio in poi
+nessuna delle due chiavi stabili basta piu' ad aprire niente", e per un gruppo
+quella frase sarebbe falsa.
+
+**Divieto che accompagna K1, con il motivo.** Nessun identificatore per slot —
+niente "key hint" per saltare i tentativi. La chiave di ogni slot deriva da
+`DH(effimera, destinatario) || DH(mittente, destinatario)`, quindi oggi
+l'appartenenza al gruppo **non e' verificabile** da chi non ne fa parte. Un
+identificatore stabile per destinatario la renderebbe verificabile, e arriverebbe
+travestito da ottimizzazione: il costo che eviterebbe e' stato misurato ed e'
+trascurabile, perche' il numero di X25519 non dipende dagli slot.
+
+Il resto della decisione (formato degli slot, tetto al numero di destinatari,
+slot civetta, gruppi predefiniti nell'interfaccia) resta **aperto**.
+
 ### Decisione G — file cifrati (immagini e audio). **G1 CHIUSA, il resto aperto**
 
 **G1, chiusa: sì, come documento allegato.** Si sceglie il file dall'Activity
