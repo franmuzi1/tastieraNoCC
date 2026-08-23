@@ -587,33 +587,65 @@ consegna l'intero insieme dei destinatari a chiunque guardi il traffico, con un
 confronto per uguaglianza. **Vincolo di formato, non consiglio d'uso:** un blob
 multi-destinatario va a una conversazione sola.
 
-**K1, chiusa: un messaggio di gruppo ha meta' forward secrecy.** Una sola
-chiave effimera del mittente per tutto l'envelope; ogni destinatario riceve la
-chiave di contenuto incapsulata verso la propria **identita'**, non verso una
-sua prechiave. Niente prechiavi per slot, niente modo per slot.
+**K1, chiusa e riconfermata: il messaggio di gruppo e' cifrato ma non e' in
+forward secrecy.** Una sola chiave effimera del mittente per tutto l'envelope;
+ogni destinatario riceve la chiave di contenuto incapsulata verso la propria
+**identita'**, non verso una sua prechiave. Niente prechiavi per slot, niente
+modo per slot.
 
-Tre motivi, in ordine di peso.
+Cinque motivi, in ordine di peso. I primi due bastano da soli.
 
-1. **La forward secrecy piena non si comprerebbe comunque.** Il testo e' cifrato
-   una volta sola sotto una chiave di contenuto, e quella chiave si ricava da
-   *qualunque* slot. Quindi il messaggio resta apribile finche' anche uno solo
-   dei destinatari non ha fatto avanzare la propria catena: vale quanto il
-   membro peggiore. La congiunzione e' una proprieta' del riuso della chiave di
-   contenuto — cioe' proprio di cio' che rende economico il multi-destinatario —
-   non dell'incapsulamento. Le prechiavi per slot proteggerebbero l'involucro,
-   non il messaggio.
+1. **La forward secrecy piena non si comprerebbe comunque: il gruppo ha la
+   forward secrecy del suo membro peggiore.** Il testo e' cifrato una volta sola
+   sotto una chiave di contenuto, e quella chiave si ricava da *qualunque* slot.
+   Quindi il messaggio resta apribile finche' anche uno solo dei destinatari non
+   ha fatto avanzare la propria catena. La mia prechiave distrutta protegge il
+   mio slot; se a un altro membro trapela l'identita', l'attaccante ripercorre
+   tutta la storia del gruppo **dal suo slot**, e la mia diligenza non conta.
+   Fra due persone la forward secrecy e' una proprieta' che si costruiscono
+   insieme; in dieci e' una proprieta' che si perde se la perde uno solo. La
+   congiunzione e' una conseguenza del riuso della chiave di contenuto — cioe'
+   proprio di cio' che rende economico il multi-destinatario — non
+   dell'incapsulamento. Le prechiavi per slot proteggerebbero l'involucro, non
+   il messaggio.
 
-2. **Romperebbe un invariante scelto apposta.** `Header::flags` e' una funzione
+2. **Le prechiavi monouso hanno bisogno di un distributore, e qui non c'e'.**
+   Sono per-contatto (`my_prekeys(&peer)`, `MAX_PREKEY_MIE = 32`) e si
+   ricaricano quando quel contatto scrive. Fra due persone il piggyback basta,
+   perche' i turni si alternano e le parti sono due. In un gruppo no, e per due
+   ragioni distinte:
+   - **I silenziosi restano senza.** Chi legge e non scrive non rifornisce mai
+     nessuno di prechiavi fresche, e per lui si ricade sull'identita' comunque.
+     Si otterrebbe forward secrecy per i chiacchieroni e niente per gli altri —
+     e chi manda non ha modo di sapere quale delle due ha avuto.
+   - **Due mittenti pescano la stessa prechiave.** Sono monouso, in un gruppo
+     scrivono in molti nello stesso momento, e nessuno vede cosa hanno consumato
+     gli altri. O qualcuno fallisce l'invio, o la stessa prechiave viene riusata
+     **in silenzio**. Una prechiave riusata e' peggio di nessuna prechiave,
+     perche' l'interfaccia continua a promettere una proprieta' che non c'e'
+     piu'. Un fallimento silenzioso che si dichiara riuscito e' esattamente la
+     categoria di guasto che questo progetto rifiuta altrove.
+
+3. **Romperebbe un invariante scelto apposta.** `Header::flags` e' una funzione
    di `origin` e non un campo, perche' "due fonti di verita' per lo stesso fatto
    sarebbero un modo per produrre un header incoerente". Un modo per slot
    reintroduce esattamente quella possibilita', e la reintroduce nel punto in
    cui un errore non si vede: un header valido che dice il falso su quale
    schema e' stato usato.
 
-3. **Direbbe qualcosa sui terzi.** Con un modo per slot, ogni destinatario
+4. **Direbbe qualcosa sui terzi.** Con un modo per slot, ogni destinatario
    scoprirebbe quanti co-destinatari sono in forward secrecy piena e quanti nel
    ripiego. E' informazione debole, ma e' informazione su persone che non sono
    ne' lui ne' il mittente.
+
+5. **Motivo che NON vale, registrato perche' non venga riscoperto: lo spazio.**
+   Verrebbe da pensare che le prechiavi per slot non ci stiano nel blob. Ci
+   stanno. Con 4096 caratteri e ~116 byte di intestazione ci sta una ventina di
+   slot lasciando spazio per un messaggio vero, e i pochi byte in piu' per slot
+   della forward secrecy non spostano l'ago. Il vincolo e' il coordinamento
+   delle prechiavi, non la dimensione: chi in futuro trovasse un tetto di
+   dimensione piu' generoso non ha con questo trovato un argomento per riaprire
+   K1.
 
 **Cosa NON cambia:** i messaggi a un destinatario restano `version = 1`, byte
 per byte, con la forward secrecy piena di oggi. Il gruppo e' un formato nuovo
@@ -622,12 +654,36 @@ perche' una versione vecchia dica "aggiorna l'app" invece di "messaggio
 corrotto": un `kind` nuovo o un bit di flag darebbero `Error::Format`, che
 l'interfaccia mostra con la stessa frase di un blob rovinato.
 
-**Residuo accettato con la chiusura di K1.** Un messaggio di gruppo si apre a
-chi ottenga l'identita' di **un qualsiasi** membro, e resta apribile finche' non
-tutti hanno risposto. Va scritto dove l'utente lo legge, non solo qui: oggi
-l'interruttore della forward secrecy promette che "dal secondo messaggio in poi
-nessuna delle due chiavi stabili basta piu' ad aprire niente", e per un gruppo
-quella frase sarebbe falsa.
+**Condizione 1 — il gruppo non deve poter indebolire il dialogo a due.** Gli
+slot di gruppo non toccano i segreti da cui dipende la forward secrecy a due:
+dominio di derivazione separato, e nessun materiale in comune oltre
+all'identita' pubblica. Va imposto per costruzione e coperto da un test, non
+lasciato all'attenzione di chi scrivera' il codice. Senza questa separazione la
+decisione si rovescia: un gruppo compromesso retrocederebbe conversazioni che
+avevano una garanzia piu' forte, e a quel punto meglio non avere i gruppi.
+
+**Condizione 2 — dirlo dove l'utente lo legge, non solo qui.** Un messaggio di
+gruppo si apre a chi ottenga l'identita' di **un qualsiasi** membro, e resta
+apribile finche' non tutti hanno risposto. Chi registra il traffico del gruppo
+oggi e fra un anno mette le mani sul telefono di un solo membro legge tutto
+quello che quel membro poteva leggere. Oggi l'interruttore della forward secrecy
+promette che "dal secondo messaggio in poi nessuna delle due chiavi stabili
+basta piu' ad aprire niente": per un gruppo quella frase e' falsa e non deve
+comparire. Il gruppo si annuncia come **cifrato, ma non a prova di telefono
+perso**. Con l'etichetta la scelta e' legittima; senza, e' una bugia — ed e' la
+condizione che rende accettabile tutto il resto di K1.
+
+**Condizione 3 — la via d'uscita e' una versione, non un bit di flag.** Se un
+giorno si vorra' la forward secrecy anche nei gruppi, sara' `version = 3`, per
+lo stesso motivo per cui il gruppo e' `version = 2`: un bit di flag su una
+versione esistente fa dire "corrotto" alle installazioni vecchie invece di
+"aggiorna". *(I quattro bit alti liberi in `Flags::KNOWN` non sono il posto
+giusto: sembrano l'appiglio ovvio ed e' un errore che questa nota esiste per
+prevenire.)* La strada tecnica e' nota e si chiama **chiavi del mittente**: ogni
+membro ha una catena che avanza da solo a ogni messaggio che manda, e siccome la
+avanza da solo il problema del distributore del motivo 2 sparisce. Il prezzo e'
+stato per membro per gruppo e il recupero di chi si e' perso dei messaggi. E'
+lavoro da dopo, non da adesso, e non va cominciato di nascosto dentro K1.
 
 **Divieto che accompagna K1, con il motivo.** Nessun identificatore per slot —
 niente "key hint" per saltare i tentativi. La chiave di ogni slot deriva da
@@ -636,6 +692,14 @@ l'appartenenza al gruppo **non e' verificabile** da chi non ne fa parte. Un
 identificatore stabile per destinatario la renderebbe verificabile, e arriverebbe
 travestito da ottimizzazione: il costo che eviterebbe e' stato misurato ed e'
 trascurabile, perche' il numero di X25519 non dipende dagli slot.
+
+**Ricaduta sulla decisione I (distruzione alla lettura).** Chiusa K1 in questa
+forma, la domanda "la chiave avanza alla lettura invece che alla risposta"
+riguarda **solo il dialogo a due**. Era nel gruppo che faceva il danno peggiore:
+in una conversazione di gruppo si scorre indietro di continuo, e una chiave
+distrutta alla prima lettura renderebbe illeggibile la cronologia a chi la
+rilegge. Fra due persone il problema resta ma e' molto piu' piccolo, e le parti
+in gioco sono due. La decisione va presa li', non qui.
 
 Il resto della decisione (formato degli slot, tetto al numero di destinatari,
 slot civetta, gruppi predefiniti nell'interfaccia) resta **aperto**.
