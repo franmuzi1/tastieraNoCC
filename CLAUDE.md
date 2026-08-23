@@ -169,15 +169,43 @@ l'altro in passato, non da cosa dichiara il messaggio in arrivo.
 
 **Lo stato per contatto** vive in `Keyring` (`PrekeyStore` nel core: struttura
 dati, nessun I/O, cosi' le tre implementazioni non ne hanno tre versioni
-diverse). Se ne tengono `MAX_PREKEY_MIE` = 3, ed e' **la finestra in cui la
-forward secrecy non c'e' ancora**: una sola romperebbe il caso normale — mando
-due messaggi di fila, l'altro apre il secondo, il primo e' gia' morto — e molte
-allungherebbero il periodo in cui un telefono sequestrato apre il passato.
+diverse). Se ne tengono `MAX_PREKEY_MIE` = **32**.
+
+**Il numero NON e' un compromesso sulla forward secrecy, ed e' l'errore da non
+rifare.** Era 3, con la motivazione — sbagliata — che fosse "la finestra in cui
+la forward secrecy non c'e' ancora". Non lo e': una nostra chiave apre solo i
+messaggi cifrati con quella, e le eccedenti non hanno mai aperto niente, perche'
+nessun messaggio le ha mai usate. Tenerne di piu' non allunga nessun passato
+apribile. Il tetto serve a una cosa sola, impedire che lo stato cresca verso chi
+non risponde mai: 32 chiavi sono 1 KB per contatto.
+
+Tre erano poche per un motivo pratico trovato con una sonda, non a mente: chi
+risponde usa l'ultima chiave temporanea che **ha visto**, non l'ultima che
+esiste. Con tre, quattro messaggi di fila prima di una risposta bastavano a
+rendere quella risposta illeggibile — e quattro messaggi di fila, in chat, sono
+la norma. Il test con venti messaggi c'e'.
 
 **Il gesto che produce la proprieta' e' `drop_my_prekeys_older_than`**, cioe'
-buttare, non cifrare. Finche' quelle chiavi esistono i messaggi che le usavano
-si riaprono. Si butta il vecchio e non tutto: in un mezzo fatto di copia-incolla
-i messaggi arrivano in ordine sparso di continuo.
+buttare, non cifrare.
+
+**Ed e' la LETTURA a buttare, non la risposta.** La chiamata sta nel percorso di
+decifratura (`prova_con_le_prekey`, `prova_le_prekey_sul_file`), non in
+cifratura: aprire un messaggio uccide subito tutte le proprie chiavi piu'
+vecchie di quella che quel messaggio ha usato, senza aspettare che si risponda.
+Vale la pena scriverlo qui perche' e' gia' costato: il commento di un commit lo
+raccontava come "ogni risposta butta", e una sessione successiva ci si e'
+appoggiata invece di aprire il file, arrivando a proporre come lavoro da fare
+una proprieta' che il codice aveva gia'.
+
+Si butta il vecchio e non tutto: `truncate(i + 1)` tiene la chiave usata e le
+piu' recenti. Quindi un messaggio **resta rileggibile finche' non se ne apre uno
+piu' recente della stessa persona**, ed e' la frase da usare in interfaccia. La
+scelta e' deliberata: in un mezzo fatto di copia-incolla i messaggi arrivano in
+ordine sparso di continuo, e un messaggio che si rifiuta di riaprirsi sembra un
+guasto. Buttare anche la chiave appena usata — un messaggio si apre una volta
+sola — e' stato **considerato e scartato**: guadagna poco, perche' chi sequestra
+il telefono subito dopo recupera un messaggio che era appena sullo schermo, e
+costa un malfunzionamento visibile.
 
 **Cifrare non e' piu' un'operazione di sola lettura.** Genera una prekey nuova e
 la mette nel keyring, quindi ogni chiamante deve persistere subito: un processo
