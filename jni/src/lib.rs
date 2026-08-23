@@ -692,6 +692,60 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFo
     })
 }
 
+/// Cifra per piu' destinatari (decisione K).
+///
+/// Le chiavi arrivano **concatenate** in un solo `byte[]`, 32 byte ciascuna,
+/// invece che come `byte[][]`. Un array di array attraverso JNI vuole un
+/// riferimento locale per riga e un ciclo che li rilascia: piu' codice `unsafe`
+/// per trasportare la stessa cosa. Il conteggio si ricava dalla lunghezza, e
+/// una lunghezza non multipla di 32 e' un errore del chiamante, non un gruppo
+/// strano.
+///
+/// **Non ha forward secrecy**, per decisione: chi mostra il risultato deve
+/// dirlo all'utente.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptGroup(
+    mut env: JNIEnv,
+    _class: JClass,
+    peers: JByteArray,
+    plaintext: JByteArray,
+    now_unix: jlong,
+) -> jstring {
+    guard(std::ptr::null_mut(), || {
+        let nullo: jstring = std::ptr::null_mut();
+        let Ok(chiavi) = read_bytes(&mut env, &peers) else {
+            return nullo;
+        };
+        if chiavi.is_empty() || chiavi.len() % KEY_LEN != 0 {
+            return nullo;
+        }
+        let destinatari: Vec<keyboard_cipher_core::keys::PublicKey> = chiavi
+            .chunks_exact(KEY_LEN)
+            .map(|pezzo| {
+                let mut bytes = [0u8; KEY_LEN];
+                bytes.copy_from_slice(pezzo);
+                keyboard_cipher_core::keys::PublicKey::from_bytes(bytes)
+            })
+            .collect();
+
+        let Ok(mut bytes) = read_bytes(&mut env, &plaintext) else {
+            return nullo;
+        };
+        let esito = with_session(|session| {
+            session.encrypt_group(&destinatari, &bytes, now_unix, &mut OsRng)
+        });
+        // Come per gli altri: la copia Rust del chiaro sparisce subito, quella
+        // Java la azzera il chiamante.
+        use zeroize::Zeroize;
+        bytes.zeroize();
+
+        match esito {
+            Ok(blob) => new_string(&env, &blob),
+            Err(_) => nullo,
+        }
+    })
+}
+
 /// Punto d'ingresso unico per tutte e quattro le vie con cui un blob puo'
 /// arrivare (clipboard, `ACTION_PROCESS_TEXT`, share sheet, campo di input).
 ///
@@ -738,6 +792,15 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
 
                 if !set_int("kind", code::ITEM_MESSAGE)
                     || !set_int("verified", jint::from(verificato))
+                    // Quante persone potevano leggerlo, mittente compreso. Uno
+                    // per un messaggio a due. Serve all'interfaccia per dire
+                    // che un messaggio di gruppo NON ha forward secrecy: e' la
+                    // condizione che accompagna la decisione K1, e senza questo
+                    // numero non e' esprimibile.
+                    || !set_int(
+                        "recipientCount",
+                        jint::try_from(message.destinatari).unwrap_or(1),
+                    )
                 {
                     return code::INTERNAL;
                 }

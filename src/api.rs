@@ -75,6 +75,14 @@ pub struct DecryptedMessage {
     pub sender: PublicKey,
     pub sender_status: SenderStatus,
     pub plaintext: Plaintext,
+    /// Quante persone potevano leggerlo, mittente compreso. `1` per un
+    /// messaggio a due.
+    ///
+    /// Non e' una curiosita': un messaggio di gruppo **non ha forward
+    /// secrecy** (decisione K1), e chi legge deve poterlo sapere. La condizione
+    /// che accompagna quella decisione e' che l'interfaccia lo dica, e
+    /// l'interfaccia puo' dirlo solo se il dato arriva fin qui.
+    pub destinatari: usize,
 }
 
 /// Un segreto nuovo per una chiave temporanea.
@@ -228,6 +236,7 @@ impl<K: Keyring> Session<K> {
                 }
                 let sender_status = self.pin_and_classify(&peer, now_unix)?;
                 Ok(IncomingItem::Message(DecryptedMessage {
+                    destinatari: 1,
                     sender: peer,
                     sender_status,
                     plaintext,
@@ -239,6 +248,7 @@ impl<K: Keyring> Session<K> {
                 self.current_peer
                     .insert(app_package.to_owned(), sender.clone());
                 Ok(IncomingItem::Message(DecryptedMessage {
+                    destinatari: 1,
                     sender,
                     sender_status,
                     plaintext,
@@ -256,6 +266,7 @@ impl<K: Keyring> Session<K> {
                 self.current_peer
                     .insert(app_package.to_owned(), sender.clone());
                 Ok(IncomingItem::Message(DecryptedMessage {
+                    destinatari: 1,
                     sender,
                     sender_status,
                     plaintext,
@@ -298,6 +309,7 @@ impl<K: Keyring> Session<K> {
                     .insert(app_package.to_owned(), sender.clone());
 
                 Ok(IncomingItem::Message(DecryptedMessage {
+                    destinatari: 1,
                     sender,
                     sender_status,
                     plaintext,
@@ -310,7 +322,22 @@ impl<K: Keyring> Session<K> {
             // esplicito e' meglio di un `unreachable!()`: se un blob di gruppo
             // arriva prima che la strada sia finita, si vuole un messaggio, non
             // un processo che muore.
-            ParsedBlob::Group(_) => Err(Error::Format("messaggio di gruppo: non ancora gestito")),
+            ParsedBlob::Group(parsed) => {
+                let (mittente, plaintext) = self.apri_di_gruppo(&parsed)?;
+                let sender_status = self.pin_and_classify(&mittente, now_unix)?;
+                // **Non si tocca il destinatario corrente**, e non e' una
+                // dimenticanza. La regola "decifrare stabilisce con chi si
+                // parla" vale fra due persone; qui l'altro capo e' un gruppo, e
+                // scegliere il solo mittente farebbe partire la risposta a lui
+                // in privato — dentro la chat dove tutti gli altri la
+                // aspettano. Il gruppo lo sceglie chi scrive, sopra di qui.
+                Ok(IncomingItem::Message(DecryptedMessage {
+                    destinatari: parsed.slot_count(),
+                    sender: mittente,
+                    sender_status,
+                    plaintext,
+                }))
+            }
             ParsedBlob::IdentityCard(card) => {
                 // Si fissa la chiave, e NIENTE ALTRO.
                 //
@@ -865,6 +892,63 @@ impl<K: Keyring> Session<K> {
             return Ok((mittente, plaintext, false));
         }
         Err(Error::Crypto)
+    }
+
+    /// Apre un messaggio di gruppo provando i contatti fissati.
+    ///
+    /// L'header porta la sola effimera, quindi chi ha scritto non e' scritto da
+    /// nessuna parte: come per i messaggi effimeri si prova, e come per quelli
+    /// **il mittente deve gia' essere fra i contatti**. Un gruppo da uno
+    /// sconosciuto non si apre, ed e' coerente: senza la sua identita' la
+    /// chiave dello slot non si ricava nemmeno.
+    ///
+    /// La propria identita' e' fra i candidati, in coda: e' cosi' che si
+    /// rilegge cio' che si e' scritto. In coda e non in testa perche' il caso
+    /// comune e' ricevere, non rileggere.
+    fn apri_di_gruppo(
+        &mut self,
+        parsed: &crate::format::ParsedGroup<'_>,
+    ) -> Result<(PublicKey, Plaintext)> {
+        for candidato in self.keyring.peers()? {
+            if let Ok(aperto) = baseline::open_group(&self.identity, &candidato, parsed) {
+                return Ok((candidato, aperto));
+            }
+        }
+        let mio = self.identity.public();
+        if let Ok(aperto) = baseline::open_group(&self.identity, &mio, parsed) {
+            return Ok((mio, aperto));
+        }
+        Err(Error::Crypto)
+    }
+
+    /// Cifra per piu' destinatari (decisione K).
+    ///
+    /// I destinatari li sceglie chi chiama, sempre e per intero: non esiste un
+    /// "gruppo corrente" che si stabilisca leggendo, come succede fra due
+    /// persone. Il motivo e' lo stesso per cui un allegato vuole la scelta
+    /// esplicita — un messaggio mandato al gruppo sbagliato non si ritira — con
+    /// in piu' che qui gli sbagliati sarebbero molti insieme.
+    ///
+    /// **Non ha forward secrecy**, per decisione: chi mostra il risultato deve
+    /// dirlo.
+    pub fn encrypt_group<R: RngCore + CryptoRng>(
+        &mut self,
+        destinatari: &[PublicKey],
+        plaintext: &[u8],
+        now_unix: i64,
+        rng: &mut R,
+    ) -> Result<String> {
+        // Si cifra solo verso contatti fissati: verso una chiave mai vista non
+        // si saprebbe nemmeno se e' la persona giusta, e in un gruppo l'errore
+        // si moltiplica.
+        for chiave in destinatari {
+            if self.keyring.get(chiave)?.is_none() {
+                return Err(Error::UnknownPeer);
+            }
+        }
+        let (header, slots, ciphertext) =
+            baseline::seal_group(&self.identity, destinatari, plaintext, now_unix, rng)?;
+        Ok(crate::format::serialize_group(&header, &slots, &ciphertext))
     }
 
     /// Chi ha chiesto il rogo. Si **decifra** per saperlo: senza, chiunque
@@ -1445,6 +1529,69 @@ mod tests {
     /// Copiare la propria chiave e riaprirla creava un contatto che e' se
     /// stessi: una rubrica che mente, e da li' in poi "per chi sto cifrando"
     /// non ha piu' una risposta affidabile.
+    /// Il giro completo di un gruppo, dal livello che lo usera' davvero.
+    #[test]
+    fn un_gruppo_si_apre_da_tutti_e_dice_quanti_erano() {
+        let mut alice = sessione(1);
+        let mut babbo = sessione(2);
+        let mut mamma = sessione(3);
+        let chiave_alice = alice.identity.public();
+        let chiave_babbo = babbo.identity.public();
+        let chiave_mamma = mamma.identity.public();
+
+        // Si conoscono: un gruppo verso chi non e' fissato non si manda, e da
+        // chi non e' fissato non si apre.
+        alice.keyring.tofu_pin(&chiave_babbo, 1).unwrap();
+        alice.keyring.tofu_pin(&chiave_mamma, 1).unwrap();
+        babbo.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        mamma.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+
+        let blob = alice
+            .encrypt_group(
+                &[chiave_babbo.clone(), chiave_mamma.clone()],
+                b"ci vediamo domenica",
+                50,
+                &mut rng(4),
+            )
+            .unwrap();
+
+        for chi in [&mut babbo, &mut mamma] {
+            let IncomingItem::Message(messaggio) =
+                chi.handle_incoming_text(WHATSAPP, &blob, 51).unwrap()
+            else {
+                panic!("atteso un messaggio")
+            };
+            assert_eq!(messaggio.plaintext.as_bytes(), b"ci vediamo domenica");
+            assert_eq!(messaggio.sender, chiave_alice);
+            // Tre slot: babbo, mamma e Alice. Serve a dire in interfaccia che
+            // un messaggio di gruppo non ha forward secrecy.
+            assert_eq!(messaggio.destinatari, 3);
+        }
+
+        // Alice rilegge il suo.
+        let IncomingItem::Message(riletto) =
+            alice.handle_incoming_text(WHATSAPP, &blob, 52).unwrap()
+        else {
+            panic!("atteso un messaggio")
+        };
+        assert_eq!(riletto.plaintext.as_bytes(), b"ci vediamo domenica");
+
+        // LA RIGA CHE CONTA: leggere un messaggio di gruppo NON sceglie il
+        // mittente come destinatario. Altrimenti la risposta partirebbe in
+        // privato a lui, dentro la chat dove tutti aspettano di leggerla.
+        assert_eq!(babbo.current_peer(WHATSAPP), None);
+    }
+
+    #[test]
+    fn un_gruppo_verso_uno_sconosciuto_non_parte() {
+        let mut alice = sessione(1);
+        let estraneo = sessione(9).identity.public();
+        assert!(matches!(
+            alice.encrypt_group(&[estraneo], b"ciao", 1, &mut rng(5)),
+            Err(Error::UnknownPeer)
+        ));
+    }
+
     /// SONDA (decisione J). L'epoca non deve ruotare: e' cio' che fa esistere la
     /// cronologia. Se vive nella stessa lista della catena di forward secrecy,
     /// leggere un messaggio la butta — e la conversazione diventa illeggibile
