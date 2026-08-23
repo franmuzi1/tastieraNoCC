@@ -15,7 +15,6 @@ hkdf = "0.12"
 sha2 = { version = "0.10", default-features = false }
 zeroize = { version = "1", features = ["derive"] }
 rand_core = "0.6"
-subtle = "2"
 thiserror = "2"
 # Argon2id per derivare la chiave del backup da una passphrase.
 # Serve una KDF LENTA: il backup esce dal dispositivo, quindi chi lo

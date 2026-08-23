@@ -1101,7 +1101,23 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeBurnConve
         let esito =
             with_session(|session| session.burn_conversation(&chiave, now_unix, &mut OsRng));
         match esito {
-            Ok(blob) => new_string(&env, &blob),
+            // Se la stringa non si riesce a costruire, il rogo E' GIA'
+            // AVVENUTO: le chiavi sono distrutte e non tornano. Restituire
+            // `null` — come si faceva — dice al chiamante "non riuscito", e
+            // l'utente si vede un errore su un'operazione irreversibile che ha
+            // funzionato: la conversazione e' bruciata e lui crede di no.
+            //
+            // Quindi tre esiti e non due: `null` = non bruciato, stringa vuota
+            // = bruciato ma senza richiesta da consegnare all'altro, stringa
+            // piena = tutto fatto. E' scritto anche sul lato Kotlin.
+            Ok(blob) => {
+                let costruita = new_string(&env, &blob);
+                if costruita.is_null() {
+                    new_string(&env, "")
+                } else {
+                    costruita
+                }
+            }
             Err(_) => nullo,
         }
     })

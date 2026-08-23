@@ -275,7 +275,6 @@ dependencies = [
  "hkdf",
  "rand_core",
  "sha2",
- "subtle",
  "thiserror 2.0.20",
  "x25519-dalek",
  "zeroize",

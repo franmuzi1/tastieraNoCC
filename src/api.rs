@@ -883,10 +883,21 @@ impl<K: Keyring> Session<K> {
             .sender_pub()
             .cloned()
             .ok_or(Error::Format("rogo senza mittente"))?;
+        // Si decifra PRIMA di guardare il keyring, e il fallito non si
+        // distingue: prima l'ordine era invertito e l'errore diverso —
+        // `UnknownPeer` per un mittente non fissato, `Crypto` per un blob che
+        // non si apre. Bastava spedire un rogo qualsiasi con una pubkey
+        // candidata per sapere dall'errore se quella persona e' fra i contatti
+        // della vittima, senza avere nessuna chiave. E' l'oracolo di
+        // appartenenza che il threat model vieta, e costava zero costruirlo.
+        //
+        // Decifrare prima non e' solo per l'oracolo: e' anche l'unica prova che
+        // chi chiede il rogo possieda davvero quella privata.
+        baseline::open_burn_static(&self.identity, &mittente, parsed)
+            .map_err(|_| Error::Crypto)?;
         if self.keyring.get(&mittente)?.is_none() {
-            return Err(Error::UnknownPeer);
+            return Err(Error::Crypto);
         }
-        baseline::open_burn_static(&self.identity, &mittente, parsed)?;
         Ok(mittente)
     }
 
