@@ -323,6 +323,15 @@ pub enum LabelOutcome {
 /// contatto che non risponde mai. 32 chiavi sono 1 KB per contatto.
 pub const MAX_PREKEY_MIE: usize = 32;
 
+/// Una riga di [`PrekeyStore::dump`]: contatto, la sua ultima prekey pubblica,
+/// le nostre private dalla piu' recente, la nostra epoca.
+pub type PrekeyRecord = (
+    PublicKey,
+    Option<PublicKey>,
+    Vec<[u8; KEY_LEN]>,
+    Option<[u8; KEY_LEN]>,
+);
+
 /// Lo stato per contatto della catena di forward secrecy.
 ///
 /// Sta nel core, che non fa I/O, perche' e' **struttura dati e basta**: chi la
@@ -339,6 +348,20 @@ pub struct PrekeyStore {
     loro: Vec<(PublicKey, PublicKey)>,
     /// Le nostre, private, dalla piu' recente. Azzerate quando cadono.
     mie: Vec<(PublicKey, Vec<Zeroizing<[u8; KEY_LEN]>>)>,
+    /// La nostra chiave d'epoca per contatto (decisione J). Privata.
+    ///
+    /// **Vive qui e non dentro `mie`, ed e' il difetto da cui nasce questo
+    /// campo.** Prima l'epoca era semplicemente la piu' recente delle `mie`:
+    /// due cose con regole opposte nello stesso posto. La catena e' fatta per
+    /// ruotare e per essere buttata — `push_my_prekey` inserisce in testa e
+    /// `drop_my_prekeys_older_than` tronca a ogni lettura — mentre l'epoca
+    /// esiste proprio perche' NON ruota: e' cio' che fa esistere la cronologia.
+    ///
+    /// Convivendo, leggere un messaggio a forward secrecy buttava l'epoca, e la
+    /// conversazione bruciabile diventava illeggibile **senza che nessuno
+    /// avesse bruciato** — con `Error::Crypto`, indistinguibile da un blob
+    /// rovinato. C'e' la sonda in `api.rs`.
+    epoche: Vec<(PublicKey, Zeroizing<[u8; KEY_LEN]>)>,
 }
 
 impl PrekeyStore {
@@ -401,20 +424,56 @@ impl PrekeyStore {
     /// Chi dimentica un contatto deve chiamarla: senza, le chiavi private
     /// temporanee verso quella persona resterebbero su disco dopo che l'utente
     /// ha chiesto di cancellarla.
+    /// La nostra epoca verso quel contatto, se ne esiste una.
+    pub fn my_epoch(&self, peer: &PublicKey) -> Option<[u8; KEY_LEN]> {
+        self.epoche.iter().find(|(p, _)| p == peer).map(|(_, k)| **k)
+    }
+
+    /// Ne tiene UNA sola per contatto: una seconda sarebbe una seconda
+    /// cronologia, e "quale delle due e' la conversazione" non e' una domanda
+    /// che questo sistema sappia rispondere. Sovrascrivere e' quindi giusto —
+    /// ma chi chiama deve farlo solo se non ce n'e' gia' una, altrimenti
+    /// l'epoca ruota e la cronologia si spezza lo stesso.
+    pub fn set_my_epoch(&mut self, peer: &PublicKey, secret: [u8; KEY_LEN]) {
+        match self.epoche.iter_mut().find(|(p, _)| p == peer) {
+            Some((_, k)) => *k = Zeroizing::new(secret),
+            None => self.epoche.push((peer.clone(), Zeroizing::new(secret))),
+        }
+    }
+
     pub fn forget(&mut self, peer: &PublicKey) {
         self.loro.retain(|(p, _)| p != peer);
         self.mie.retain(|(p, _)| p != peer);
+        // L'epoca se ne va con il resto: e' lo stato di conversazione, e
+        // dimenticare un contatto o bruciare la conversazione devono lasciare
+        // lo stesso vuoto. Se sopravvivesse qui, `burn` prometterebbe di
+        // rendere illeggibile cio' che resterebbe leggibile.
+        self.epoche.retain(|(p, _)| p != peer);
     }
 
     /// Per chi deve scrivere lo stato su disco.
-    pub fn dump(&self) -> Vec<(PublicKey, Option<PublicKey>, Vec<[u8; KEY_LEN]>)> {
-        let mut fuori: Vec<(PublicKey, Option<PublicKey>, Vec<[u8; KEY_LEN]>)> = Vec::new();
+    pub fn dump(&self) -> Vec<PrekeyRecord> {
+        let mut fuori: Vec<PrekeyRecord> = Vec::new();
         for (peer, loro) in &self.loro {
-            fuori.push((peer.clone(), Some(loro.clone()), self.my_prekeys(peer)));
+            fuori.push((
+                peer.clone(),
+                Some(loro.clone()),
+                self.my_prekeys(peer),
+                self.my_epoch(peer),
+            ));
         }
         for (peer, _) in &self.mie {
-            if !fuori.iter().any(|(p, _, _)| p == peer) {
-                fuori.push((peer.clone(), None, self.my_prekeys(peer)));
+            if !fuori.iter().any(|(p, _, _, _)| p == peer) {
+                fuori.push((peer.clone(), None, self.my_prekeys(peer), self.my_epoch(peer)));
+            }
+        }
+        // Un contatto puo' avere SOLO l'epoca: e' il caso di chi usa la
+        // modalita' bruciabile senza aver mai scambiato una prekey. Senza
+        // questo giro il suo stato non finirebbe su disco e la cronologia
+        // sparirebbe al riavvio.
+        for (peer, _) in &self.epoche {
+            if !fuori.iter().any(|(p, _, _, _)| p == peer) {
+                fuori.push((peer.clone(), None, Vec::new(), self.my_epoch(peer)));
             }
         }
         fuori
@@ -423,7 +482,16 @@ impl PrekeyStore {
     /// Per chi lo rilegge. Le nostre chiavi vanno passate dalla piu' recente,
     /// cioe' nell'ordine in cui [`Self::dump`] le ha restituite: l'ordine e'
     /// significativo, e' quello che decide cosa cade.
-    pub fn restore(&mut self, peer: &PublicKey, loro: Option<PublicKey>, mie: Vec<[u8; KEY_LEN]>) {
+    pub fn restore(
+        &mut self,
+        peer: &PublicKey,
+        loro: Option<PublicKey>,
+        mie: Vec<[u8; KEY_LEN]>,
+        epoca: Option<[u8; KEY_LEN]>,
+    ) {
+        if let Some(k) = epoca {
+            self.set_my_epoch(peer, k);
+        }
         if let Some(k) = loro {
             self.set_peer_prekey(peer, &k);
         }
@@ -485,6 +553,18 @@ pub trait Keyring {
 
     /// Aggiunge una nostra chiave temporanea, tenendo solo le ultime poche.
     fn push_my_prekey(&mut self, peer: &PublicKey, secret: [u8; KEY_LEN]) -> Result<()>;
+
+    /// La nostra chiave d'epoca verso quel contatto (decisione J), se c'e'.
+    ///
+    /// **Non e' una prekey e non sta nella loro lista**, per quanto si
+    /// assomiglino: la catena e' fatta per ruotare e per essere buttata,
+    /// l'epoca esiste perche' non ruota. Tenerle insieme faceva sparire la
+    /// cronologia alla prima lettura di un messaggio a forward secrecy.
+    fn my_epoch(&self, peer: &PublicKey) -> Result<Option<[u8; KEY_LEN]>>;
+
+    /// Fissa la nostra epoca verso quel contatto. Chi chiama deve farlo solo
+    /// quando non ce n'e' gia' una: sovrascriverla e' come non averla.
+    fn set_my_epoch(&mut self, peer: &PublicKey, secret: [u8; KEY_LEN]) -> Result<()>;
 
     /// Butta le nostre chiavi temporanee piu' vecchie di quella indicata.
     ///
@@ -611,8 +691,8 @@ mod tests {
         store.push_my_prekey(&peer(3), [30; KEY_LEN]);
 
         let mut riletto = PrekeyStore::default();
-        for (chi, loro, mie) in store.dump() {
-            riletto.restore(&chi, loro, mie);
+        for (chi, loro, mie, epoca) in store.dump() {
+            riletto.restore(&chi, loro, mie, epoca);
         }
 
         assert_eq!(riletto.peer_prekey(&peer(1)), Some(peer(50)));

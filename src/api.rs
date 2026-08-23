@@ -675,11 +675,17 @@ impl<K: Keyring> Session<K> {
         peer: &PublicKey,
         rng: &mut R,
     ) -> Result<keys::EphemeralSecret> {
-        if let Some(segreto) = self.keyring.my_prekeys(peer)?.first() {
-            return Ok(keys::EphemeralSecret::from_bytes(*segreto));
+        // Prima si prendeva `my_prekeys(peer).first()`, cioe' la piu' recente
+        // della CATENA. Due sbagli in una riga: l'epoca cambiava ogni volta che
+        // la catena avanzava — e l'epoca che cambia e' un'epoca che non c'e' —
+        // e leggere un messaggio a forward secrecy la buttava del tutto,
+        // rendendo illeggibile la conversazione bruciabile senza che nessuno
+        // avesse bruciato. La sonda e' `leggere_un_messaggio_non_brucia_l_epoca`.
+        if let Some(segreto) = self.keyring.my_epoch(peer)? {
+            return Ok(keys::EphemeralSecret::from_bytes(segreto));
         }
         let nuova = keys::EphemeralSecret::from_bytes(nuovo_segreto(rng));
-        self.keyring.push_my_prekey(peer, *nuova.to_bytes())?;
+        self.keyring.set_my_epoch(peer, *nuova.to_bytes())?;
         Ok(nuova)
     }
 
@@ -809,14 +815,31 @@ impl<K: Keyring> Session<K> {
             return Ok((mittente, plaintext, false));
         }
 
+        // La nostra epoca, che ora ha un posto suo e non e' piu' la piu' recente
+        // della catena. **Non si butta niente**: qui la cronologia deve
+        // restare, ed e' l'unica differenza operativa con la catena.
+        if let Some(segreto) = self.keyring.my_epoch(&mittente)? {
+            let mia = keys::EphemeralSecret::from_bytes(segreto);
+            if let Ok((sua_epoca, plaintext)) = baseline::open_epoch(&mia, &mittente, parsed) {
+                self.ricorda_prekey(&mittente, &sua_epoca)?;
+                return Ok((mittente, plaintext, false));
+            }
+        }
+
+        // Ripiego per lo stato salvato PRIMA che l'epoca avesse un posto suo,
+        // quando viveva dentro la catena. Senza, aggiornare l'app renderebbe
+        // illeggibili le conversazioni bruciabili gia' in corso — che e' lo
+        // stesso danno che questa correzione elimina, arrivato da un'altra
+        // parte. Non indovina quale prekey fosse l'epoca: le prova, e sono
+        // chiavi che esistono comunque. Si esaurisce da solo quando le vecchie
+        // prekey cadono.
         for segreto in self.keyring.my_prekeys(&mittente)? {
             let mia = keys::EphemeralSecret::from_bytes(segreto);
             let Ok((sua_epoca, plaintext)) = baseline::open_epoch(&mia, &mittente, parsed) else {
                 continue;
             };
-            // Si prende nota della sua chiave d'epoca, che e' come si risponde.
-            // **Non si butta niente**: qui la cronologia deve restare, ed e'
-            // l'unica differenza operativa con la catena.
+            // Si adotta come epoca: da qui in avanti sta nel posto giusto.
+            self.keyring.set_my_epoch(&mittente, segreto)?;
             self.ricorda_prekey(&mittente, &sua_epoca)?;
             return Ok((mittente, plaintext, false));
         }
@@ -835,6 +858,16 @@ impl<K: Keyring> Session<K> {
                 .sender_pub()
                 .cloned()
                 .ok_or(Error::Format("rogo senza mittente"))?;
+            // La nostra epoca, dal posto suo. Il ripiego sulla catena e' per
+            // lo stato salvato prima della separazione: senza, un rogo in
+            // arrivo dopo l'aggiornamento non si aprirebbe, e un rogo che non
+            // si apre e' una richiesta di distruzione che si perde in silenzio.
+            if let Some(segreto) = self.keyring.my_epoch(&mittente)? {
+                let mia = keys::EphemeralSecret::from_bytes(segreto);
+                if baseline::open_burn_epoch(&mia, &mittente, parsed).is_ok() {
+                    return Ok(mittente);
+                }
+            }
             for segreto in self.keyring.my_prekeys(&mittente)? {
                 let mia = keys::EphemeralSecret::from_bytes(segreto);
                 if baseline::open_burn_epoch(&mia, &mittente, parsed).is_ok() {
@@ -1145,6 +1178,15 @@ mod tests {
             Ok(self.prekey.my_prekeys(peer))
         }
 
+        fn my_epoch(&self, peer: &PublicKey) -> Result<Option<[u8; 32]>> {
+            Ok(self.prekey.my_epoch(peer))
+        }
+
+        fn set_my_epoch(&mut self, peer: &PublicKey, secret: [u8; 32]) -> Result<()> {
+            self.prekey.set_my_epoch(peer, secret);
+            Ok(())
+        }
+
         fn push_my_prekey(&mut self, peer: &PublicKey, secret: [u8; 32]) -> Result<()> {
             self.prekey.push_my_prekey(peer, secret);
             Ok(())
@@ -1371,6 +1413,55 @@ mod tests {
     /// Copiare la propria chiave e riaprirla creava un contatto che e' se
     /// stessi: una rubrica che mente, e da li' in poi "per chi sto cifrando"
     /// non ha piu' una risposta affidabile.
+    /// SONDA (decisione J). L'epoca non deve ruotare: e' cio' che fa esistere la
+    /// cronologia. Se vive nella stessa lista della catena di forward secrecy,
+    /// leggere un messaggio la butta — e la conversazione diventa illeggibile
+    /// senza che nessuno abbia bruciato.
+    #[test]
+    fn leggere_un_messaggio_non_brucia_l_epoca() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_bob = bob.identity.public();
+        let chiave_alice = alice.identity.public();
+        // Si conoscono gia': il primo contatto non e' cio' che si sta provando.
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+        bob.set_current_peer(WHATSAPP, &chiave_alice).unwrap();
+
+        // 1. Alice apre in modalita' bruciabile: nasce la sua epoca e la offre.
+        let apertura = alice
+            .encrypt_for_app_with(WHATSAPP, b"ciao", 10, &mut rng(1), false)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &apertura, 11).unwrap();
+
+        // 2. Bob risponde bruciabile, cifrando verso l'epoca di Alice.
+        let verso_epoca = bob
+            .encrypt_for_app_with(WHATSAPP, b"prima risposta", 12, &mut rng(2), false)
+            .unwrap();
+
+        // 3. Nel frattempo si scambiano un messaggio a forward secrecy piena.
+        let effimero = alice
+            .encrypt_for_app_with(WHATSAPP, b"effimero", 13, &mut rng(3), true)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &effimero, 14).unwrap();
+        let risposta_effimera = bob
+            .encrypt_for_app_with(WHATSAPP, b"risposta effimera", 15, &mut rng(4), true)
+            .unwrap();
+        alice
+            .handle_incoming_text(WHATSAPP, &risposta_effimera, 16)
+            .unwrap();
+
+        // 4. LA RIGA CHE CONTA. Nessuno ha bruciato niente: il messaggio
+        //    bruciabile di Bob deve ancora aprirsi.
+        let esito = alice.handle_incoming_text(WHATSAPP, &verso_epoca, 17);
+        assert!(
+            esito.is_ok(),
+            "l'epoca e' stata buttata leggendo un altro messaggio: {:?}",
+            esito.err(),
+        );
+    }
+
     #[test]
     fn la_propria_card_non_diventa_un_contatto() {
         let mut alice = sessione(1);

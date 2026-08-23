@@ -110,6 +110,15 @@ impl FileKeyring {
 }
 
 impl Keyring for FileKeyring {
+    fn my_epoch(&self, peer: &PublicKey) -> Result<Option<[u8; KEY_LEN]>> {
+        Ok(self.prekey.my_epoch(peer))
+    }
+
+    fn set_my_epoch(&mut self, peer: &PublicKey, secret: [u8; KEY_LEN]) -> Result<()> {
+        self.prekey.set_my_epoch(peer, secret);
+        Ok(())
+    }
+
     fn peers(&self) -> Result<Vec<PublicKey>> {
         Ok(self.peers.iter().map(|p| p.public.clone()).collect())
     }
@@ -303,7 +312,19 @@ pub fn save(path: &Path, secret: &[u8; KEY_LEN], keyring: &FileKeyring) -> io::R
     //
     // Qui c'e' materiale privato in chiaro, come il segreto d'identita' due
     // righe sopra: stesso file, stessi permessi, stessa avvertenza.
-    for (chi, loro, mie) in keyring.prekey.dump() {
+    for (chi, loro, mie, epoca) in keyring.prekey.dump() {
+        // Riga a parte e non una colonna in coda a `chain`: un lettore vecchio
+        // scarta le righe che non conosce, mentre una colonna in piu' su una
+        // riga nota la leggerebbe come una prekey — cioe' userebbe l'epoca come
+        // chiave della catena e la butterebbe alla prima lettura. Il difetto
+        // che questa riga esiste per riparare, reintrodotto dal formato.
+        if let Some(k) = epoca {
+            out.push_str("epoch ");
+            out.push_str(&encoding::encode(chi.as_bytes()));
+            out.push(' ');
+            out.push_str(&encoding::encode(&k));
+            out.push('\n');
+        }
         out.push_str("chain ");
         out.push_str(&encoding::encode(chi.as_bytes()));
         out.push(' ');
@@ -313,9 +334,9 @@ pub fn save(path: &Path, secret: &[u8; KEY_LEN], keyring: &FileKeyring) -> io::R
             // loro chiave: il trattino tiene la posizione della colonna.
             None => "-".to_owned(),
         });
-        for segreto in mie {
+        for segreto in mie.iter() {
             out.push(' ');
-            out.push_str(&encoding::encode(&segreto));
+            out.push_str(&encoding::encode(segreto));
         }
         out.push('\n');
     }
@@ -401,7 +422,21 @@ fn parse(text: &str) -> Option<State> {
                         Some(testo) => chiave(testo),
                     };
                     let mie = campi.filter_map(segreto_da).collect();
-                    keyring.prekey.restore(&chi, loro, mie);
+                    // L'epoca arriva dalla sua riga, che puo' venire prima o
+                    // dopo questa: qui non si tocca.
+                    keyring.prekey.restore(&chi, loro, mie, None);
+                }
+            }
+            // Riga introdotta quando l'epoca ha smesso di vivere dentro la
+            // catena. Uno stato scritto prima non ce l'ha, e riparte senza:
+            // il ripiego nel core la ritrova fra le prekey vecchie.
+            (Some("epoch"), Some(rest)) => {
+                let mut campi = rest.split(' ');
+                if let (Some(chi), Some(k)) = (
+                    campi.next().and_then(chiave),
+                    campi.next().and_then(segreto_da),
+                ) {
+                    keyring.prekey.set_my_epoch(&chi, k);
                 }
             }
             _ => {}

@@ -25,8 +25,12 @@ use keyboard_cipher_core::keys::{
 /// contatti di tutti a un aggiornamento, cioe' ri-fissare ogni chiave al
 /// prossimo messaggio — accettare in silenzio un eventuale MITM, che e'
 /// esattamente cio' che l'errore su blob corrotto serve a evitare.
-const STORAGE_VERSION: u8 = 2;
+const STORAGE_VERSION: u8 = 3;
 const STORAGE_VERSION_SENZA_CATENA: u8 = 1;
+/// La 2 aveva la catena ma non l'epoca: l'epoca viveva DENTRO la catena, ed e'
+/// il difetto che la 3 ripara. Si continua a leggerla, e quello stato riparte
+/// senza epoca — il ripiego in `api.rs` la ritrova fra le prekey vecchie.
+const STORAGE_VERSION_SENZA_EPOCA: u8 = 2;
 /// pubkey + first_seen(i64) + verified(u8) + lunghezza etichetta(u16)
 const RECORD_LEN: usize = KEY_LEN + 8 + 1 + 2;
 /// Un'etichetta e' un nome scelto dall'utente, non un campo libero di rete.
@@ -103,7 +107,7 @@ impl MemoryKeyring {
         let catena = self.prekey.dump();
         let quante = u32::try_from(catena.len()).unwrap_or(0);
         out.extend_from_slice(&quante.to_le_bytes());
-        for (chi, loro, mie) in catena.iter().take(quante as usize) {
+        for (chi, loro, mie, epoca) in catena.iter().take(quante as usize) {
             out.extend_from_slice(chi.as_bytes());
             match loro {
                 Some(k) => {
@@ -119,6 +123,15 @@ impl MemoryKeyring {
             for segreto in mie.iter().take(usize::from(quante_mie)) {
                 out.extend_from_slice(segreto);
             }
+            // L'epoca in coda al record, con il suo byte di presenza: un
+            // contatto puo' averla senza prekey e viceversa.
+            match epoca {
+                Some(k) => {
+                    out.push(1);
+                    out.extend_from_slice(k);
+                }
+                None => out.push(0),
+            }
         }
     }
 
@@ -131,7 +144,10 @@ impl MemoryKeyring {
     pub fn import(bytes: &[u8]) -> Result<Self> {
         let mut cursor = bytes.iter().copied();
         let version = cursor.next().ok_or(Error::Keyring)?;
-        if version != STORAGE_VERSION && version != STORAGE_VERSION_SENZA_CATENA {
+        if version != STORAGE_VERSION
+            && version != STORAGE_VERSION_SENZA_EPOCA
+            && version != STORAGE_VERSION_SENZA_CATENA
+        {
             return Err(Error::Keyring);
         }
 
@@ -182,7 +198,7 @@ impl MemoryKeyring {
             });
         }
         let mut prekey = PrekeyStore::default();
-        if version == STORAGE_VERSION {
+        if version == STORAGE_VERSION || version == STORAGE_VERSION_SENZA_EPOCA {
             let mut quante_bytes = [0u8; 4];
             for slot in quante_bytes.iter_mut() {
                 *slot = cursor.next().ok_or(Error::Keyring)?;
@@ -204,7 +220,17 @@ impl MemoryKeyring {
                 for _ in 0..quante_mie {
                     mie.push(prendi_chiave(&mut cursor)?);
                 }
-                prekey.restore(&chi, loro, mie);
+                // Solo dalla 3 in poi: nella 2 qui finiva gia' il record.
+                let epoca = if version == STORAGE_VERSION {
+                    match cursor.next().ok_or(Error::Keyring)? {
+                        0 => None,
+                        1 => Some(prendi_chiave(&mut cursor)?),
+                        _ => return Err(Error::Keyring),
+                    }
+                } else {
+                    None
+                };
+                prekey.restore(&chi, loro, mie, epoca);
             }
         }
         if cursor.next().is_some() {
@@ -316,6 +342,15 @@ impl Keyring for MemoryKeyring {
         Ok(self.prekey.my_prekeys(peer))
     }
 
+    fn my_epoch(&self, peer: &PublicKey) -> Result<Option<[u8; KEY_LEN]>> {
+        Ok(self.prekey.my_epoch(peer))
+    }
+
+    fn set_my_epoch(&mut self, peer: &PublicKey, secret: [u8; KEY_LEN]) -> Result<()> {
+        self.prekey.set_my_epoch(peer, secret);
+        Ok(())
+    }
+
     fn push_my_prekey(&mut self, peer: &PublicKey, secret: [u8; KEY_LEN]) -> Result<()> {
         self.prekey.push_my_prekey(peer, secret);
         Ok(())
@@ -397,6 +432,40 @@ mod tests {
 
         // E l'elenco deve restare utile: i nomi ci sono ancora.
         assert!(pubblico.windows(5).any(|f| f == b"Marco"));
+    }
+
+    /// L'epoca sopravvive al giro su disco, e uno stato scritto dalla versione
+    /// precedente si rilegge lo stesso.
+    #[test]
+    fn l_epoca_sopravvive_al_disco_e_la_2_si_rilegge() {
+        const EPOCA: [u8; KEY_LEN] = [0xEE; KEY_LEN];
+        const PREKEY: [u8; KEY_LEN] = [0x11; KEY_LEN];
+        let mut keyring = MemoryKeyring::new();
+        keyring.tofu_pin(&key(1), 100).unwrap();
+        keyring.push_my_prekey(&key(1), PREKEY).unwrap();
+        keyring.set_my_epoch(&key(1), EPOCA).unwrap();
+
+        let riletto = MemoryKeyring::import(&keyring.export()).unwrap();
+        assert_eq!(riletto.my_epoch(&key(1)).unwrap(), Some(EPOCA));
+        assert_eq!(riletto.my_prekeys(&key(1)).unwrap(), vec![PREKEY]);
+
+        // Un contatto con la sola epoca, senza prekey: e' il caso di chi usa la
+        // modalita' bruciabile e basta, e senza il giro apposta in `dump` il suo
+        // stato non finirebbe su disco.
+        let mut solo_epoca = MemoryKeyring::new();
+        solo_epoca.tofu_pin(&key(2), 100).unwrap();
+        solo_epoca.set_my_epoch(&key(2), EPOCA).unwrap();
+        let riletto = MemoryKeyring::import(&solo_epoca.export()).unwrap();
+        assert_eq!(riletto.my_epoch(&key(2)).unwrap(), Some(EPOCA));
+
+        // Formato 2: stesso blob con il byte di versione abbassato e l'epoca
+        // tolta dalla coda. Deve rileggersi, con epoca assente.
+        let completo = keyring.export();
+        let mut vecchio = completo[..completo.len() - 1 - KEY_LEN].to_vec();
+        vecchio[0] = STORAGE_VERSION_SENZA_EPOCA;
+        let riletto = MemoryKeyring::import(&vecchio).unwrap();
+        assert_eq!(riletto.my_epoch(&key(1)).unwrap(), None);
+        assert_eq!(riletto.my_prekeys(&key(1)).unwrap(), vec![PREKEY]);
     }
 
     #[test]

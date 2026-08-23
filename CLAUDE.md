@@ -259,6 +259,22 @@ Niente effimera: senza, la derivazione si puo' rifare, quindi il messaggio si
 rilegge anche da chi l'ha scritto. Segnalato da `PREKEY` **senza** `EPHEMERAL`,
 combinazione che il parser prima rifiutava — per una ragione che non vale piu'.
 
+**L'epoca ha un posto suo nel keyring, separato dalla catena** — e non e'
+un dettaglio di implementazione. All'inizio era "la piu' recente delle mie
+prekey": due cose con regole opposte nello stesso contenitore. La catena e'
+fatta per ruotare e per essere buttata (`push_my_prekey` inserisce in testa,
+`drop_my_prekeys_older_than` tronca a ogni lettura), l'epoca esiste **perche'
+non ruota**. Convivendo, leggere un messaggio a forward secrecy buttava l'epoca:
+la conversazione bruciabile diventava illeggibile senza che nessuno avesse
+bruciato, con `Error::Crypto` — indistinguibile da un blob rovinato. C'e' la
+sonda: `leggere_un_messaggio_non_brucia_l_epoca`.
+
+Da qui due regole. Chi legge un messaggio a epoca guarda `my_epoch`, non la
+catena; e il formato su disco tiene l'epoca in un campo suo (versione 3 su
+Android, riga `epoch` nella CLI), mai come una colonna in piu' su una riga della
+catena — un lettore che la scambiasse per una prekey la butterebbe alla prima
+lettura, reintroducendo il difetto dal formato.
+
 **Il bit `EPOCH_OFFER`**, quarto flag: "il cifrato porta la mia chiave d'epoca".
 Distinto da `PREKEY`, che dice l'opposto — *usare* quella dell'altro. Servono
 separati perche' il primo messaggio porta la propria senza poter usare la sua:
