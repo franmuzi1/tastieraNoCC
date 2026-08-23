@@ -331,7 +331,7 @@ impl App {
                 self.ricarica();
                 self.avviso = None;
             }
-            Ok(IncomingItem::Burned { peer }) => {
+            Ok(IncomingItem::Burned { peer, sent_at_unix }) => {
                 let nome = self
                     .contatti
                     .iter()
@@ -342,10 +342,17 @@ impl App {
                 self.letto = None;
                 self.incollato.clear();
                 self.ricarica();
+                // La data della richiesta sta nell'avviso, e non e' un
+                // dettaglio: un rogo composto mesi fa e arrivato adesso e' un
+                // blob ripubblicato da qualcuno che l'aveva visto passare, non
+                // una richiesta nuova. Rifiutarlo per la data e' vietato dalla
+                // decisione C; mostrarla e' l'unica difesa che resta.
                 self.avviso = Some((
                     format!(
                         "Conversazione con {nome} bruciata: non si rilegge piu'. \
-                         Il contatto resta, il prossimo messaggio riparte da capo."
+                         Richiesta composta il {}. \
+                         Il contatto resta, il prossimo messaggio riparte da capo.",
+                        data(sent_at_unix)
                     ),
                     false,
                 ));

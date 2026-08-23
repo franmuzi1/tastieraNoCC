@@ -787,8 +787,25 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
                 }
                 code::OK
             }
-            IncomingItem::Burned { peer } => {
+            IncomingItem::Burned { peer, sent_at_unix } => {
                 if !set_int("kind", code::ITEM_BURNED) || !set_int("verified", 0) {
+                    return code::INTERNAL;
+                }
+                // La data della richiesta, che prima si perdeva qui. Un blob di
+                // rogo resta valido per sempre: chi l'ha visto passare in chat
+                // puo' reincollarlo mesi dopo e distruggere la conversazione
+                // ripartita nel frattempo. Rifiutarlo per la data e' vietato
+                // dalla decisione C — un timestamp non e' verificabile — ma
+                // mostrarla rende il replay visibile a chi legge.
+                if env
+                    .set_field(
+                        &result,
+                        "sentAtUnix",
+                        "J",
+                        jni::objects::JValue::Long(sent_at_unix),
+                    )
+                    .is_err()
+                {
                     return code::INTERNAL;
                 }
                 let fingerprint = keyboard_cipher_core::keys::Fingerprint::of(&peer);

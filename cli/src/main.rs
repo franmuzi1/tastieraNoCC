@@ -328,11 +328,15 @@ fn cmd_decrypt(args: &[String]) -> Result<(), String> {
         .handle_incoming_text(APP, &input, now_unix())
         .map_err(|e| format!("{e}"))?;
     match item {
-        IncomingItem::Burned { peer } => {
+        IncomingItem::Burned { peer, sent_at_unix } => {
             persist(&secret, &session)?;
             let chi = state_label(&session, &peer);
             println!("bruciata:  la conversazione con {chi} non si rilegge piu'.");
             println!("chiave:    {}", Fingerprint::of(&peer).display());
+            // La data della richiesta. Va letta: un rogo che arriva mesi dopo
+            // essere stato composto e' un blob ripubblicato, non una richiesta
+            // nuova — e a quel punto la conversazione e' gia' distrutta.
+            println!("richiesta: composta a {sent_at_unix} (unix)");
             println!();
             println!("Il contatto resta. Il prossimo messaggio riparte da capo.");
         }

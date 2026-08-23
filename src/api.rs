@@ -114,7 +114,20 @@ pub enum IncomingItem {
     /// leggeva quella conversazione non esistono piu' da questo lato.
     ///
     /// Non c'e' testo da mostrare — e' un gesto, non un messaggio.
-    Burned { peer: PublicKey },
+    /// Un rogo ricevuto. `sent_at_unix` e' l'ora che il MITTENTE ha scritto
+    /// dentro il cifrato: autenticata, non verificabile, e va **mostrata** —
+    /// mai usata per decidere da soli (decisione C).
+    ///
+    /// Portarla fin qui serve a una cosa precisa: un blob di rogo resta valido
+    /// per sempre, quindi chi l'ha visto passare in chat puo' reincollarlo piu'
+    /// tardi e distruggere la conversazione che nel frattempo era ripartita.
+    /// Non lo si puo' impedire senza rifiutare per data, che la decisione C
+    /// vieta. Lo si puo' rendere VISIBILE: una richiesta di agosto che arriva a
+    /// novembre si vede, se la data e' a schermo. Prima non lo era.
+    Burned {
+        peer: PublicKey,
+        sent_at_unix: i64,
+    },
     /// Una presentazione: nessun messaggio da mostrare, solo una chiave da
     /// fissare. La UI mostra il fingerprint e l'esito del pin.
     /// La propria card, riaperta. Non si fissa niente: vedi il perche' nel
@@ -194,9 +207,9 @@ impl<K: Keyring> Session<K> {
             // Un rogo si riconosce dal kind, che sta nell'AAD: non e' un
             // messaggio travestito, e un messaggio non puo' diventarlo.
             ParsedBlob::Burn(parsed) => {
-                let peer = self.mittente_di_un_rogo(&parsed)?;
+                let (peer, sent_at_unix) = self.mittente_di_un_rogo(&parsed)?;
                 self.keyring.burn_conversation(&peer)?;
-                Ok(IncomingItem::Burned { peer })
+                Ok(IncomingItem::Burned { peer, sent_at_unix })
             }
             ParsedBlob::Message(parsed)
                 if parsed.header.origin.uses_epoch()
@@ -851,7 +864,7 @@ impl<K: Keyring> Session<K> {
     fn mittente_di_un_rogo(
         &mut self,
         parsed: &crate::format::ParsedEnvelope<'_>,
-    ) -> Result<PublicKey> {
+    ) -> Result<(PublicKey, i64)> {
         if parsed.header.origin.uses_epoch() {
             let mittente = parsed
                 .header
@@ -864,14 +877,14 @@ impl<K: Keyring> Session<K> {
             // si apre e' una richiesta di distruzione che si perde in silenzio.
             if let Some(segreto) = self.keyring.my_epoch(&mittente)? {
                 let mia = keys::EphemeralSecret::from_bytes(segreto);
-                if baseline::open_burn_epoch(&mia, &mittente, parsed).is_ok() {
-                    return Ok(mittente);
+                if let Ok((_, aperto)) = baseline::open_burn_epoch(&mia, &mittente, parsed) {
+                    return Ok((mittente, aperto.sent_at_unix()));
                 }
             }
             for segreto in self.keyring.my_prekeys(&mittente)? {
                 let mia = keys::EphemeralSecret::from_bytes(segreto);
-                if baseline::open_burn_epoch(&mia, &mittente, parsed).is_ok() {
-                    return Ok(mittente);
+                if let Ok((_, aperto)) = baseline::open_burn_epoch(&mia, &mittente, parsed) {
+                    return Ok((mittente, aperto.sent_at_unix()));
                 }
             }
             return Err(Error::Crypto);
@@ -893,12 +906,12 @@ impl<K: Keyring> Session<K> {
         //
         // Decifrare prima non e' solo per l'oracolo: e' anche l'unica prova che
         // chi chiede il rogo possieda davvero quella privata.
-        baseline::open_burn_static(&self.identity, &mittente, parsed)
+        let (_, aperto) = baseline::open_burn_static(&self.identity, &mittente, parsed)
             .map_err(|_| Error::Crypto)?;
         if self.keyring.get(&mittente)?.is_none() {
             return Err(Error::Crypto);
         }
-        Ok(mittente)
+        Ok((mittente, aperto.sent_at_unix()))
     }
 
     /// [`Self::prova_i_contatti`] per gli allegati.
@@ -1936,7 +1949,7 @@ mod tests {
 
         // Bob riceve la richiesta e la onora: sparisce anche dal suo lato.
         let esito = bob.handle_incoming_text(WHATSAPP, &richiesta, 17).unwrap();
-        let IncomingItem::Burned { peer } = esito else {
+        let IncomingItem::Burned { peer, .. } = esito else {
             panic!("doveva essere un rogo")
         };
         assert_eq!(peer, chiave_alice);

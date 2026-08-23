@@ -282,6 +282,25 @@ non ce l'ha ancora. Senza questa distinzione quel messaggio sarebbe costretto a
 essere effimero, cioe' non rileggibile da chi l'ha scritto — il caso che questa
 decisione esiste per rendere possibile.
 
+**Il rogo si puo' ripubblicare, e non si puo' impedire.** Un blob resta valido
+per sempre: chi l'ha visto passare in chat puo' reincollarlo mesi dopo e
+distruggere la conversazione che nel frattempo era ripartita. Non e' un difetto
+del rogo, e' il replay del threat model applicato all'unica operazione
+**distruttiva e ripetibile** che esiste qui.
+
+Rifiutarlo per la data e' vietato dalla decisione C, e la ragione vale identica:
+il timestamp e' autenticato ma non verificabile, e un orologio sbagliato non e'
+un attacco. Resta la difesa che la C ha scelto — renderlo **visibile a un
+umano** — e per il rogo mancava proprio: `sent_at_unix` si perdeva dentro
+`mittente_di_un_rogo`. Ora arriva al chiamante, e tutte e tre le interfacce
+mostrano quando la richiesta e' stata composta.
+
+Il limite va guardato in faccia: quando quella data si legge, la conversazione
+e' gia' distrutta. Si scopre che qualcuno ha ripubblicato, non lo si evita. La
+via per evitarlo davvero esiste — ricordare per contatto l'ora dell'ultimo rogo
+onorato e ignorare i piu' vecchi — ma e' stato per contatto e un altro cambio di
+formato su disco, e non e' stata presa.
+
 **Il rogo** e' un `kind` nuovo (`Burn`), non un messaggio con un marcatore nel
 testo: `kind` sta nell'AAD, quindi un rogo non e' un messaggio travestito ne'
 viceversa. Non porta testo. Chi lo riceve lo **decifra** per sapere chi l'ha
