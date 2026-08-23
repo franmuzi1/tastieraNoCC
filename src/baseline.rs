@@ -556,6 +556,204 @@ fn apri_avanti(
 /// Concatenati e non sommati o mescolati: HKDF e' fatto per prendere materiale
 /// grezzo di lunghezza qualunque, e qualsiasi combinazione inventata qui
 /// sarebbe una primitiva nuova senza motivo.
+/// Il nonce di uno slot: quello dell'envelope con l'indice mescolato dentro.
+///
+/// Con chiavi diverse lo stesso nonce non sarebbe un riuso, e in teoria si
+/// potrebbe usare quello dell'envelope per tutti. Ma le chiavi sono diverse
+/// **se i destinatari sono diversi**, e un destinatario ripetuto per sbaglio —
+/// due volte la stessa persona nella selezione — darebbe due slot con la stessa
+/// chiave e lo stesso nonce, che con XChaCha20Poly1305 e' la rovina completa.
+/// Un byte di differenza rende quell'errore innocuo invece che catastrofico.
+fn nonce_slot(nonce: &[u8; NONCE_LEN], indice: u8) -> [u8; NONCE_LEN] {
+    let mut fuori = *nonce;
+    if let Some(ultimo) = fuori.last_mut() {
+        *ultimo ^= indice.wrapping_add(1);
+    }
+    fuori
+}
+
+/// Cifra per piu' destinatari (decisione K).
+///
+/// Il testo si cifra **una volta sola** con una chiave di contenuto casuale;
+/// ogni destinatario riceve quella chiave dentro uno slot da 48 byte, chiuso
+/// verso la sua identita'. Chi apre prova gli slot uno per uno: non esistono
+/// identificatori per slot, per non rendere verificabile l'appartenenza al
+/// gruppo a chi guarda da fuori.
+///
+/// **Il mittente e' sempre nella lista**, e non e' cortesia: l'effimera si
+/// butta dopo l'invio, quindi senza uno slot suo non potrebbe rileggere cio'
+/// che ha scritto — in un formato che per scelta NON ha forward secrecy, cioe'
+/// dove la cronologia esiste apposta, sarebbe incoerente.
+///
+/// Restituisce header, blocco degli slot gia' mescolato, e ciphertext.
+pub fn seal_group<R: RngCore + CryptoRng>(
+    sender: &Identity,
+    destinatari: &[PublicKey],
+    plaintext: &[u8],
+    now_unix: i64,
+    rng: &mut R,
+) -> Result<(Header, Vec<u8>, Vec<u8>)> {
+    if destinatari.is_empty() {
+        return Err(Error::Format("un gruppo senza destinatari"));
+    }
+    // Il mittente in coda, e i doppioni via: la stessa persona scelta due volte
+    // e' un errore di chi seleziona, non un secondo destinatario, e due slot
+    // identici sprecherebbero spazio senza aggiungere niente.
+    let mut lista: Vec<PublicKey> = Vec::with_capacity(destinatari.len().saturating_add(1));
+    for chiave in destinatari.iter().chain(std::iter::once(&sender.public())) {
+        if !lista.iter().any(|k| k == chiave) {
+            lista.push(chiave.clone());
+        }
+    }
+    if lista.len() > format::MAX_SLOT {
+        return Err(Error::Format("troppi destinatari"));
+    }
+
+    // Mescolare: la posizione di uno slot non deve dire niente su chi c'e'
+    // dentro, e senza questo il mittente sarebbe sempre l'ultimo.
+    // Fisher-Yates. `checked_rem` e non `%`: il divisore qui non puo' essere
+    // zero, ma il progetto vieta l'aritmetica che potrebbe panicare e la regola
+    // vale anche quando si sa che non succede — sapere non si compila.
+    //
+    // Il modulo introduce una minima distorsione sulla distribuzione. Per nove
+    // posizioni e' irrilevante, e soprattutto qui non si sta scegliendo una
+    // chiave: si sta decidendo l'ordine degli slot, che serve a non far
+    // capire chi c'e' dentro dalla posizione.
+    for i in (1..lista.len()).rev() {
+        let j = usize::try_from(rng.next_u32())
+            .unwrap_or(0)
+            .checked_rem(i.saturating_add(1))
+            .unwrap_or(0);
+        lista.swap(i, j);
+    }
+
+    let effimera = Ephemeral::generate(rng)?;
+    let mut nonce = [0u8; NONCE_LEN];
+    rng.fill_bytes(&mut nonce);
+    let header = Header {
+        tier: Tier::Baseline,
+        origin: Origin::Effimera(effimera.public()),
+        nonce,
+    };
+    let n_slot = u8::try_from(lista.len()).map_err(|_| Error::Format("troppi destinatari"))?;
+
+    let mut chiave_contenuto = Zeroizing::new([0u8; AEAD_KEY_LEN]);
+    rng.fill_bytes(chiave_contenuto.as_mut());
+
+    // Il payload, cifrato una volta sola.
+    let aad_payload = format::build_group_aad(Kind::Message, &header, n_slot, None);
+    let mut inner = Zeroizing::new(Vec::with_capacity(
+        TIMESTAMP_LEN.saturating_add(plaintext.len()),
+    ));
+    inner.extend_from_slice(&now_unix.to_le_bytes());
+    inner.extend_from_slice(plaintext);
+    let ciphertext = XChaCha20Poly1305::new((&*chiave_contenuto).into())
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &inner,
+                aad: &aad_payload,
+            },
+        )
+        .map_err(|_| Error::Crypto)?;
+
+    // Gli slot.
+    let mut slots = Vec::with_capacity(lista.len().saturating_mul(format::SLOT_LEN));
+    for (i, destinatario) in lista.iter().enumerate() {
+        let indice = u8::try_from(i).map_err(|_| Error::Format("troppi destinatari"))?;
+        let aad = format::build_group_aad(Kind::Message, &header, n_slot, Some(indice));
+        let nonce_i = nonce_slot(&nonce, indice);
+        let chiave = derive_ephemeral_key(
+            &*effimera.diffie_hellman(destinatario)?,
+            &*sender.diffie_hellman(destinatario)?,
+            &nonce_i,
+            &aad,
+            destinatario,
+        )?;
+        let slot = XChaCha20Poly1305::new((&*chiave).into())
+            .encrypt(
+                XNonce::from_slice(&nonce_i),
+                Payload {
+                    msg: chiave_contenuto.as_ref(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::Crypto)?;
+        if slot.len() != format::SLOT_LEN {
+            return Err(Error::Crypto);
+        }
+        slots.extend_from_slice(&slot);
+    }
+
+    Ok((header, slots, ciphertext))
+}
+
+/// Apre un messaggio di gruppo provando `mittente` come autore.
+///
+/// L'header porta solo l'effimera, quindi chi ha scritto non e' scritto da
+/// nessuna parte: come per i messaggi effimeri, chi legge prova i propri
+/// contatti. Vale anche per rileggere cio' che si e' scritto: li' `mittente`
+/// e' la propria chiave.
+pub fn open_group(
+    recipient: &Identity,
+    mittente: &PublicKey,
+    parsed: &format::ParsedGroup<'_>,
+) -> Result<Plaintext> {
+    if parsed.header.tier != Tier::Baseline {
+        return Err(Error::TierUnsupported);
+    }
+    let Origin::Effimera(effimera) = &parsed.header.origin else {
+        return Err(Error::Crypto);
+    };
+    let n_slot = u8::try_from(parsed.slot_count()).map_err(|_| Error::Crypto)?;
+
+    let dh_effimero = recipient.diffie_hellman(effimera)?;
+    let dh_statico = recipient.diffie_hellman(mittente)?;
+    let mio = recipient.public();
+
+    for i in 0..parsed.slot_count() {
+        let Some(slot) = parsed.slot(i) else { continue };
+        let indice = u8::try_from(i).map_err(|_| Error::Crypto)?;
+        let aad = format::build_group_aad(Kind::Message, &parsed.header, n_slot, Some(indice));
+        let nonce_i = nonce_slot(&parsed.header.nonce, indice);
+        let chiave = derive_ephemeral_key(&dh_effimero, &dh_statico, &nonce_i, &aad, &mio)?;
+        let Ok(contenuto) = XChaCha20Poly1305::new((&*chiave).into()).decrypt(
+            XNonce::from_slice(&nonce_i),
+            Payload {
+                msg: slot,
+                aad: &aad,
+            },
+        ) else {
+            // Non e' il nostro slot: si passa al prossimo. E' il costo che
+            // paghiamo per non avere identificatori per slot, ed e' solo
+            // simmetrico — i due X25519 si fanno una volta sola, fuori dal
+            // ciclo.
+            continue;
+        };
+        let contenuto = Zeroizing::new(contenuto);
+        if contenuto.len() != AEAD_KEY_LEN {
+            return Err(Error::Crypto);
+        }
+        let mut chiave_contenuto = Zeroizing::new([0u8; AEAD_KEY_LEN]);
+        chiave_contenuto.copy_from_slice(&contenuto);
+
+        let aad_payload = format::build_group_aad(Kind::Message, &parsed.header, n_slot, None);
+        let inner = Zeroizing::new(
+            XChaCha20Poly1305::new((&*chiave_contenuto).into())
+                .decrypt(
+                    XNonce::from_slice(&parsed.header.nonce),
+                    Payload {
+                        msg: parsed.ciphertext,
+                        aad: &aad_payload,
+                    },
+                )
+                .map_err(|_| Error::Crypto)?,
+        );
+        return stacca_timestamp(&inner);
+    }
+    Err(Error::Crypto)
+}
+
 fn derive_ephemeral_key(
     dh_effimero: &[u8; 32],
     dh_statico: &[u8; 32],
@@ -1152,6 +1350,159 @@ mod tests {
 
     fn identita(seed: u8) -> Identity {
         Identity::from_secret_bytes([seed; 32]).unwrap()
+    }
+
+    // ====================================================================
+    // Messaggio di gruppo (decisione K)
+    // ====================================================================
+
+    fn gruppo(
+        mittente: &Identity,
+        destinatari: &[PublicKey],
+        testo: &[u8],
+        seme: u8,
+    ) -> String {
+        let (header, slots, ciphertext) =
+            seal_group(mittente, destinatari, testo, 1_700_000_000, &mut rng(seme)).unwrap();
+        format::serialize_group(&header, &slots, &ciphertext)
+    }
+
+    fn apri_gruppo(blob: &str, chi: &Identity, mittente: &PublicKey) -> Result<Plaintext> {
+        let mut buf = Vec::new();
+        let ParsedBlob::Group(parsed) = format::parse(blob, &mut buf)? else {
+            panic!("atteso un gruppo")
+        };
+        open_group(chi, mittente, &parsed)
+    }
+
+    #[test]
+    fn tutti_i_destinatari_aprono_e_gli_altri_no() {
+        let alice = identita(1);
+        let babbo = identita(2);
+        let mamma = identita(3);
+        let fratello = identita(4);
+        let estraneo = identita(9);
+
+        let blob = gruppo(
+            &alice,
+            &[babbo.public(), mamma.public(), fratello.public()],
+            b"ci vediamo domenica",
+            7,
+        );
+
+        for chi in [&babbo, &mamma, &fratello] {
+            let aperto = apri_gruppo(&blob, chi, &alice.public()).unwrap();
+            assert_eq!(aperto.as_bytes(), b"ci vediamo domenica");
+        }
+
+        // Alice rilegge cio' che ha scritto: e' il senso dello slot suo, e
+        // senza sarebbe un messaggio illeggibile a chi l'ha mandato.
+        let riletto = apri_gruppo(&blob, &alice, &alice.public()).unwrap();
+        assert_eq!(riletto.as_bytes(), b"ci vediamo domenica");
+
+        // Chi non e' nel gruppo non entra, nemmeno sapendo chi ha scritto.
+        assert!(apri_gruppo(&blob, &estraneo, &alice.public()).is_err());
+        // E un destinatario che sbaglia mittente non entra: la chiave dipende
+        // anche dall'identita' di chi ha scritto.
+        assert!(apri_gruppo(&blob, &babbo, &mamma.public()).is_err());
+    }
+
+    /// L'indice nell'AAD serve a questo: uno slot spostato aprirebbe lo stesso,
+    /// perche' la chiave non dipende dalla posizione.
+    #[test]
+    fn riordinare_gli_slot_rompe_il_messaggio() {
+        let alice = identita(1);
+        let babbo = identita(2);
+        let mamma = identita(3);
+        let blob = gruppo(&alice, &[babbo.public(), mamma.public()], b"ciao", 8);
+
+        let payload = blob.strip_prefix(SENTINEL).unwrap();
+        let mut corpo = crate::encoding::decode(payload).unwrap();
+        // Header: versione, kind, tier, flags, chiave(32), nonce(24), n_slot.
+        let inizio = 4 + KEY_LEN + NONCE_LEN + 1;
+        let (primo, secondo) = (inizio, inizio + format::SLOT_LEN);
+        for i in 0..format::SLOT_LEN {
+            corpo.swap(primo + i, secondo + i);
+        }
+        let manomesso = format!("{SENTINEL}{}", crate::encoding::encode(&corpo));
+
+        assert!(
+            apri_gruppo(&manomesso, &babbo, &alice.public()).is_err(),
+            "uno slot spostato non deve aprirsi",
+        );
+    }
+
+    /// Il conteggio nell'AAD serve a questo: togliere via un destinatario non
+    /// deve poter far sembrare il blob nato senza di lui.
+    #[test]
+    fn togliere_uno_slot_rompe_il_messaggio() {
+        let alice = identita(1);
+        let babbo = identita(2);
+        let mamma = identita(3);
+        let blob = gruppo(&alice, &[babbo.public(), mamma.public()], b"ciao", 9);
+
+        let payload = blob.strip_prefix(SENTINEL).unwrap();
+        let mut corpo = crate::encoding::decode(payload).unwrap();
+        let posizione_conteggio = 4 + KEY_LEN + NONCE_LEN;
+        let inizio = posizione_conteggio + 1;
+        // Via l'ultimo slot, e il conteggio abbassato di conseguenza: la forma
+        // resta valida, cambia solo chi puo' leggere.
+        let n = corpo[posizione_conteggio];
+        corpo[posizione_conteggio] = n - 1;
+        let taglio = inizio + usize::from(n - 1) * format::SLOT_LEN;
+        corpo.drain(taglio..taglio + format::SLOT_LEN);
+        let manomesso = format!("{SENTINEL}{}", crate::encoding::encode(&corpo));
+
+        // Nessuno dei rimasti deve poterlo aprire: l'AAD del payload lega il
+        // conteggio, quindi il testo non si decifra piu' per nessuno.
+        assert!(apri_gruppo(&manomesso, &babbo, &alice.public()).is_err());
+        assert!(apri_gruppo(&manomesso, &mamma, &alice.public()).is_err());
+    }
+
+    #[test]
+    fn un_gruppo_non_e_un_messaggio_e_viceversa() {
+        let alice = identita(1);
+        let babbo = identita(2);
+
+        // Un gruppo non si legge come messaggio a due: sono versioni diverse,
+        // e il parser lo dice PRIMA di qualunque tentativo di decifratura.
+        let blob = gruppo(&alice, &[babbo.public()], b"ciao", 10);
+        let mut buf = Vec::new();
+        assert!(matches!(
+            format::parse(&blob, &mut buf).unwrap(),
+            ParsedBlob::Group(_)
+        ));
+
+        // E un messaggio a due non si legge come gruppo.
+        let normale = seal(&alice, &babbo.public(), b"ciao", 1, &mut rng(11)).unwrap();
+        let mut buf = Vec::new();
+        assert!(matches!(
+            format::parse(&normale, &mut buf).unwrap(),
+            ParsedBlob::Message(_)
+        ));
+    }
+
+    #[test]
+    fn il_tetto_e_i_doppioni() {
+        let alice = identita(1);
+        let babbo = identita(2);
+
+        // Lo stesso destinatario due volte e' un solo slot: e' un errore di chi
+        // seleziona, non un secondo destinatario.
+        let blob = gruppo(&alice, &[babbo.public(), babbo.public()], b"ciao", 12);
+        let mut buf = Vec::new();
+        let ParsedBlob::Group(parsed) = format::parse(&blob, &mut buf).unwrap() else {
+            panic!()
+        };
+        assert_eq!(parsed.slot_count(), 2, "babbo e alice, non babbo due volte");
+
+        // Oltre il tetto si rifiuta, e con un errore di formato: non e' un
+        // fallimento crittografico, e' una richiesta che non si puo' servire.
+        let troppi: Vec<PublicKey> = (10..20u8).map(|s| identita(s).public()).collect();
+        assert!(seal_group(&alice, &troppi, b"ciao", 1, &mut rng(13)).is_err());
+
+        // E un gruppo senza nessuno non e' un gruppo.
+        assert!(seal_group(&alice, &[], b"ciao", 1, &mut rng(14)).is_err());
     }
 
     /// I due schemi che derivano la STESSA chiave non devono essere

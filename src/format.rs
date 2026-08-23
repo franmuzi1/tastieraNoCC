@@ -37,6 +37,19 @@ use crate::keys::{PublicKey, KEY_LEN};
 /// non si modifica mai: si aggiunge la 2.
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// Il messaggio di gruppo (decisione K). **Versione e non `kind` nuovo, e non un
+/// bit di flag**: un'installazione vecchia deve dire "aggiorna l'app", non
+/// "messaggio corrotto", e solo il byte di versione produce
+/// `UnsupportedVersion` prima di qualunque altro controllo.
+pub const GROUP_VERSION: u8 = 2;
+
+/// Chiave di contenuto incapsulata (32) piu' il tag (16).
+pub const SLOT_LEN: usize = KEY_LEN + TAG_LEN;
+
+/// Otto destinatari piu' lo slot del mittente, che serve a rileggere cio' che
+/// si e' scritto: l'effimera si butta dopo l'invio.
+pub const MAX_SLOT: usize = 9;
+
 /// Prefisso di riconoscimento, in chiaro per forza: serve a capire che un
 /// testo qualsiasi della clipboard e' un nostro blob PRIMA di decifrarlo.
 ///
@@ -386,6 +399,33 @@ pub enum ParsedBlob<'a> {
     /// identico a quello di un messaggio: cambia solo `kind`, che sta nell'AAD
     /// e quindi non e' scambiabile con un messaggio normale.
     Burn(ParsedEnvelope<'a>),
+    /// Un messaggio di gruppo (decisione K, `version = 2`).
+    Group(ParsedGroup<'a>),
+}
+
+/// Un messaggio di gruppo parsato.
+///
+/// Gli slot restano un blocco di byte e non un `Vec` di strutture: chi apre li
+/// prova uno per uno e non ha niente da estrarre finche' uno non funziona.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ParsedGroup<'a> {
+    pub header: Header,
+    /// `n * SLOT_LEN` byte. Il conteggio si ricava dalla lunghezza.
+    pub slots: &'a [u8],
+    /// Include il tag Poly1305 in coda.
+    pub ciphertext: &'a [u8],
+}
+
+impl ParsedGroup<'_> {
+    pub fn slot_count(&self) -> usize {
+        self.slots.len() / SLOT_LEN
+    }
+
+    pub fn slot(&self, i: usize) -> Option<&[u8]> {
+        let inizio = i.checked_mul(SLOT_LEN)?;
+        let fine = inizio.checked_add(SLOT_LEN)?;
+        self.slots.get(inizio..fine)
+    }
 }
 
 /// Dati autenticati ma non cifrati (AAD dell'AEAD).
@@ -406,6 +446,65 @@ pub fn build_aad(kind: Kind, header: &Header) -> Vec<u8> {
         aad.extend_from_slice(chiave.as_bytes());
     }
     aad
+}
+
+/// AAD di un messaggio di gruppo.
+///
+/// Oltre a cio' che lega gia' la versione 1, lega **il conteggio degli slot** e
+/// — quando si sta aprendo o chiudendo uno slot — **il suo indice**. Le due
+/// cose servono a difetti diversi e servono entrambe:
+///
+/// - senza l'indice gli slot si potrebbero **riordinare**, e uno slot spostato
+///   apre lo stesso perche' la chiave non dipende dalla posizione;
+/// - senza il conteggio se ne potrebbe **togliere via uno**, e il blob mutilato
+///   sembrerebbe nato senza quel destinatario invece che manomesso.
+///
+/// `indice` e' `None` per l'AAD del payload, che e' unico e non appartiene a
+/// nessuno slot.
+pub fn build_group_aad(kind: Kind, header: &Header, n_slot: u8, indice: Option<u8>) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(6 + KEY_LEN);
+    aad.push(GROUP_VERSION);
+    aad.push(kind as u8);
+    aad.push(header.tier as u8);
+    aad.push(header.flags().0);
+    if let Some(chiave) = header.origin.key() {
+        aad.extend_from_slice(chiave.as_bytes());
+    }
+    aad.push(n_slot);
+    // Il payload e gli slot non devono poter condividere un AAD: `0xFF` non e'
+    // un indice valido (il tetto e' MAX_SLOT), quindi separa i due casi senza
+    // aggiungere un byte di tipo.
+    aad.push(indice.unwrap_or(0xFF));
+    aad
+}
+
+/// Serializza un messaggio di gruppo.
+///
+/// `slots` e' gia' il blocco concatenato, in ordine casuale: mescolarli non e'
+/// compito di questa funzione, ma di chi li costruisce — qui non c'e' RNG.
+pub fn serialize_group(header: &Header, slots: &[u8], ciphertext: &[u8]) -> String {
+    let capacity = MESSAGE_PREFIX_LEN
+        .saturating_add(KEY_LEN)
+        .saturating_add(NONCE_LEN)
+        .saturating_add(1)
+        .saturating_add(slots.len())
+        .saturating_add(ciphertext.len());
+    let mut body = Vec::with_capacity(capacity);
+    body.push(GROUP_VERSION);
+    body.push(Kind::Message as u8);
+    body.push(header.tier as u8);
+    body.push(header.flags().0);
+    if let Some(chiave) = header.origin.key() {
+        body.extend_from_slice(chiave.as_bytes());
+    }
+    body.extend_from_slice(&header.nonce);
+    body.push(u8::try_from(slots.len() / SLOT_LEN).unwrap_or(0));
+    body.extend_from_slice(slots);
+    body.extend_from_slice(ciphertext);
+
+    let mut out = String::from(SENTINEL);
+    out.push_str(&encoding::encode(&body));
+    out
 }
 
 /// Serializza un messaggio e antepone il sentinel, restituendo la stringa
@@ -530,10 +629,20 @@ pub fn parse<'a>(text: &str, out: &'a mut Vec<u8>) -> Result<ParsedBlob<'a>> {
 
     let mut cursor = Cursor::new(out);
     let version = cursor.take_u8()?;
-    if version != PROTOCOL_VERSION {
+    if version != PROTOCOL_VERSION && version != GROUP_VERSION {
         return Err(Error::UnsupportedVersion(version));
     }
     let kind = Kind::from_byte(cursor.take_u8()?)?;
+
+    if version == GROUP_VERSION {
+        // Solo i messaggi hanno una forma di gruppo. Un rogo o una card di
+        // gruppo non esistono, e accettarli qui vorrebbe dire un ramo di codice
+        // che nessuno produce e nessuno prova.
+        return match kind {
+            Kind::Message => parse_group(cursor).map(ParsedBlob::Group),
+            _ => Err(Error::Format("questo tipo non ha una forma di gruppo")),
+        };
+    }
 
     match kind {
         Kind::Message => parse_message(cursor).map(ParsedBlob::Message),
@@ -704,6 +813,60 @@ fn parse_message<'a>(mut cursor: Cursor<'a>) -> Result<ParsedEnvelope<'a>> {
 
     Ok(ParsedEnvelope {
         header: Header { tier, origin, nonce },
+        ciphertext,
+    })
+}
+
+/// Parsa un messaggio di gruppo (`version = 2`).
+///
+/// L'header e' quello della versione 1 e si rilegge con le stesse regole: la
+/// forma del gruppo aggiunge in coda, non cambia cio' che c'era.
+fn parse_group<'a>(mut cursor: Cursor<'a>) -> Result<ParsedGroup<'a>> {
+    let tier = Tier::from_byte(cursor.take_u8()?)?;
+    let flags = Flags(cursor.take_u8()?);
+    if flags.has_unknown_bits() {
+        return Err(Error::Format("flag non definiti in questa versione"));
+    }
+    // Il gruppo ha una forma sola: chiave effimera del mittente, niente
+    // prechiavi. Non e' una restrizione arbitraria — un gruppo NON ha forward
+    // secrecy per decisione (K1), quindi i bit della catena qui non
+    // significherebbero niente, e accettarli vorrebbe dire un header che
+    // dichiara una proprieta' che il formato non ha.
+    if !flags.contains(Flags::SENDER_PUB)
+        || !flags.contains(Flags::EPHEMERAL)
+        || flags.contains(Flags::PREKEY)
+        || flags.contains(Flags::EPOCH_OFFER)
+    {
+        return Err(Error::Format("un gruppo vuole la sola effimera"));
+    }
+
+    let mut bytes = [0u8; KEY_LEN];
+    bytes.copy_from_slice(cursor.take(KEY_LEN)?);
+    let origin = Origin::Effimera(PublicKey::from_bytes(bytes));
+
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(cursor.take(NONCE_LEN)?);
+
+    let n_slot = usize::from(cursor.take_u8()?);
+    if n_slot == 0 {
+        return Err(Error::Format("un gruppo senza destinatari"));
+    }
+    if n_slot > MAX_SLOT {
+        return Err(Error::Format("troppi destinatari"));
+    }
+    // `take` fallisce se i byte non ci sono tutti: il conteggio dichiarato e la
+    // lunghezza reale devono coincidere, altrimenti un blob troncato
+    // sembrerebbe un gruppo piu' piccolo.
+    let slots = cursor.take(n_slot.saturating_mul(SLOT_LEN))?;
+
+    let ciphertext = cursor.rest();
+    if ciphertext.len() < TAG_LEN {
+        return Err(Error::Format("ciphertext piu' corto del tag"));
+    }
+
+    Ok(ParsedGroup {
+        header: Header { tier, origin, nonce },
+        slots,
         ciphertext,
     })
 }
@@ -988,16 +1151,21 @@ mod tests {
     /// Con il sentinel privo di versione, un blob di una versione futura viene
     /// riconosciuto come nostro: l'utente deve leggere "aggiorna l'app", non
     /// "questo testo non e' cifrato".
+    ///
+    /// La 3 e non la 2: la 2 e' il messaggio di gruppo, e da quando esiste non
+    /// e' piu' un esempio di versione futura. Questo test e' cambiato insieme
+    /// al formato, ed e' il modo giusto di accorgersene — se avesse continuato
+    /// a passare avrebbe voluto dire che il gruppo non veniva riconosciuto.
     #[test]
     fn versione_futura_riconosciuta_come_nostra() {
-        let mut body = vec![2u8, Kind::Message as u8];
+        let mut body = vec![3u8, Kind::Message as u8];
         body.extend_from_slice(&[0u8; 64]);
         let text = format!("{SENTINEL}{}", encoding::encode(&body));
 
         let mut buf = Vec::new();
         assert!(matches!(
             parse(&text, &mut buf),
-            Err(Error::UnsupportedVersion(2))
+            Err(Error::UnsupportedVersion(3))
         ));
     }
 

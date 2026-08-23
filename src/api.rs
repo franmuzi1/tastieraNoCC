@@ -303,6 +303,14 @@ impl<K: Keyring> Session<K> {
                     plaintext,
                 }))
             }
+            // I messaggi di gruppo (decisione K) arrivano qui, e per ora il
+            // livello superiore non li sa ancora aprire: il formato e la
+            // crittografia esistono e sono provati, il resto — scelta dei
+            // destinatari, gruppi salvati, ponte verso Android — no. Un errore
+            // esplicito e' meglio di un `unreachable!()`: se un blob di gruppo
+            // arriva prima che la strada sia finita, si vuole un messaggio, non
+            // un processo che muore.
+            ParsedBlob::Group(_) => Err(Error::Format("messaggio di gruppo: non ancora gestito")),
             ParsedBlob::IdentityCard(card) => {
                 // Si fissa la chiave, e NIENTE ALTRO.
                 //
