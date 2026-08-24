@@ -1479,10 +1479,14 @@ mod tests {
         let inizio = posizione_conteggio + 1;
         // Via l'ultimo slot, e il conteggio abbassato di conseguenza: la forma
         // resta valida, cambia solo chi puo' leggere.
-        let n = corpo[posizione_conteggio];
-        corpo[posizione_conteggio] = n - 1;
-        let taglio = inizio + usize::from(n - 1) * format::SLOT_LEN;
-        corpo.drain(taglio..taglio + format::SLOT_LEN);
+        let Some(&n) = corpo.get(posizione_conteggio) else {
+            panic!("il conteggio deve stare nel corpo")
+        };
+        if let Some(slot) = corpo.get_mut(posizione_conteggio) {
+            *slot = n.saturating_sub(1);
+        }
+        let taglio = inizio + usize::from(n.saturating_sub(1)) * format::SLOT_LEN;
+        corpo.drain(taglio..taglio.saturating_add(format::SLOT_LEN));
         let manomesso = format!("{SENTINEL}{}", crate::encoding::encode(&corpo));
 
         // Nessuno dei rimasti deve poterlo aprire: l'AAD del payload lega il
@@ -1509,7 +1513,12 @@ mod tests {
         // resta fuori, e prima gli altri non se ne accorgevano.
         let (primo, secondo) = (inizio, inizio + format::SLOT_LEN);
         for i in 0..format::SLOT_LEN {
-            corpo[secondo + i] = corpo[primo + i];
+            let Some(&byte) = corpo.get(primo + i) else {
+                panic!("lo slot 0 deve stare nel corpo")
+            };
+            if let Some(slot) = corpo.get_mut(secondo + i) {
+                *slot = byte;
+            }
         }
         let manomesso = format!("{SENTINEL}{}", crate::encoding::encode(&corpo));
 
