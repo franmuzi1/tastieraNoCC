@@ -1202,6 +1202,23 @@ impl<K: Keyring> Session<K> {
                     baseline::open_epoch_bootstrap(&self.identity, &mittente, &parsed)?;
                 return Ok((mittente, plaintext));
             }
+            // La nostra epoca, dal posto suo. Mancava, e la conseguenza era
+            // grossa: lo stesso blob si apriva dalla tastiera e dava
+            // `Error::Crypto` dall'archivio. Cioe' la **cronologia** — l'unica
+            // cosa che si compra rinunciando alla forward secrecy — non era
+            // ricostruibile proprio per i messaggi ricevuti.
+            //
+            // E' la stessa dimenticanza gia' corretta nella via di lettura:
+            // separando l'epoca dalla catena si e' aggiornato chi legge un
+            // messaggio in arrivo e non chi rilegge un archivio.
+            if let Some(segreto) = self.keyring.my_epoch(&mittente)? {
+                let mia = keys::EphemeralSecret::from_bytes(segreto);
+                if let Ok((_, plaintext)) = baseline::open_epoch(&mia, &mittente, &parsed) {
+                    return Ok((mittente, plaintext));
+                }
+            }
+            // Ripiego per lo stato salvato prima della separazione, come nella
+            // via di lettura.
             for segreto in self.keyring.my_prekeys(&mittente)? {
                 let mia = keys::EphemeralSecret::from_bytes(segreto);
                 if let Ok((_, plaintext)) = baseline::open_epoch(&mia, &mittente, &parsed) {
@@ -1628,6 +1645,37 @@ mod tests {
 
     /// Rileggere un proprio messaggio di gruppo non deve mettere l'utente fra
     /// i propri contatti: e' la rubrica che mente, gia' corretta altrove.
+    /// Lo stesso blob deve aprirsi dalla tastiera E dall'archivio: la
+    /// cronologia e' l'unica cosa che si compra rinunciando alla forward
+    /// secrecy, e non serve a niente se e' ricostruibile solo a meta'.
+    #[test]
+    fn l_archivio_apre_quel_che_apre_la_tastiera() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity.public();
+        let chiave_bob = bob.identity.public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+        bob.set_current_peer(WHATSAPP, &chiave_alice).unwrap();
+
+        // Apertura bruciabile, cosi' Bob impara l'epoca di Alice e le risponde.
+        let apertura = alice
+            .encrypt_for_app_with(WHATSAPP, b"ciao", 10, &mut rng(1), false)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &apertura, 11).unwrap();
+        let risposta = bob
+            .encrypt_for_app_with(WHATSAPP, b"ci sono", 12, &mut rng(2), false)
+            .unwrap();
+
+        // Dalla tastiera si apre.
+        alice.handle_incoming_text(WHATSAPP, &risposta, 13).unwrap();
+        // E dall'archivio pure: prima qui usciva Error::Crypto.
+        let (chi, aperto) = alice.open_archived(&risposta).unwrap();
+        assert_eq!(chi, chiave_bob);
+        assert_eq!(aperto.as_bytes(), b"ci sono");
+    }
+
     #[test]
     fn rileggere_un_proprio_gruppo_non_fissa_se_stessi() {
         let mut alice = sessione(1);
