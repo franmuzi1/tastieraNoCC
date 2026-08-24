@@ -1232,6 +1232,21 @@ fn apri_come_mittente(
     recipient: &PublicKey,
     parsed: &ParsedEnvelope<'_>,
 ) -> Result<Plaintext> {
+    // Lo schema statico e' `Origin::Mittente` e basta — il gemello del
+    // controllo che [`open_inner`] e [`apri_epoca_con`] hanno gia', e che qui
+    // mancava. Senza, riaprendo un proprio messaggio si poteva aprire con
+    // questa via un blob prodotto da `seal_epoch_bootstrap`: la chiave coincide
+    // e il tag torna, e i primi 32 byte — che li' sono una chiave d'epoca —
+    // finivano in testa a quello che l'utente legge come proprio testo.
+    //
+    // Non e' forzabile da un attaccante di rete e oggi non e' raggiungibile da
+    // `api.rs`, che smista prima. Ma "funziona perche' `api.rs` smista" e' la
+    // configurazione che CLAUDE.md dichiara insufficiente, e che ha gia'
+    // prodotto un difetto una volta: la protezione deve stare nella funzione,
+    // non nell'abitudine di chi la chiama.
+    if !matches!(parsed.header.origin, Origin::Mittente(_)) {
+        return Err(Error::Crypto);
+    }
     if parsed.header.tier != Tier::Baseline {
         return Err(Error::TierUnsupported);
     }
@@ -1560,6 +1575,36 @@ mod tests {
     /// l'AAD si costruisce dai flag che il blob dichiara di se': il messaggio
     /// viene letto con il layout sbagliato e i primi 32 byte del testo
     /// dell'utente diventano una "chiave d'epoca" — o viceversa.
+    /// Il gemello del test qui sotto, dal lato di chi rilegge cio' che ha
+    /// scritto: `open_as_sender` non deve aprire un bootstrap a epoca.
+    #[test]
+    fn rileggere_il_proprio_non_apre_un_altro_schema() {
+        let alice = identita(0x11);
+        let bob = identita(0x22);
+        let mia_epoca = EphemeralSecret::from_bytes([0x44; KEY_LEN]);
+
+        let (header, ciphertext) = seal_epoch_bootstrap(
+            &alice,
+            &bob.public(),
+            &mia_epoca.public(),
+            b"ciao",
+            1,
+            &mut rng(3),
+        )
+        .unwrap();
+        let bootstrap = format::serialize_message(&header, &ciphertext);
+        let mut buf = Vec::new();
+        let ParsedBlob::Message(parsed) = format::parse(&bootstrap, &mut buf).unwrap() else {
+            panic!("atteso un messaggio")
+        };
+
+        // Prima si apriva, e i 32 byte della chiave d'epoca finivano in testa
+        // al testo mostrato all'utente come proprio messaggio.
+        assert!(open_as_sender(&alice, &bob.public(), &parsed).is_err());
+        // E la via giusta continua a funzionare sullo stesso blob.
+        assert!(open_epoch_bootstrap_as_sender(&alice, &bob.public(), &parsed).is_ok());
+    }
+
     #[test]
     fn statico_e_bootstrap_a_epoca_non_sono_intercambiabili() {
         let alice = identita(0x11);

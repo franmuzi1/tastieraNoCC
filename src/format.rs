@@ -528,7 +528,7 @@ pub fn serialize_group(header: &Header, slots: &[u8], ciphertext: &[u8]) -> Resu
         return Err(Error::Format("blocco di slot malformato"));
     }
     let n_slot = slots.len() / SLOT_LEN;
-    if n_slot < 2 || n_slot > MAX_SLOT {
+    if !(2..=MAX_SLOT).contains(&n_slot) {
         return Err(Error::Format("numero di slot fuori dai limiti"));
     }
     let capacity = MESSAGE_PREFIX_LEN

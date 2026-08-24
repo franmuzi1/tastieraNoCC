@@ -428,7 +428,15 @@ mod tests {
 
         // Prefisso, non "formato simile": e' cio' che rende il taglio
         // compatibile col lettore Java, che ignora la coda.
-        assert_eq!(pubblico[..], completo[..pubblico.len()]);
+        // `get` e non lo slicing diretto: il gate del progetto e'
+        // `clippy --all-targets -D warnings`, e vale anche per i test — su un
+        // crate che contiene `unsafe`, un gate che non passa e' un gate che
+        // smette di sostenere la promessa "nessun panic".
+        assert_eq!(
+            Some(&pubblico[..]),
+            completo.get(..pubblico.len()),
+            "il blob pubblico deve essere un prefisso di quello completo",
+        );
 
         // E l'elenco deve restare utile: i nomi ci sono ancora.
         assert!(pubblico.windows(5).any(|f| f == b"Marco"));
@@ -461,8 +469,11 @@ mod tests {
         // Formato 2: stesso blob con il byte di versione abbassato e l'epoca
         // tolta dalla coda. Deve rileggersi, con epoca assente.
         let completo = keyring.export();
-        let mut vecchio = completo[..completo.len() - 1 - KEY_LEN].to_vec();
-        vecchio[0] = STORAGE_VERSION_SENZA_EPOCA;
+        let taglio = completo.len().saturating_sub(1 + KEY_LEN);
+        let mut vecchio = completo.get(..taglio).unwrap_or_default().to_vec();
+        if let Some(primo) = vecchio.first_mut() {
+            *primo = STORAGE_VERSION_SENZA_EPOCA;
+        }
         let riletto = MemoryKeyring::import(&vecchio).unwrap();
         assert_eq!(riletto.my_epoch(&key(1)).unwrap(), None);
         assert_eq!(riletto.my_prekeys(&key(1)).unwrap(), vec![PREKEY]);
