@@ -104,15 +104,41 @@ pub struct Backup {
 ///
 /// # Errori
 ///
+/// [`Error::Format`] se la passphrase e' vuota — vedi sotto.
+///
 /// [`Error::Crypto`] se la derivazione o la cifratura falliscono. Non c'e'
 /// nessun caso in cui il chiamante possa distinguere quale delle due, ed e'
 /// voluto.
+///
+/// # La passphrase vuota si rifiuta qui, non nell'interfaccia
+///
+/// Argon2 una passphrase vuota la digerisce senza lamentarsi: si otteneva un
+/// file **che sembra un backup cifrato** e che chiunque lo trovi apre premendo
+/// invio. E' il fallimento peggiore di tutta questa funzione, perche' non
+/// somiglia a un fallimento: il file c'e', ha la dimensione giusta, i byte sono
+/// indistinguibili da quelli veri.
+///
+/// Il controllo sta nel core e non nelle tre interfacce perche' altrimenti
+/// sarebbe tre controlli, e basta che ne manchi uno. Questa e' l'unica funzione
+/// che sa che il risultato e' un file destinato a uscire dal dispositivo.
+///
+/// **`import` invece non lo rifiuta**, e l'asimmetria e' voluta: un backup fatto
+/// con una versione precedente, quando la passphrase vuota passava, deve restare
+/// apribile. Rifiutarlo anche in lettura non toglierebbe niente a nessuno —
+/// quel file e' gia' fuori — e chiuderebbe fuori il proprietario dai suoi dati.
+///
+/// Non e' un controllo di robustezza e non pretende di esserlo: "vuota" e' il
+/// solo caso che il core puo' giudicare senza inventare una politica. Quanto
+/// debba essere lunga lo decide chi mostra il campo.
 pub fn export<R: RngCore + CryptoRng>(
     identity: &Identity,
     keyring: &[u8],
     passphrase: &[u8],
     rng: &mut R,
 ) -> Result<Vec<u8>> {
+    if passphrase.is_empty() {
+        return Err(Error::Format("passphrase vuota"));
+    }
     let mut salt = [0u8; SALT_LEN];
     rng.fill_bytes(&mut salt);
     let mut nonce = [0u8; NONCE_LEN];
@@ -345,6 +371,30 @@ mod tests {
 
     fn identita(seed: u8) -> Identity {
         Identity::from_secret_bytes([seed; 32]).unwrap()
+    }
+
+    #[test]
+    fn una_passphrase_vuota_non_produce_un_backup() {
+        let id = identita(9);
+        let mut rng = ChaCha20Rng::from_seed([0; 32]);
+        // Argon2 la digerirebbe senza dire niente, e il file che ne uscirebbe
+        // sarebbe indistinguibile da un backup vero: stessa forma, stessa
+        // dimensione, e apribile da chiunque lo trovi premendo invio.
+        let esito = export(&id, b"portachiavi", b"", &mut rng);
+        assert!(matches!(esito, Err(Error::Format(_))));
+    }
+
+    #[test]
+    fn un_backup_vecchio_a_passphrase_vuota_si_apre_ancora() {
+        // L'asimmetria con il test qui sopra e' voluta, e questo test esiste
+        // per impedire che una sessione futura la "sistemi" mettendo lo stesso
+        // controllo anche in `import`. Un file gia' esistente e' gia' fuori:
+        // rifiutarlo in lettura non lo renderebbe piu' sicuro, chiuderebbe
+        // soltanto il proprietario fuori dai propri dati.
+        let id = identita(9);
+        let blob = export_veloce(&id, b"portachiavi", b"", 4);
+        let aperto = apri(&blob, b"");
+        assert_eq!(aperto.keyring.as_slice(), b"portachiavi");
     }
 
     #[test]

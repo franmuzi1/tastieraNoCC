@@ -33,10 +33,11 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 
-use jni::objects::{JByteArray, JClass, JObject, JString};
+use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 use rand_core::OsRng;
+use zeroize::Zeroizing;
 
 use keyboard_cipher_core::api::{IncomingItem, SenderStatus, Session};
 use keyboard_cipher_core::file::FileMeta;
@@ -131,28 +132,112 @@ fn guard<T, F: FnOnce() -> T>(fallback: T, body: F) -> T {
     catch_unwind(AssertUnwindSafe(body)).unwrap_or(fallback)
 }
 
+/// Spegne un'eccezione Java rimasta accesa, e va chiamata su OGNI errore di una
+/// chiamata JNI.
+///
+/// Il motivo e' che l'errore lo si scopre due volte. Quando una chiamata JNI
+/// fallisce — memoria finita mentre si alloca una stringa, un array troppo
+/// grande — la JVM **arma un'eccezione sul thread** e la lascia li'; il valore
+/// di ritorno e' solo la seconda copia della notizia. Restituire `null` senza
+/// spegnerla non chiude niente: l'eccezione resta armata sul thread e scoppia
+/// alla prima chiamata Java successiva, cioe' **lontano da qui**, addosso a
+/// codice che non ha sbagliato niente. Peggio: nel frattempo altre chiamate JNI
+/// hanno comportamento indefinito, perche' il contratto vieta di proseguire con
+/// un'eccezione pendente.
+///
+/// Percio' il ponte la spegne subito e riporta il guasto **solo** con il valore
+/// di ritorno, che e' l'unico canale che questo confine dichiara di usare. Il
+/// difetto era in tutte e quattro le funzioni qui sotto, non solo in quelle che
+/// scrivono: `get_string` e `convert_byte_array` armano un'eccezione esattamente
+/// come `new_string`.
+///
+/// Se `exception_clear` fallisce a sua volta non resta niente da fare — non
+/// c'e' un canale piu' in basso a cui riportarlo — e si prosegue: il valore di
+/// ritorno dice comunque che l'operazione non e' riuscita.
+fn spegni_eccezione(env: &JNIEnv) {
+    let _ = env.exception_clear();
+}
+
 fn read_string(env: &mut JNIEnv, value: &JString) -> Result<String, jint> {
-    env.get_string(value)
-        .map(|s| s.into())
-        .map_err(|_| code::INTERNAL)
+    env.get_string(value).map(|s| s.into()).map_err(|_| {
+        spegni_eccezione(env);
+        code::INTERNAL
+    })
 }
 
 fn new_string(env: &JNIEnv, value: &str) -> jstring {
     match env.new_string(value) {
         Ok(s) => s.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(_) => {
+            spegni_eccezione(env);
+            std::ptr::null_mut()
+        }
     }
 }
 
 fn new_byte_array(env: &JNIEnv, value: &[u8]) -> jbyteArray {
     match env.byte_array_from_slice(value) {
         Ok(array) => array.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Err(_) => {
+            spegni_eccezione(env);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Come `read_bytes`, ma per cio' che non deve restare in memoria: chiavi
+/// private, passphrase, chiaro dei messaggi e degli allegati.
+///
+/// La differenza con `read_bytes` e' solo il `Zeroizing`, e per questo esistono
+/// due funzioni invece di un parametro: il tipo di ritorno **dice** se quel che
+/// entra e' un segreto, e chi legge non deve andare a vedere come viene usato
+/// piu' avanti.
+///
+/// Azzerare a mano funzionava — e in quattro punti si faceva — ma e' una
+/// disciplina che regge finche' nessuno infila un `return` in mezzo: la
+/// scrittura sta in fondo alla funzione, e un'uscita anticipata la salta senza
+/// che niente lo segnali. Col `Zeroizing` la garanzia sta nel `Drop`, quindi
+/// vale per ogni via d'uscita, comprese quelle scritte domani.
+///
+/// **Copre solo la copia Rust.** Quella dentro l'array Java resta viva e la
+/// deve azzerare il chiamante: da qui non e' raggiungibile, ed e' scritto sulle
+/// firme che ricevono segreti.
+fn read_secret_bytes(env: &mut JNIEnv, value: &JByteArray) -> Result<Zeroizing<Vec<u8>>, jint> {
+    read_bytes(env, value).map(Zeroizing::new)
+}
+
+/// Deposita il motivo del fallimento nell'array d'uscita, se il chiamante ne
+/// ha passato uno.
+///
+/// Serve alle funzioni che restituiscono un puntatore: `null` e' l'unica cosa
+/// che possono dire, e da solo mette tutte le cause nello stesso mucchio. Il
+/// chiamante che voglia sapere **perche'** passa un `int[1]`; chi non lo vuole
+/// passa `null` e non paga niente.
+///
+/// Perche' un parametro d'uscita e non un "ultimo errore" da interrogare dopo:
+/// un ultimo-errore e' stato globale, e con piu' thread che chiamano il ponte
+/// non e' detto che quello che si legge sia il proprio. Questo e' il contrario
+/// — vive nella chiamata — ed e' lo stesso schema che `nativeDecryptFile` e
+/// `nativeImportBackup` usano gia' per i loro risultati.
+///
+/// Se la scrittura fallisce non si fa niente: il `null` di ritorno dice
+/// comunque che l'operazione non e' riuscita, e un errore nel riportare un
+/// errore non deve diventare un secondo guasto. `spegni_eccezione` c'e' perche'
+/// un array troppo corto arma un'eccezione che va spenta subito.
+fn motivo(env: &mut JNIEnv, out: &JIntArray, codice: jint) {
+    if out.is_null() {
+        return;
+    }
+    if env.set_int_array_region(out, 0, &[codice]).is_err() {
+        spegni_eccezione(env);
     }
 }
 
 fn read_bytes(env: &mut JNIEnv, value: &JByteArray) -> Result<Vec<u8>, jint> {
-    env.convert_byte_array(value).map_err(|_| code::INTERNAL)
+    env.convert_byte_array(value).map_err(|_| {
+        spegni_eccezione(env);
+        code::INTERNAL
+    })
 }
 
 fn read_key(env: &mut JNIEnv, value: &JByteArray) -> Result<PublicKey, jint> {
@@ -181,21 +266,22 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeGenerateS
 ) -> jbyteArray {
     guard(std::ptr::null_mut(), || {
         use rand_core::RngCore;
-        use zeroize::Zeroize;
 
         // OsRng: entropia dell'OS. Mai un PRNG seedato in-app.
-        let mut secret = [0u8; KEY_LEN];
-        OsRng.fill_bytes(&mut secret);
+        //
+        // `Zeroizing` e non due `secret.zeroize()` a mano: le uscite qui sono
+        // due e le azzeravano entrambe, ma e' la forma che si rompe in
+        // silenzio quando qualcuno ne aggiunge una terza. Qui l'azzeramento
+        // e' nel `Drop`.
+        let mut secret = Zeroizing::new([0u8; KEY_LEN]);
+        OsRng.fill_bytes(&mut *secret);
         // Verifica che i byte producano un'identita' valida prima di
         // consegnarli allo storage: un segreto che non si ricarica sarebbe un
         // guasto permanente e silenzioso.
-        if Identity::from_secret_bytes(secret).is_err() {
-            secret.zeroize();
+        if Identity::from_secret_bytes(*secret).is_err() {
             return std::ptr::null_mut();
         }
-        let array = new_byte_array(&env, &secret);
-        secret.zeroize();
-        array
+        new_byte_array(&env, &*secret)
     })
 }
 
@@ -209,21 +295,26 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeInit(
     keyring_blob: JByteArray,
 ) -> jint {
     guard(code::INTERNAL, || {
-        let bytes = match read_bytes(&mut env, &secret) {
+        // Segreto e blob del keyring sono entrambi materiale di chiave: il
+        // primo e' l'identita', il secondo contiene le chiavi temporanee e le
+        // chiavi d'epoca di ogni contatto. Senza `Zeroizing` restavano in heap
+        // fino al riuso dell'allocazione, e questa e' la funzione che viene
+        // chiamata a ogni avvio del processo.
+        let bytes = match read_secret_bytes(&mut env, &secret) {
             Ok(bytes) => bytes,
             Err(codice) => return codice,
         };
         if bytes.len() != KEY_LEN {
             return code::FORMAT;
         }
-        let mut key = [0u8; KEY_LEN];
+        let mut key = Zeroizing::new([0u8; KEY_LEN]);
         key.copy_from_slice(&bytes);
-        let identity = match Identity::from_secret_bytes(key) {
+        let identity = match Identity::from_secret_bytes(*key) {
             Ok(identity) => identity,
             Err(error) => return code_of(&error),
         };
 
-        let blob = match read_bytes(&mut env, &keyring_blob) {
+        let blob = match read_secret_bytes(&mut env, &keyring_blob) {
             Ok(blob) => blob,
             Err(codice) => return codice,
         };
@@ -339,6 +430,14 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHasCurren
 ///
 /// Con `forward` diverso da zero **modifica il keyring**, come
 /// `nativeEncryptForApp`: chi chiama deve persistere subito.
+///
+/// `errorOut` e' un `int[1]` facoltativo — passare `null` per non riceverlo —
+/// dove finisce il motivo quando il ritorno e' `null`. Prima il `null` era uno
+/// solo per cause diverse: `UNKNOWN_PEER` (il destinatario non e' piu' nella
+/// rubrica, cosa che capita se lo si dimentica dopo aver scelto il file),
+/// `FORMAT` (il file non ci sta) e i guasti veri finivano tutti nello stesso
+/// mucchio, e l'utente leggeva la stessa frase in tutti e tre i casi — di cui
+/// almeno uno lui puo' risolvere.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFile(
     mut env: JNIEnv,
@@ -349,18 +448,28 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFi
     content: JByteArray,
     now_unix: jlong,
     forward: jboolean,
+    error_out: JIntArray,
 ) -> jbyteArray {
     guard(std::ptr::null_mut(), || {
-        let Ok(chiave) = read_key(&mut env, &peer) else {
-            return std::ptr::null_mut();
+        let chiave = match read_key(&mut env, &peer) {
+            Ok(chiave) => chiave,
+            Err(codice) => {
+                motivo(&mut env, &error_out, codice);
+                return std::ptr::null_mut();
+            }
         };
         let Ok(nome) = read_string(&mut env, &name) else {
+            motivo(&mut env, &error_out, code::INTERNAL);
             return std::ptr::null_mut();
         };
         let Ok(tipo) = read_string(&mut env, &mime) else {
+            motivo(&mut env, &error_out, code::INTERNAL);
             return std::ptr::null_mut();
         };
-        let Ok(bytes) = read_bytes(&mut env, &content) else {
+        // Il contenuto del file e' chiaro come il testo di un messaggio, e
+        // ne passa molto di piu': fino al tetto della decisione G6.
+        let Ok(bytes) = read_secret_bytes(&mut env, &content) else {
+            motivo(&mut env, &error_out, code::INTERNAL);
             return std::ptr::null_mut();
         };
         let meta = FileMeta { name: nome, mime: tipo };
@@ -369,7 +478,10 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFi
         });
         match esito {
             Ok(blob) => new_byte_array(&env, &blob),
-            Err(_) => std::ptr::null_mut(),
+            Err(codice) => {
+                motivo(&mut env, &error_out, codice);
+                std::ptr::null_mut()
+            }
         }
     })
 }
@@ -379,6 +491,34 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFi
 /// Come per i messaggi, il core decifra **prima** di toccare il keyring: la
 /// decifratura riuscita e' la prova che chi ha mandato il file possiede la
 /// privata dichiarata.
+///
+/// **Anche aprire modifica il keyring, e anche qui si persiste subito.** Il
+/// contratto della persistenza era scritto solo sulle firme che cifrano, e
+/// suggeriva quindi il contrario: che leggere fosse un'operazione innocua. Non
+/// lo e', per tre motivi distinti, e ciascuno lascerebbe un danno diverso se il
+/// processo morisse prima del salvataggio:
+///
+/// - un mittente mai visto viene **fissato** (TOFU). Non persistendolo, la
+///   volta dopo verrebbe fissato di nuovo in silenzio — cioe' un cambio di
+///   chiave non verrebbe mai notato;
+/// - aprire un messaggio a forward secrecy **butta** le proprie chiavi
+///   temporanee piu' vecchie (decisione I: e' la lettura a buttare, non la
+///   risposta). Non persistendolo, le chiavi buttate tornano al riavvio e la
+///   proprieta' che l'interruttore promette non c'e';
+/// - un rogo (decisione J) **distrugge** la chiave d'epoca. Non persistendolo,
+///   la conversazione bruciata resuscita al riavvio, dopo che all'utente e'
+///   stato detto che era finita. E' il peggiore dei tre, perche' l'interfaccia
+///   ha gia' dichiarato una cosa che il disco smentisce.
+///
+/// # Il chiaro che finisce in `result`
+///
+/// Il campo del testo e' un `byte[]` e non una `String` per lo stesso motivo di
+/// sempre: una `java.lang.String` e' immutabile e non si azzera. Ma il ponte
+/// non puo' azzerarlo — appartiene al chiamante — quindi **e' il chiamante che
+/// lo azzera appena l'ha mostrato o salvato**, come fa gia' con quello che
+/// consegna in cifratura. Detto qui perche' dalla firma non si indovina: e'
+/// l'unico posto di questo file dove un segreto viaggia verso la JVM invece che
+/// verso il core.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeDecryptFile(
     mut env: JNIEnv,
@@ -515,13 +655,15 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeExportBac
     passphrase: JByteArray,
 ) -> jbyteArray {
     guard(std::ptr::null_mut(), || {
-        use zeroize::Zeroize;
-        let mut pass = match read_bytes(&mut env, &passphrase) {
+        let pass = match read_secret_bytes(&mut env, &passphrase) {
             Ok(bytes) => bytes,
             Err(_) => return std::ptr::null_mut(),
         };
         let esito = with_session(|session| {
-            let keyring = session.keyring().export();
+            // Anche il keyring esportato e' materiale di chiave, non solo la
+            // passphrase: ci sono dentro le chiavi temporanee e le chiavi
+            // d'epoca di ogni contatto.
+            let keyring = Zeroizing::new(session.keyring().export());
             keyboard_cipher_core::backup::export(
                 session.identity(),
                 &keyring,
@@ -529,13 +671,6 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeExportBac
                 &mut OsRng,
             )
         });
-        // La copia della passphrase che vive in questo stack e' nostra: la
-        // azzeriamo noi, senza aspettare il chiamante.
-        // `as_mut_slice()` e non `pass.zeroize()`: l'impl di Zeroize per Vec
-        // dipende dalla feature `alloc`, quella per gli slice no. Il risultato
-        // e' identico — e resta una scrittura che il compilatore non puo'
-        // eliminare, che e' il motivo per cui non si usa `fill(0)`.
-        pass.as_mut_slice().zeroize();
         match esito {
             Ok(blob) => new_byte_array(&env, &blob),
             Err(_) => std::ptr::null_mut(),
@@ -568,18 +703,11 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeImportBac
             Ok(bytes) => bytes,
             Err(codice) => return codice,
         };
-        use zeroize::Zeroize;
-        let mut pass = match read_bytes(&mut env, &passphrase) {
+        let pass = match read_secret_bytes(&mut env, &passphrase) {
             Ok(bytes) => bytes,
             Err(codice) => return codice,
         };
-        let aperto = keyboard_cipher_core::backup::import(&dati, &pass);
-        // `as_mut_slice()` e non `pass.zeroize()`: l'impl di Zeroize per Vec
-        // dipende dalla feature `alloc`, quella per gli slice no. Il risultato
-        // e' identico — e resta una scrittura che il compilatore non puo'
-        // eliminare, che e' il motivo per cui non si usa `fill(0)`.
-        pass.as_mut_slice().zeroize();
-        let aperto = match aperto {
+        let aperto = match keyboard_cipher_core::backup::import(&dati, &pass) {
             Ok(aperto) => aperto,
             Err(error) => return code_of(&error),
         };
@@ -673,18 +801,13 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFo
         let Ok(package) = read_string(&mut env, &app_package) else {
             return nullo;
         };
-        let Ok(mut bytes) = read_bytes(&mut env, &plaintext) else {
+        let Ok(bytes) = read_secret_bytes(&mut env, &plaintext) else {
             return nullo;
         };
 
         let esito = with_session(|session| {
             session.encrypt_for_app_with(&package, &bytes, now_unix, &mut OsRng, forward != 0)
         });
-        // La copia Rust del plaintext sparisce subito; quella Java la azzera
-        // il chiamante.
-        use zeroize::Zeroize;
-        bytes.zeroize();
-
         match esito {
             Ok(blob) => new_string(&env, &blob),
             Err(_) => nullo,
@@ -703,6 +826,13 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptFo
 ///
 /// **Non ha forward secrecy**, per decisione: chi mostra il risultato deve
 /// dirlo all'utente.
+///
+/// `errorOut` e' un `int[1]` facoltativo — `null` per non riceverlo — dove
+/// finisce il motivo quando il ritorno e' `null`. Serve soprattutto per
+/// `UNKNOWN_PEER`: un gruppo salvato tiene le chiavi dei membri, ma un membro
+/// puo' essere stato dimenticato dopo, e allora il gruppo non si cifra piu'.
+/// E' l'unico fallimento che l'utente puo' aggiustare da solo, e prima gli
+/// veniva mostrato con la stessa frase di un guasto interno.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptGroup(
     mut env: JNIEnv,
@@ -710,13 +840,16 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptGr
     peers: JByteArray,
     plaintext: JByteArray,
     now_unix: jlong,
+    error_out: JIntArray,
 ) -> jstring {
     guard(std::ptr::null_mut(), || {
         let nullo: jstring = std::ptr::null_mut();
         let Ok(chiavi) = read_bytes(&mut env, &peers) else {
+            motivo(&mut env, &error_out, code::INTERNAL);
             return nullo;
         };
         if chiavi.is_empty() || chiavi.len() % KEY_LEN != 0 {
+            motivo(&mut env, &error_out, code::FORMAT);
             return nullo;
         }
         let destinatari: Vec<keyboard_cipher_core::keys::PublicKey> = chiavi
@@ -728,20 +861,19 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptGr
             })
             .collect();
 
-        let Ok(mut bytes) = read_bytes(&mut env, &plaintext) else {
+        let Ok(bytes) = read_secret_bytes(&mut env, &plaintext) else {
+            motivo(&mut env, &error_out, code::INTERNAL);
             return nullo;
         };
         let esito = with_session(|session| {
             session.encrypt_group(&destinatari, &bytes, now_unix, &mut OsRng)
         });
-        // Come per gli altri: la copia Rust del chiaro sparisce subito, quella
-        // Java la azzera il chiamante.
-        use zeroize::Zeroize;
-        bytes.zeroize();
-
         match esito {
             Ok(blob) => new_string(&env, &blob),
-            Err(_) => nullo,
+            Err(codice) => {
+                motivo(&mut env, &error_out, codice);
+                nullo
+            }
         }
     })
 }
@@ -754,6 +886,15 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeEncryptGr
 /// a runtime, e ogni errore diventa un'eccezione lanciata in mezzo a
 /// un'operazione crypto. Riempire campi di un oggetto gia' allocato dal lato
 /// Java e' piu' noioso e molto piu' difficile da sbagliare.
+///
+/// **Non e' una lettura: modifica il keyring, e chi chiama persiste subito.**
+/// Fissa un mittente mai visto, butta le proprie chiavi temporanee piu' vecchie
+/// di quella usata, e su un rogo distrugge la chiave d'epoca. I tre danni che
+/// si prendono non persistendo sono elencati per esteso su `nativeDecryptFile`,
+/// che e' la stessa cosa per gli allegati.
+///
+/// Il testo aperto arriva in `result` come `byte[]`, e **lo azzera il
+/// chiamante** appena l'ha mostrato: da qui non e' piu' raggiungibile.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleIncomingText(
     mut env: JNIEnv,
