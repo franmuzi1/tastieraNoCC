@@ -461,8 +461,30 @@ pub fn build_aad(kind: Kind, header: &Header) -> Vec<u8> {
 ///
 /// `indice` e' `None` per l'AAD del payload, che e' unico e non appartiene a
 /// nessuno slot.
-pub fn build_group_aad(kind: Kind, header: &Header, n_slot: u8, indice: Option<u8>) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(6 + KEY_LEN);
+///
+/// `impronta_slot` si passa **solo** per l'AAD del payload, e lega il testo al
+/// blocco degli slot cosi' com'e'. Senza, gli slot erano legati al proprio
+/// indice e al conteggio ma non fra loro: sovrascrivere lo slot di una persona
+/// con la copia di quello di un'altra lasciava conteggio, lunghezza e forma
+/// intatti, e il blob restava perfettamente leggibile per tutti gli altri.
+/// Chi sta in mezzo poteva cosi' **escludere una persona sola dalla lettura**,
+/// senza che gli altri se ne accorgessero e senza che l'esclusa potesse
+/// distinguere l'esclusione da un guasto.
+///
+/// Ora una sostituzione del genere rompe il payload per TUTTI: resta possibile
+/// corrompere — un attaccante attivo puo' sempre farlo — ma diventa un guasto
+/// evidente invece che una censura mirata e silenziosa.
+///
+/// Non serve per gli slot: al momento di chiuderli il blocco non esiste ancora,
+/// e ognuno e' gia' legato al proprio indice.
+pub fn build_group_aad(
+    kind: Kind,
+    header: &Header,
+    n_slot: u8,
+    indice: Option<u8>,
+    impronta_slot: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(6 + KEY_LEN + 32);
     aad.push(GROUP_VERSION);
     aad.push(kind as u8);
     aad.push(header.tier as u8);
@@ -475,7 +497,19 @@ pub fn build_group_aad(kind: Kind, header: &Header, n_slot: u8, indice: Option<u
     // un indice valido (il tetto e' MAX_SLOT), quindi separa i due casi senza
     // aggiungere un byte di tipo.
     aad.push(indice.unwrap_or(0xFF));
+    if let Some(impronta) = impronta_slot {
+        aad.extend_from_slice(impronta);
+    }
     aad
+}
+
+/// L'impronta del blocco degli slot, per legarlo al payload. Vedi
+/// [`build_group_aad`].
+pub fn impronta_slot(slots: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(slots);
+    hasher.finalize().into()
 }
 
 /// Serializza un messaggio di gruppo.

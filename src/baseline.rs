@@ -640,28 +640,12 @@ pub fn seal_group<R: RngCore + CryptoRng>(
     let mut chiave_contenuto = Zeroizing::new([0u8; AEAD_KEY_LEN]);
     rng.fill_bytes(chiave_contenuto.as_mut());
 
-    // Il payload, cifrato una volta sola.
-    let aad_payload = format::build_group_aad(Kind::Message, &header, n_slot, None);
-    let mut inner = Zeroizing::new(Vec::with_capacity(
-        TIMESTAMP_LEN.saturating_add(plaintext.len()),
-    ));
-    inner.extend_from_slice(&now_unix.to_le_bytes());
-    inner.extend_from_slice(plaintext);
-    let ciphertext = XChaCha20Poly1305::new((&*chiave_contenuto).into())
-        .encrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: &inner,
-                aad: &aad_payload,
-            },
-        )
-        .map_err(|_| Error::Crypto)?;
-
-    // Gli slot.
+    // Gli slot PRIMA del payload: il payload viene legato alla loro impronta,
+    // quindi devono esistere per poterla calcolare.
     let mut slots = Vec::with_capacity(lista.len().saturating_mul(format::SLOT_LEN));
     for (i, destinatario) in lista.iter().enumerate() {
         let indice = u8::try_from(i).map_err(|_| Error::Format("troppi destinatari"))?;
-        let aad = format::build_group_aad(Kind::Message, &header, n_slot, Some(indice));
+        let aad = format::build_group_aad(Kind::Message, &header, n_slot, Some(indice), None);
         let nonce_i = nonce_slot(&nonce, indice);
         let chiave = derive_ephemeral_key(
             &*effimera.diffie_hellman(destinatario)?,
@@ -684,6 +668,25 @@ pub fn seal_group<R: RngCore + CryptoRng>(
         }
         slots.extend_from_slice(&slot);
     }
+
+    // Il payload, cifrato una volta sola e legato al blocco degli slot.
+    let impronta = format::impronta_slot(&slots);
+    let aad_payload =
+        format::build_group_aad(Kind::Message, &header, n_slot, None, Some(&impronta));
+    let mut inner = Zeroizing::new(Vec::with_capacity(
+        TIMESTAMP_LEN.saturating_add(plaintext.len()),
+    ));
+    inner.extend_from_slice(&now_unix.to_le_bytes());
+    inner.extend_from_slice(plaintext);
+    let ciphertext = XChaCha20Poly1305::new((&*chiave_contenuto).into())
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &inner,
+                aad: &aad_payload,
+            },
+        )
+        .map_err(|_| Error::Crypto)?;
 
     Ok((header, slots, ciphertext))
 }
@@ -714,7 +717,8 @@ pub fn open_group(
     for i in 0..parsed.slot_count() {
         let Some(slot) = parsed.slot(i) else { continue };
         let indice = u8::try_from(i).map_err(|_| Error::Crypto)?;
-        let aad = format::build_group_aad(Kind::Message, &parsed.header, n_slot, Some(indice));
+        let aad =
+            format::build_group_aad(Kind::Message, &parsed.header, n_slot, Some(indice), None);
         let nonce_i = nonce_slot(&parsed.header.nonce, indice);
         let chiave = derive_ephemeral_key(&dh_effimero, &dh_statico, &nonce_i, &aad, &mio)?;
         let Ok(contenuto) = XChaCha20Poly1305::new((&*chiave).into()).decrypt(
@@ -737,7 +741,14 @@ pub fn open_group(
         let mut chiave_contenuto = Zeroizing::new([0u8; AEAD_KEY_LEN]);
         chiave_contenuto.copy_from_slice(&contenuto);
 
-        let aad_payload = format::build_group_aad(Kind::Message, &parsed.header, n_slot, None);
+        let impronta = format::impronta_slot(parsed.slots);
+        let aad_payload = format::build_group_aad(
+            Kind::Message,
+            &parsed.header,
+            n_slot,
+            None,
+            Some(&impronta),
+        );
         let inner = Zeroizing::new(
             XChaCha20Poly1305::new((&*chiave_contenuto).into())
                 .decrypt(
@@ -1457,6 +1468,39 @@ mod tests {
         // conteggio, quindi il testo non si decifra piu' per nessuno.
         assert!(apri_gruppo(&manomesso, &babbo, &alice.public()).is_err());
         assert!(apri_gruppo(&manomesso, &mamma, &alice.public()).is_err());
+    }
+
+    /// Sostituire lo slot di una persona con la copia di quello di un'altra
+    /// lasciava conteggio, lunghezza e forma intatti: il blob restava leggibile
+    /// per tutti gli altri e l'esclusa vedeva un errore uguale a quello di un
+    /// blob corrotto. Censura mirata e invisibile.
+    #[test]
+    fn sostituire_uno_slot_rompe_il_messaggio_per_tutti() {
+        let alice = identita(1);
+        let babbo = identita(2);
+        let mamma = identita(3);
+        let blob = gruppo(&alice, &[babbo.public(), mamma.public()], b"ciao", 21);
+
+        let payload = blob.strip_prefix(SENTINEL).unwrap();
+        let mut corpo = crate::encoding::decode(payload).unwrap();
+        let inizio = 4 + KEY_LEN + NONCE_LEN + 1;
+        // Lo slot 1 diventa una copia dello slot 0: chi apriva con lo slot 1
+        // resta fuori, e prima gli altri non se ne accorgevano.
+        let (primo, secondo) = (inizio, inizio + format::SLOT_LEN);
+        for i in 0..format::SLOT_LEN {
+            corpo[secondo + i] = corpo[primo + i];
+        }
+        let manomesso = format!("{SENTINEL}{}", crate::encoding::encode(&corpo));
+
+        // LA RIGA CHE CONTA: non si rompe solo per l'esclusa. Si rompe per
+        // tutti, quindi la manomissione e' un guasto evidente e non una
+        // censura silenziosa.
+        for chi in [&babbo, &mamma, &alice] {
+            assert!(
+                apri_gruppo(&manomesso, chi, &alice.public()).is_err(),
+                "uno slot sostituito deve rompere il messaggio per chiunque",
+            );
+        }
     }
 
     #[test]
