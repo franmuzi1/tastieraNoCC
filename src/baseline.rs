@@ -1381,7 +1381,7 @@ mod tests {
     ) -> String {
         let (header, slots, ciphertext) =
             seal_group(mittente, destinatari, testo, 1_700_000_000, &mut rng(seme)).unwrap();
-        format::serialize_group(&header, &slots, &ciphertext)
+        format::serialize_group(&header, &slots, &ciphertext).unwrap()
     }
 
     fn apri_gruppo(blob: &str, chi: &Identity, mittente: &PublicKey) -> Result<Plaintext> {

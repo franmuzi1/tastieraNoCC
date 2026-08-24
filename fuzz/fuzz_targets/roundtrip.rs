@@ -52,17 +52,61 @@ fuzz_target!(|data: &[u8]| {
     // Ciphertext di lunghezza valida costruito dall'input.
     let mut ciphertext = vec![0u8; format::TAG_LEN];
     ciphertext.extend_from_slice(corpo);
-    let testo = format::serialize_message(&header, &ciphertext);
 
-    // Un blob appena prodotto deve sempre ri-parsare identico.
-    let mut buf = Vec::new();
-    match format::parse(&testo, &mut buf) {
-        Ok(ParsedBlob::Message(envelope)) => {
-            assert_eq!(envelope.header, header);
-            assert_eq!(envelope.ciphertext, &ciphertext[..]);
+    // Un bit del byte di controllo sceglie la forma di GRUPPO (version 2).
+    // Senza, questo target — l'unico che costruisce blob validi e quindi
+    // raggiunge i rami profondi — non scriveva mai la versione 2 ne' un blocco
+    // di slot: il parser dei gruppi restava fuori dal fuzzing, mentre il
+    // documento dichiarava ogni parser esercitato su input ostile.
+    let gruppo = controllo & 0b100 != 0;
+    let testo = if gruppo {
+        // Il gruppo vuole la sola effimera e almeno due slot: si costruisce un
+        // blocco valido per lunghezza, riempito con l'input. Il contenuto degli
+        // slot non deve essere apribile — qui si prova il PARSER, non la
+        // crittografia.
+        let quanti = 2 + usize::from(controllo) % (format::MAX_SLOT - 1);
+        let mut slots = vec![0u8; quanti * format::SLOT_LEN];
+        for (slot, byte) in slots.iter_mut().zip(corpo.iter().cycle()) {
+            *slot = *byte;
         }
-        altro => panic!("un blob appena serializzato non ri-parsa: {:?}", altro.is_ok()),
-    }
+        let header_gruppo = Header {
+            tier: header.tier,
+            origin: Origin::Effimera(PublicKey::from_bytes(chiave)),
+            nonce,
+        };
+        match format::serialize_group(&header_gruppo, &slots, &ciphertext) {
+            Ok(testo) => {
+                let mut buf = Vec::new();
+                match format::parse(&testo, &mut buf) {
+                    Ok(ParsedBlob::Group(g)) => {
+                        assert_eq!(g.header, header_gruppo);
+                        assert_eq!(g.slot_count(), quanti);
+                        assert_eq!(g.ciphertext, &ciphertext[..]);
+                    }
+                    // Il tier riservato si rifiuta dopo il parsing della forma:
+                    // e' un esito legittimo, non un round-trip fallito.
+                    Ok(_) | Err(_) if header_gruppo.tier != Tier::Baseline => {}
+                    altro => {
+                        panic!("un gruppo appena serializzato non ri-parsa: {:?}", altro.is_ok())
+                    }
+                }
+                testo
+            }
+            Err(_) => return,
+        }
+    } else {
+        let testo = format::serialize_message(&header, &ciphertext);
+        // Un blob appena prodotto deve sempre ri-parsare identico.
+        let mut buf = Vec::new();
+        match format::parse(&testo, &mut buf) {
+            Ok(ParsedBlob::Message(envelope)) => {
+                assert_eq!(envelope.header, header);
+                assert_eq!(envelope.ciphertext, &ciphertext[..]);
+            }
+            altro => panic!("un blob appena serializzato non ri-parsa: {:?}", altro.is_ok()),
+        }
+        testo
+    };
 
     // Ora lo si corrompe: qualunque mutazione, parse non deve andare in panic.
     let payload = testo.strip_prefix(SENTINEL).unwrap_or(&testo);

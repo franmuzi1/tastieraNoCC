@@ -243,7 +243,6 @@ dependencies = [
  "hkdf",
  "rand_core",
  "sha2",
- "subtle",
  "thiserror",
  "x25519-dalek",
  "zeroize",

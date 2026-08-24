@@ -990,6 +990,14 @@ una chiave: non viaggia, non entra nel cifrato, e non lo conosce nessun altro.
   incoerenti con la lunghezza.
 - Ogni parser va esercitato su input ostile. **Fatto**: `fuzz/` contiene tre
   target cargo-fuzz (richiede nightly, che c'è).
+
+  *Ogni* significa ogni, e per un po' non è stato vero: quando è arrivato il
+  messaggio di gruppo, `roundtrip` — l'unico target che costruisce blob validi,
+  e quindi l'unico che arriva ai rami profondi — sapeva produrre solo la
+  versione 1. Il parser dei gruppi è rimasto fuori dal fuzzing mentre questa
+  riga diceva «fatto». Ora un bit del byte di controllo sceglie la forma di
+  gruppo. **Chi aggiunge un formato aggiorna questo target nello stesso
+  commit**, altrimenti questa riga torna a essere più larga della realtà.
   - `decode` — `encoding::decode` non deve mai andare in panic, e se decodifica
     deve valere `encode(decode(s)) == s`.
   - `parse` — `format::parse` non deve mai andare in panic. Metà degli input

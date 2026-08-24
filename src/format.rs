@@ -516,7 +516,21 @@ pub fn impronta_slot(slots: &[u8]) -> [u8; 32] {
 ///
 /// `slots` e' gia' il blocco concatenato, in ordine casuale: mescolarli non e'
 /// compito di questa funzione, ma di chi li costruisce — qui non c'e' RNG.
-pub fn serialize_group(header: &Header, slots: &[u8], ciphertext: &[u8]) -> String {
+pub fn serialize_group(header: &Header, slots: &[u8], ciphertext: &[u8]) -> Result<String> {
+    // Il contratto si impone invece di darlo per buono. Prima non si verificava
+    // niente: un blocco di lunghezza non multipla lasciava i byte di troppo
+    // dentro il ciphertext, e oltre 255 slot `u8::try_from` falliva e
+    // `unwrap_or(0)` scriveva un conteggio zero — cioe' un blob che il nostro
+    // stesso parser rifiuta. Un errore del chiamante diventava un blob rotto
+    // invece che un `Err`, che e' il fallimento silenzioso che questo progetto
+    // rifiuta altrove.
+    if slots.is_empty() || slots.len() % SLOT_LEN != 0 {
+        return Err(Error::Format("blocco di slot malformato"));
+    }
+    let n_slot = slots.len() / SLOT_LEN;
+    if n_slot < 2 || n_slot > MAX_SLOT {
+        return Err(Error::Format("numero di slot fuori dai limiti"));
+    }
     let capacity = MESSAGE_PREFIX_LEN
         .saturating_add(KEY_LEN)
         .saturating_add(NONCE_LEN)
@@ -532,13 +546,13 @@ pub fn serialize_group(header: &Header, slots: &[u8], ciphertext: &[u8]) -> Stri
         body.extend_from_slice(chiave.as_bytes());
     }
     body.extend_from_slice(&header.nonce);
-    body.push(u8::try_from(slots.len() / SLOT_LEN).unwrap_or(0));
+    body.push(u8::try_from(n_slot).map_err(|_| Error::Format("troppi slot"))?);
     body.extend_from_slice(slots);
     body.extend_from_slice(ciphertext);
 
     let mut out = String::from(SENTINEL);
     out.push_str(&encoding::encode(&body));
-    out
+    Ok(out)
 }
 
 /// Serializza un messaggio e antepone il sentinel, restituendo la stringa

@@ -991,7 +991,7 @@ impl<K: Keyring> Session<K> {
         }
         let (header, slots, ciphertext) =
             baseline::seal_group(&self.identity, destinatari, plaintext, now_unix, rng)?;
-        Ok(crate::format::serialize_group(&header, &slots, &ciphertext))
+        crate::format::serialize_group(&header, &slots, &ciphertext)
     }
 
     /// Chi ha chiesto il rogo. Si **decifra** per saperlo: senza, chiunque
