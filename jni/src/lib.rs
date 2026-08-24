@@ -797,9 +797,13 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeHandleInc
                     // che un messaggio di gruppo NON ha forward secrecy: e' la
                     // condizione che accompagna la decisione K1, e senza questo
                     // numero non e' esprimibile.
+                    // Un flag esplicito, non una soglia sul conteggio: un blob
+                    // con un solo slot si presentava come messaggio a due pur
+                    // essendo un gruppo senza forward secrecy.
+                    || !set_int("isGroup", jint::from(message.gruppo))
                     || !set_int(
                         "recipientCount",
-                        jint::try_from(message.destinatari).unwrap_or(1),
+                        jint::try_from(message.destinatari).unwrap_or(0),
                     )
                 {
                     return code::INTERNAL;

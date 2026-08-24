@@ -608,6 +608,12 @@ pub fn seal_group<R: RngCore + CryptoRng>(
     if lista.len() > format::MAX_SLOT {
         return Err(Error::Format("troppi destinatari"));
     }
+    // Meno di due slot non e' un gruppo: succede se l'unico destinatario e' il
+    // mittente stesso, e la dedup qui sopra li fonde. Il parser lo rifiuta gia'
+    // in lettura, ma produrlo sarebbe comunque un blob che nessuno puo' aprire.
+    if lista.len() < 2 {
+        return Err(Error::Format("un gruppo vuole almeno due slot"));
+    }
 
     // Mescolare: la posizione di uno slot non deve dire niente su chi c'e'
     // dentro, e senza questo il mittente sarebbe sempre l'ultimo.

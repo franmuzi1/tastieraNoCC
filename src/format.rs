@@ -882,8 +882,14 @@ fn parse_group<'a>(mut cursor: Cursor<'a>) -> Result<ParsedGroup<'a>> {
     nonce.copy_from_slice(cursor.take(NONCE_LEN)?);
 
     let n_slot = usize::from(cursor.take_u8()?);
-    if n_slot == 0 {
-        return Err(Error::Format("un gruppo senza destinatari"));
+    // **Meno di due slot non e' un gruppo.** Il mittente ha sempre uno slot suo
+    // (K2), quindi un gruppo legittimo ne ha almeno due: uno per lui e uno per
+    // qualcun altro. Un blob da uno slot puo' nascere solo da un client
+    // modificato, e serviva a una cosa sola — presentarsi come messaggio a due
+    // pur essendo un `version = 2` senza forward secrecy, cioe' aggirare la
+    // condizione che rende accettabile tutto il resto della decisione K.
+    if n_slot < 2 {
+        return Err(Error::Format("un gruppo vuole almeno due slot"));
     }
     if n_slot > MAX_SLOT {
         return Err(Error::Format("troppi destinatari"));

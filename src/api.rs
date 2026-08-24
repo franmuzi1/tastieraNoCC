@@ -85,13 +85,21 @@ pub struct DecryptedMessage {
     pub sender: PublicKey,
     pub sender_status: SenderStatus,
     pub plaintext: Plaintext,
-    /// Quante persone potevano leggerlo, mittente compreso. `1` per un
-    /// messaggio a due.
+    /// Questo messaggio veniva da un **gruppo**.
     ///
-    /// Non e' una curiosita': un messaggio di gruppo **non ha forward
-    /// secrecy** (decisione K1), e chi legge deve poterlo sapere. La condizione
-    /// che accompagna quella decisione e' che l'interfaccia lo dica, e
-    /// l'interfaccia puo' dirlo solo se il dato arriva fin qui.
+    /// Un flag esplicito e non una soglia sul conteggio, ed e' una correzione:
+    /// prima si deduceva da `destinatari > 1`, e un blob costruito con un solo
+    /// slot si presentava come un normale messaggio a due — pur essendo un
+    /// `version = 2` senza forward secrecy. Saltava cosi' la condizione che
+    /// accompagna la decisione K1, quella che il documento chiama "cio' che
+    /// rende accettabile tutto il resto". Un numero non e' una semantica.
+    ///
+    /// Ora il parser rifiuta i gruppi sotto i due slot, ma il flag resta:
+    /// dedurre un fatto da una soglia e' fragile una volta e lo sara' ancora.
+    pub gruppo: bool,
+    /// Quanti slot aveva il blob, cioe' quante persone potevano leggerlo,
+    /// mittente compreso. **`0` quando [gruppo] e' falso**, perche' li' il
+    /// numero non descrive niente che valga la pena mostrare.
     pub destinatari: usize,
 }
 
@@ -246,7 +254,8 @@ impl<K: Keyring> Session<K> {
                 }
                 let sender_status = self.pin_and_classify(&peer, now_unix)?;
                 Ok(IncomingItem::Message(DecryptedMessage {
-                    destinatari: 1,
+                    gruppo: false,
+                    destinatari: 0,
                     sender: peer,
                     sender_status,
                     plaintext,
@@ -258,7 +267,8 @@ impl<K: Keyring> Session<K> {
                 self.current_peer
                     .insert(app_package.to_owned(), sender.clone());
                 Ok(IncomingItem::Message(DecryptedMessage {
-                    destinatari: 1,
+                    gruppo: false,
+                    destinatari: 0,
                     sender,
                     sender_status,
                     plaintext,
@@ -276,7 +286,8 @@ impl<K: Keyring> Session<K> {
                 self.current_peer
                     .insert(app_package.to_owned(), sender.clone());
                 Ok(IncomingItem::Message(DecryptedMessage {
-                    destinatari: 1,
+                    gruppo: false,
+                    destinatari: 0,
                     sender,
                     sender_status,
                     plaintext,
@@ -319,7 +330,8 @@ impl<K: Keyring> Session<K> {
                     .insert(app_package.to_owned(), sender.clone());
 
                 Ok(IncomingItem::Message(DecryptedMessage {
-                    destinatari: 1,
+                    gruppo: false,
+                    destinatari: 0,
                     sender,
                     sender_status,
                     plaintext,
@@ -334,7 +346,27 @@ impl<K: Keyring> Session<K> {
             // un processo che muore.
             ParsedBlob::Group(parsed) => {
                 let (mittente, plaintext) = self.apri_di_gruppo(&parsed)?;
-                let sender_status = self.pin_and_classify(&mittente, now_unix)?;
+                // Se ad aprire e' stata la nostra chiave stiamo rileggendo un
+                // messaggio nostro: **non si fissa niente**. Senza questa
+                // guardia `tofu_pin` metteva l'utente fra i propri contatti —
+                // la rubrica che mente, lo stesso difetto gia' corretto per le
+                // presentazioni — e l'interfaccia riceveva "mittente mai visto"
+                // su un messaggio scritto da lei.
+                //
+                // Gli altri percorsi la guardia ce l'hanno gia': quello statico
+                // intercetta il proprio mittente prima di decifrare, quello a
+                // epoca usa il flag `nostro`. Il gruppo era l'unico senza.
+                let sender_status = if mittente == self.identity.public() {
+                    // Non `New`, che farebbe chiedere "chi e'?" su una frase
+                    // propria. Per un gruppo l'autore non si mostra comunque
+                    // (K6), quindi qui non si sta affermando niente all'utente.
+                    SenderStatus::Known {
+                        label: None,
+                        verified: false,
+                    }
+                } else {
+                    self.pin_and_classify(&mittente, now_unix)?
+                };
                 // **Non si tocca il destinatario corrente**, e non e' una
                 // dimenticanza. La regola "decifrare stabilisce con chi si
                 // parla" vale fra due persone; qui l'altro capo e' un gruppo, e
@@ -342,6 +374,7 @@ impl<K: Keyring> Session<K> {
                 // in privato — dentro la chat dove tutti gli altri la
                 // aspettano. Il gruppo lo sceglie chi scrive, sopra di qui.
                 Ok(IncomingItem::Message(DecryptedMessage {
+                    gruppo: true,
                     destinatari: parsed.slot_count(),
                     sender: mittente,
                     sender_status,
@@ -1575,6 +1608,7 @@ mod tests {
             assert_eq!(messaggio.sender, chiave_alice);
             // Tre slot: babbo, mamma e Alice. Serve a dire in interfaccia che
             // un messaggio di gruppo non ha forward secrecy.
+            assert!(messaggio.gruppo);
             assert_eq!(messaggio.destinatari, 3);
         }
 
@@ -1590,6 +1624,46 @@ mod tests {
         // mittente come destinatario. Altrimenti la risposta partirebbe in
         // privato a lui, dentro la chat dove tutti aspettano di leggerla.
         assert_eq!(babbo.current_peer(WHATSAPP), None);
+    }
+
+    /// Rileggere un proprio messaggio di gruppo non deve mettere l'utente fra
+    /// i propri contatti: e' la rubrica che mente, gia' corretta altrove.
+    #[test]
+    fn rileggere_un_proprio_gruppo_non_fissa_se_stessi() {
+        let mut alice = sessione(1);
+        let babbo = sessione(2).identity.public();
+        alice.keyring.tofu_pin(&babbo, 1).unwrap();
+        let quanti_prima = alice.keyring.peers().unwrap().len();
+
+        let blob = alice
+            .encrypt_group(&[babbo], b"ciao a tutti", 50, &mut rng(6))
+            .unwrap();
+        let IncomingItem::Message(riletto) =
+            alice.handle_incoming_text(WHATSAPP, &blob, 51).unwrap()
+        else {
+            panic!("atteso un messaggio")
+        };
+
+        assert_eq!(riletto.plaintext.as_bytes(), b"ciao a tutti");
+        assert!(riletto.gruppo);
+        assert_eq!(riletto.sender, alice.identity.public());
+        // LA RIGA CHE CONTA: la rubrica non e' cresciuta.
+        assert_eq!(alice.keyring.peers().unwrap().len(), quanti_prima);
+        // E non si chiede "chi e'?" su una frase propria.
+        assert!(matches!(riletto.sender_status, SenderStatus::Known { .. }));
+    }
+
+    /// Un gruppo da uno slot solo si presentava come un messaggio a due: un
+    /// `version = 2` senza forward secrecy con la faccia di uno che ce l'ha.
+    #[test]
+    fn un_gruppo_da_uno_slot_non_esiste() {
+        let mut alice = sessione(1);
+        let mia = alice.identity.public();
+        alice.keyring.tofu_pin(&mia, 1).unwrap();
+        // Unico destinatario: se stessa. Dopo la dedup resterebbe uno slot.
+        assert!(alice
+            .encrypt_group(&[mia], b"ciao", 1, &mut rng(7))
+            .is_err());
     }
 
     #[test]
