@@ -325,12 +325,29 @@ pub const MAX_PREKEY_MIE: usize = 32;
 
 /// Una riga di [`PrekeyStore::dump`]: contatto, la sua ultima prekey pubblica,
 /// le nostre private dalla piu' recente, la nostra epoca.
-pub type PrekeyRecord = (
-    PublicKey,
-    Option<PublicKey>,
-    Vec<[u8; KEY_LEN]>,
-    Option<[u8; KEY_LEN]>,
-);
+/// Una riga di [`PrekeyStore::dump`].
+///
+/// Una **struttura** e non una tupla, e il motivo e' la storia di questo tipo:
+/// era una coppia, poi una tripla, poi una quadrupla, e ogni volta chi
+/// persisteva doveva riallineare le posizioni a mano. Con due
+/// `Option<PublicKey>` che significano cose opposte — la prechiave a rotazione
+/// e la chiave d'epoca — scambiarle di posto sarebbe un difetto silenzioso, e
+/// di quel difetto ne abbiamo gia' pagati due.
+pub struct PrekeyRecord {
+    pub peer: PublicKey,
+    /// La sua prechiave a rotazione (catena di forward secrecy).
+    pub sua_prekey: Option<PublicKey>,
+    /// Le nostre prechiavi, dalla piu' recente.
+    pub mie: Vec<[u8; KEY_LEN]>,
+    /// La nostra epoca verso di lui. Privata.
+    pub mia_epoca: Option<[u8; KEY_LEN]>,
+    /// La sua epoca verso di noi. Pubblica.
+    pub sua_epoca: Option<PublicKey>,
+    /// Vedi `PrekeyStore::seen_at`.
+    pub visto_a: i64,
+    /// Vedi `PrekeyStore::burned_at`.
+    pub rogo_a: i64,
+}
 
 /// Lo stato per contatto della catena di forward secrecy.
 ///
@@ -362,6 +379,38 @@ pub struct PrekeyStore {
     /// avesse bruciato** — con `Error::Crypto`, indistinguibile da un blob
     /// rovinato. C'e' la sonda in `api.rs`.
     epoche: Vec<(PublicKey, Zeroizing<[u8; KEY_LEN]>)>,
+    /// La chiave d'epoca DEL PEER. Pubblica.
+    ///
+    /// La meta' simmetrica del campo qui sopra, e mancava. `loro` e' la
+    /// prechiave a rotazione della catena: mettendoci dentro anche l'epoca, chi
+    /// cifra con la forward secrecy accesa la ripescava e ci cifrava contro
+    /// come se fosse una prechiave. Chi riceveva cercava la privata fra le
+    /// proprie prekey — dove non c'e', sta nella sua epoca — e il messaggio non
+    /// si apriva. Per sempre, con `Error::Crypto`.
+    ///
+    /// Succede fra due persone con l'interruttore impostato in modo diverso,
+    /// che e' il caso normale: uno lo lascia acceso (il default), l'altro lo
+    /// spegne per avere la cronologia.
+    epoche_loro: Vec<(PublicKey, PublicKey)>,
+    /// Quando abbiamo accettato per l'ultima volta materiale da quel contatto,
+    /// secondo l'orologio di CHI HA SCRITTO.
+    ///
+    /// Serve a non tornare indietro. Un blob resta valido per sempre, quindi
+    /// rileggere un messaggio vecchio reinstallava la chiave di allora: dopo un
+    /// rogo, l'epoca pre-rogo dell'altro — che lui ha distrutto — e da quel
+    /// momento i nostri messaggi gli arrivavano illeggibili, in silenzio.
+    ///
+    /// Non e' un giudizio sull'orologio altrui, che la decisione C vieta: e' un
+    /// confronto con cio' che avevamo gia' accettato da LUI. Se il suo orologio
+    /// va indietro, il peggio che succede e' che il suo prossimo scambio di
+    /// chiavi venga ignorato finche' non recupera.
+    visto_a: Vec<(PublicKey, i64)>,
+    /// Quando abbiamo onorato l'ultimo rogo di quel contatto.
+    ///
+    /// Un blob di rogo si puo' reincollare mesi dopo e distruggere la
+    /// conversazione ripartita nel frattempo. Rifiutare per data assoluta e'
+    /// vietato; rifiutare di **rifare** una cosa gia' fatta no.
+    rogo_a: Vec<(PublicKey, i64)>,
 }
 
 impl PrekeyStore {
@@ -424,6 +473,64 @@ impl PrekeyStore {
     /// Chi dimentica un contatto deve chiamarla: senza, le chiavi private
     /// temporanee verso quella persona resterebbero su disco dopo che l'utente
     /// ha chiesto di cancellarla.
+    /// L'epoca del contatto, se ce l'ha mandata.
+    pub fn peer_epoch(&self, peer: &PublicKey) -> Option<PublicKey> {
+        self.epoche_loro
+            .iter()
+            .find(|(p, _)| p == peer)
+            .map(|(_, k)| k.clone())
+    }
+
+    pub fn set_peer_epoch(&mut self, peer: &PublicKey, epoca: &PublicKey) {
+        match self.epoche_loro.iter_mut().find(|(p, _)| p == peer) {
+            Some((_, k)) => *k = epoca.clone(),
+            None => self.epoche_loro.push((peer.clone(), epoca.clone())),
+        }
+    }
+
+    pub fn seen_at(&self, peer: &PublicKey) -> i64 {
+        self.visto_a
+            .iter()
+            .find(|(p, _)| p == peer)
+            .map(|(_, q)| *q)
+            .unwrap_or(i64::MIN)
+    }
+
+    pub fn set_seen_at(&mut self, peer: &PublicKey, quando: i64) {
+        match self.visto_a.iter_mut().find(|(p, _)| p == peer) {
+            Some((_, q)) => *q = quando.max(*q),
+            None => self.visto_a.push((peer.clone(), quando)),
+        }
+    }
+
+    pub fn burned_at(&self, peer: &PublicKey) -> i64 {
+        self.rogo_a
+            .iter()
+            .find(|(p, _)| p == peer)
+            .map(|(_, q)| *q)
+            .unwrap_or(i64::MIN)
+    }
+
+    pub fn set_burned_at(&mut self, peer: &PublicKey, quando: i64) {
+        match self.rogo_a.iter_mut().find(|(p, _)| p == peer) {
+            Some((_, q)) => *q = quando.max(*q),
+            None => self.rogo_a.push((peer.clone(), quando)),
+        }
+    }
+
+    /// Toglie un segreto dalla catena senza toccare il resto.
+    ///
+    /// Serve quando una vecchia prekey viene **adottata come epoca**: da quel
+    /// momento e' un'altra cosa, e lasciarla anche nella catena la farebbe
+    /// vivere in due posti — con `drop_my_prekeys_older_than` che ne tocca uno
+    /// solo, e un segreto che la forward secrecy dichiara distrutto resterebbe
+    /// sul disco.
+    pub fn forget_my_prekey(&mut self, peer: &PublicKey, secret: &[u8; KEY_LEN]) {
+        if let Some((_, v)) = self.mie.iter_mut().find(|(p, _)| p == peer) {
+            v.retain(|s| &**s != secret);
+        }
+    }
+
     /// La nostra epoca verso quel contatto, se ne esiste una.
     pub fn my_epoch(&self, peer: &PublicKey) -> Option<[u8; KEY_LEN]> {
         self.epoche.iter().find(|(p, _)| p == peer).map(|(_, k)| **k)
@@ -449,46 +556,73 @@ impl PrekeyStore {
         // lo stesso vuoto. Se sopravvivesse qui, `burn` prometterebbe di
         // rendere illeggibile cio' che resterebbe leggibile.
         self.epoche.retain(|(p, _)| p != peer);
+        self.epoche_loro.retain(|(p, _)| p != peer);
+        // `visto_a` e `rogo_a` NON si toccano: sono le difese contro il ritorno
+        // indietro, e azzerarle qui vorrebbe dire che un rogo — che passa
+        // proprio di qui — riapre la porta a un rogo ripubblicato. Sono
+        // contatori monotoni, non stato di conversazione.
     }
 
     /// Per chi deve scrivere lo stato su disco.
     pub fn dump(&self) -> Vec<PrekeyRecord> {
-        let mut fuori: Vec<PrekeyRecord> = Vec::new();
-        for (peer, loro) in &self.loro {
-            fuori.push((
-                peer.clone(),
-                Some(loro.clone()),
-                self.my_prekeys(peer),
-                self.my_epoch(peer),
-            ));
-        }
-        for (peer, _) in &self.mie {
-            if !fuori.iter().any(|(p, _, _, _)| p == peer) {
-                fuori.push((peer.clone(), None, self.my_prekeys(peer), self.my_epoch(peer)));
+        // Un contatto puo' comparire in uno qualunque degli elenchi e non negli
+        // altri — chi usa solo la modalita' bruciabile non ha prekey, chi non ha
+        // mai risposto non ha una sua prechiave — quindi si raccolgono prima
+        // tutti i peer e poi si riempie ogni riga. Prima erano tre giri con tre
+        // controlli di duplicazione, e aggiungere un elenco voleva dire
+        // ricordarsi del quarto giro.
+        let mut peers: Vec<PublicKey> = Vec::new();
+        for chiave in self
+            .loro
+            .iter()
+            .map(|(p, _)| p)
+            .chain(self.mie.iter().map(|(p, _)| p))
+            .chain(self.epoche.iter().map(|(p, _)| p))
+            .chain(self.epoche_loro.iter().map(|(p, _)| p))
+            .chain(self.visto_a.iter().map(|(p, _)| p))
+            .chain(self.rogo_a.iter().map(|(p, _)| p))
+        {
+            if !peers.iter().any(|p| p == chiave) {
+                peers.push(chiave.clone());
             }
         }
-        // Un contatto puo' avere SOLO l'epoca: e' il caso di chi usa la
-        // modalita' bruciabile senza aver mai scambiato una prekey. Senza
-        // questo giro il suo stato non finirebbe su disco e la cronologia
-        // sparirebbe al riavvio.
-        for (peer, _) in &self.epoche {
-            if !fuori.iter().any(|(p, _, _, _)| p == peer) {
-                fuori.push((peer.clone(), None, Vec::new(), self.my_epoch(peer)));
-            }
-        }
-        fuori
+        peers
+            .into_iter()
+            .map(|peer| PrekeyRecord {
+                sua_prekey: self.peer_prekey(&peer),
+                mie: self.my_prekeys(&peer),
+                mia_epoca: self.my_epoch(&peer),
+                sua_epoca: self.peer_epoch(&peer),
+                visto_a: self.seen_at(&peer),
+                rogo_a: self.burned_at(&peer),
+                peer,
+            })
+            .collect()
     }
 
     /// Per chi lo rilegge. Le nostre chiavi vanno passate dalla piu' recente,
     /// cioe' nell'ordine in cui [`Self::dump`] le ha restituite: l'ordine e'
     /// significativo, e' quello che decide cosa cade.
-    pub fn restore(
-        &mut self,
-        peer: &PublicKey,
-        loro: Option<PublicKey>,
-        mie: Vec<[u8; KEY_LEN]>,
-        epoca: Option<[u8; KEY_LEN]>,
-    ) {
+    pub fn restore(&mut self, record: PrekeyRecord) {
+        let PrekeyRecord {
+            peer,
+            sua_prekey: loro,
+            mie,
+            mia_epoca: epoca,
+            sua_epoca,
+            visto_a,
+            rogo_a,
+        } = record;
+        let peer = &peer;
+        if let Some(k) = sua_epoca {
+            self.set_peer_epoch(peer, &k);
+        }
+        if visto_a != i64::MIN {
+            self.set_seen_at(peer, visto_a);
+        }
+        if rogo_a != i64::MIN {
+            self.set_burned_at(peer, rogo_a);
+        }
         if let Some(k) = epoca {
             self.set_my_epoch(peer, k);
         }
@@ -561,6 +695,33 @@ pub trait Keyring {
     /// l'epoca esiste perche' non ruota. Tenerle insieme faceva sparire la
     /// cronologia alla prima lettura di un messaggio a forward secrecy.
     fn my_epoch(&self, peer: &PublicKey) -> Result<Option<[u8; KEY_LEN]>>;
+
+    /// L'epoca del contatto, con cui gli si scrive in modalita' bruciabile.
+    ///
+    /// **Non e' la sua prechiave**, per quanto si assomiglino: una ruota e si
+    /// butta, l'altra no. Tenerle nello stesso posto faceva cifrare verso
+    /// l'epoca credendo di usare una prechiave, e il destinatario non apriva
+    /// piu' niente.
+    fn peer_epoch(&self, peer: &PublicKey) -> Result<Option<PublicKey>>;
+
+    fn set_peer_epoch(&mut self, peer: &PublicKey, epoca: &PublicKey) -> Result<()>;
+
+    /// Da quando accettiamo materiale di quel contatto. Vedi
+    /// `PrekeyStore::seen_at`: serve a non tornare indietro rileggendo un blob
+    /// vecchio.
+    fn seen_at(&self, peer: &PublicKey) -> Result<i64>;
+
+    fn set_seen_at(&mut self, peer: &PublicKey, quando: i64) -> Result<()>;
+
+    /// Quando abbiamo onorato l'ultimo rogo di quel contatto, per non rifarne
+    /// uno gia' fatto.
+    fn burned_at(&self, peer: &PublicKey) -> Result<i64>;
+
+    fn set_burned_at(&mut self, peer: &PublicKey, quando: i64) -> Result<()>;
+
+    /// Toglie dalla catena un segreto adottato come epoca, cosi' non vive in
+    /// due posti.
+    fn forget_my_prekey(&mut self, peer: &PublicKey, secret: &[u8; KEY_LEN]) -> Result<()>;
 
     /// Fissa la nostra epoca verso quel contatto. Chi chiama deve farlo solo
     /// quando non ce n'e' gia' una: sovrascriverla e' come non averla.
@@ -691,8 +852,8 @@ mod tests {
         store.push_my_prekey(&peer(3), [30; KEY_LEN]);
 
         let mut riletto = PrekeyStore::default();
-        for (chi, loro, mie, epoca) in store.dump() {
-            riletto.restore(&chi, loro, mie, epoca);
+        for record in store.dump() {
+            riletto.restore(record);
         }
 
         assert_eq!(riletto.peer_prekey(&peer(1)), Some(peer(50)));

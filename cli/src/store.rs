@@ -25,7 +25,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use keyboard_cipher_core::encoding;
-use keyboard_cipher_core::keys::{
+use keyboard_cipher_core::keys::{PrekeyRecord, 
     Fingerprint, Identity, Keyring, LabelOutcome, PeerRecord, PinOutcome, PrekeyStore, PublicKey,
     KEY_LEN,
 };
@@ -110,6 +110,38 @@ impl FileKeyring {
 }
 
 impl Keyring for FileKeyring {
+    fn peer_epoch(&self, peer: &PublicKey) -> Result<Option<PublicKey>> {
+        Ok(self.prekey.peer_epoch(peer))
+    }
+
+    fn set_peer_epoch(&mut self, peer: &PublicKey, epoca: &PublicKey) -> Result<()> {
+        self.prekey.set_peer_epoch(peer, epoca);
+        Ok(())
+    }
+
+    fn seen_at(&self, peer: &PublicKey) -> Result<i64> {
+        Ok(self.prekey.seen_at(peer))
+    }
+
+    fn set_seen_at(&mut self, peer: &PublicKey, quando: i64) -> Result<()> {
+        self.prekey.set_seen_at(peer, quando);
+        Ok(())
+    }
+
+    fn burned_at(&self, peer: &PublicKey) -> Result<i64> {
+        Ok(self.prekey.burned_at(peer))
+    }
+
+    fn set_burned_at(&mut self, peer: &PublicKey, quando: i64) -> Result<()> {
+        self.prekey.set_burned_at(peer, quando);
+        Ok(())
+    }
+
+    fn forget_my_prekey(&mut self, peer: &PublicKey, secret: &[u8; KEY_LEN]) -> Result<()> {
+        self.prekey.forget_my_prekey(peer, secret);
+        Ok(())
+    }
+
     fn my_epoch(&self, peer: &PublicKey) -> Result<Option<[u8; KEY_LEN]>> {
         Ok(self.prekey.my_epoch(peer))
     }
@@ -312,7 +344,30 @@ pub fn save(path: &Path, secret: &[u8; KEY_LEN], keyring: &FileKeyring) -> io::R
     //
     // Qui c'e' materiale privato in chiaro, come il segreto d'identita' due
     // righe sopra: stesso file, stessi permessi, stessa avvertenza.
-    for (chi, loro, mie, epoca) in keyring.prekey.dump() {
+    for record in keyring.prekey.dump() {
+        let chi = &record.peer;
+        let loro = &record.sua_prekey;
+        let mie = &record.mie;
+        let epoca = &record.mia_epoca;
+        // Righe a se' per l'epoca del peer e per le due date, come per la
+        // nostra: un lettore vecchio scarta le righe che non conosce, mentre una
+        // colonna in piu' su una riga nota la leggerebbe come una prekey.
+        if let Some(k) = &record.sua_epoca {
+            out.push_str("peerepoch ");
+            out.push_str(&encoding::encode(chi.as_bytes()));
+            out.push(' ');
+            out.push_str(&encoding::encode(k.as_bytes()));
+            out.push('\n');
+        }
+        if record.visto_a != i64::MIN || record.rogo_a != i64::MIN {
+            out.push_str("seen ");
+            out.push_str(&encoding::encode(chi.as_bytes()));
+            out.push(' ');
+            out.push_str(&record.visto_a.to_string());
+            out.push(' ');
+            out.push_str(&record.rogo_a.to_string());
+            out.push('\n');
+        }
         // Riga a parte e non una colonna in coda a `chain`: un lettore vecchio
         // scarta le righe che non conosce, mentre una colonna in piu' su una
         // riga nota la leggerebbe come una prekey — cioe' userebbe l'epoca come
@@ -322,7 +377,7 @@ pub fn save(path: &Path, secret: &[u8; KEY_LEN], keyring: &FileKeyring) -> io::R
             out.push_str("epoch ");
             out.push_str(&encoding::encode(chi.as_bytes()));
             out.push(' ');
-            out.push_str(&encoding::encode(&k));
+            out.push_str(&encoding::encode(&k[..]));
             out.push('\n');
         }
         out.push_str("chain ");
@@ -421,10 +476,20 @@ fn parse(text: &str) -> Option<State> {
                         Some("-") | None => None,
                         Some(testo) => chiave(testo),
                     };
-                    let mie = campi.filter_map(segreto_da).collect();
+                    let mie: Vec<[u8; KEY_LEN]> = campi.filter_map(segreto_da).collect();
                     // L'epoca arriva dalla sua riga, che puo' venire prima o
                     // dopo questa: qui non si tocca.
-                    keyring.prekey.restore(&chi, loro, mie, None);
+                    keyring.prekey.restore(PrekeyRecord {
+                        peer: chi,
+                        sua_prekey: loro,
+                        mie,
+                        // Le altre righe arrivano a parte e possono venire
+                        // prima o dopo questa: qui non si toccano.
+                        mia_epoca: None,
+                        sua_epoca: None,
+                        visto_a: i64::MIN,
+                        rogo_a: i64::MIN,
+                    });
                 }
             }
             // Riga introdotta quando l'epoca ha smesso di vivere dentro la
@@ -437,6 +502,35 @@ fn parse(text: &str) -> Option<State> {
                     campi.next().and_then(segreto_da),
                 ) {
                     keyring.prekey.set_my_epoch(&chi, k);
+                }
+            }
+            // L'epoca DEL PEER: riga sua, aggiunta quando ha smesso di vivere
+            // nella prechiave a rotazione. Uno stato scritto prima non ce l'ha,
+            // e il ripiego nel core la ritrova nella prechiave.
+            (Some("peerepoch"), Some(rest)) => {
+                let mut campi = rest.split(' ');
+                if let (Some(chi), Some(k)) = (
+                    campi.next().and_then(chiave),
+                    campi.next().and_then(chiave),
+                ) {
+                    keyring.prekey.set_peer_epoch(&chi, &k);
+                }
+            }
+            // Le due date che impediscono di tornare indietro: l'ultimo
+            // materiale accettato da lui e l'ultimo rogo onorato.
+            (Some("seen"), Some(rest)) => {
+                let mut campi = rest.split(' ');
+                if let Some(chi) = campi.next().and_then(chiave) {
+                    if let Some(q) = campi.next().and_then(|s| s.parse::<i64>().ok()) {
+                        if q != i64::MIN {
+                            keyring.prekey.set_seen_at(&chi, q);
+                        }
+                    }
+                    if let Some(q) = campi.next().and_then(|s| s.parse::<i64>().ok()) {
+                        if q != i64::MIN {
+                            keyring.prekey.set_burned_at(&chi, q);
+                        }
+                    }
                 }
             }
             _ => {}

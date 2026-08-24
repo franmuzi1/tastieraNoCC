@@ -234,6 +234,23 @@ impl<K: Keyring> Session<K> {
             // messaggio travestito, e un messaggio non puo' diventarlo.
             ParsedBlob::Burn(parsed) => {
                 let (peer, sent_at_unix) = self.mittente_di_un_rogo(&parsed)?;
+                // Un rogo gia' onorato non si rifa'. Un blob resta valido per
+                // sempre: chi l'ha visto passare in chat poteva reincollarlo
+                // mesi dopo e distruggere la conversazione ripartita nel
+                // frattempo.
+                //
+                // Non e' un giudizio sulla data, che la decisione C vieta —
+                // sarebbe "questa data e' troppo vecchia, non ti credo". E'
+                // rifiutare di **rifare** una cosa gia' fatta, confrontando con
+                // cio' che abbiamo gia' onorato da lui.
+                //
+                // Si risponde `Crypto` e non un errore suo: distinguere direbbe
+                // a chi ripubblica che il blob era buono e che l'aveva gia'
+                // usato qualcun altro.
+                if sent_at_unix <= self.keyring.burned_at(&peer)? {
+                    return Err(Error::Crypto);
+                }
+                self.keyring.set_burned_at(&peer, sent_at_unix)?;
                 self.keyring.burn_conversation(&peer)?;
                 Ok(IncomingItem::Burned { peer, sent_at_unix })
             }
@@ -281,7 +298,7 @@ impl<K: Keyring> Session<K> {
                 let (sender, prekey, plaintext) = self.prova_i_contatti(&parsed)?;
                 // Da qui in poi gli si puo' rispondere con la forward secrecy
                 // piena: la catena e' partita.
-                self.ricorda_prekey(&sender, &prekey)?;
+                self.ricorda_prekey(&sender, &prekey, plaintext.sent_at_unix())?;
                 let sender_status = self.pin_and_classify(&sender, now_unix)?;
                 self.current_peer
                     .insert(app_package.to_owned(), sender.clone());
@@ -625,7 +642,7 @@ impl<K: Keyring> Session<K> {
             self.prova_le_prekey_sul_file(&parsed)?
         } else if parsed.header.origin.is_ephemeral() {
             let (chi, prekey, aperto) = self.prova_i_contatti_sul_file(&parsed)?;
-            self.ricorda_prekey(&chi, &prekey)?;
+            self.ricorda_prekey(&chi, &prekey, aperto.sent_at_unix)?;
             (chi, aperto)
         } else {
             let sender = parsed
@@ -726,11 +743,11 @@ impl<K: Keyring> Session<K> {
         rng: &mut R,
     ) -> Result<String> {
         let mia = self.mia_epoca(peer, rng)?;
-        match self
-            .keyring
-            .peer_prekey(peer)?
-            .filter(|k| self.identity.diffie_hellman(k).is_ok())
-        {
+        // L'EPOCA del contatto, non la sua prechiave. Prima erano lo stesso
+        // campo, e con la forward secrecy accesa dall'altra parte si finiva per
+        // cifrare verso una chiave la cui privata lui cerca fra le prekey —
+        // dove non c'e'.
+        match self.epoca_del_peer(peer)? {
             Some(sua) => {
                 let (header, ciphertext) = baseline::seal_epoch(
                     &self.identity,
@@ -816,10 +833,7 @@ impl<K: Keyring> Session<K> {
         rng: &mut R,
     ) -> Result<String> {
         let mia = self.mia_epoca(peer, rng)?;
-        let sua = self
-            .keyring
-            .peer_prekey(peer)?
-            .filter(|k| self.identity.diffie_hellman(k).is_ok());
+        let sua = self.epoca_del_peer(peer)?;
         // Senza una sua chiave d'epoca non c'e' niente da bruciare dall'altra
         // parte, ma la richiesta si manda lo stesso: cifrata verso la sua
         // identita', cosi' funziona anche se lui ha gia' bruciato per primo.
@@ -850,11 +864,72 @@ impl<K: Keyring> Session<K> {
     /// costa una riga rifiutarla all'ingresso invece di inciamparci dopo.
     ///
     /// Rifiutandola si tiene quella di prima, e la conversazione continua.
-    fn ricorda_prekey(&mut self, peer: &PublicKey, prekey: &PublicKey) -> Result<()> {
+    /// Prende nota della **prechiave** che il contatto ci ha mandato.
+    ///
+    /// `quando` e' l'orologio di chi ha scritto, preso da dentro il cifrato.
+    /// Materiale piu' vecchio di quello che abbiamo gia' accettato da LUI si
+    /// scarta: un blob resta valido per sempre, e rileggerne uno vecchio
+    /// reinstallava la chiave di allora — dopo un rogo, l'epoca che lui aveva
+    /// distrutto, e da quel momento i nostri messaggi gli arrivavano
+    /// illeggibili senza che nessuno dei due potesse accorgersene.
+    ///
+    /// Non e' un giudizio sul suo orologio, che la decisione C vieta: e' un
+    /// confronto con cio' che avevamo gia' accettato da lui. Se il suo orologio
+    /// torna indietro, il peggio e' che il prossimo scambio venga ignorato
+    /// finche' non recupera.
+    fn ricorda_prekey(&mut self, peer: &PublicKey, prekey: &PublicKey, quando: i64) -> Result<()> {
         if self.identity.diffie_hellman(prekey).is_err() {
             return Ok(());
         }
+        if quando < self.keyring.seen_at(peer)? {
+            return Ok(());
+        }
+        self.keyring.set_seen_at(peer, quando)?;
         self.keyring.set_peer_prekey(peer, prekey)
+    }
+
+    /// Prende nota della **chiave d'epoca** del contatto.
+    ///
+    /// Va in un campo suo e non in quello della prechiave: una ruota e si
+    /// butta, l'altra no. Mescolate, chi cifrava con la forward secrecy accesa
+    /// ripescava l'epoca e ci cifrava contro come se fosse una prechiave — e
+    /// chi riceveva non apriva piu' niente, perche' la privata di quella chiave
+    /// sta nella sua epoca e non fra le sue prekey.
+    ///
+    /// Stessa regola di recenza di [`Self::ricorda_prekey`].
+    /// L'epoca del contatto, con il ripiego sullo stato salvato prima che
+    /// avesse un campo suo.
+    ///
+    /// Il ripiego non indovina: quello che c'e' nella prechiave e' una chiave
+    /// che il contatto ci ha mandato davvero, e prima della separazione era
+    /// **anche** l'unico posto in cui la sua epoca finiva. Si esaurisce da solo
+    /// quando lui ce ne manda una nuova.
+    fn epoca_del_peer(&self, peer: &PublicKey) -> Result<Option<PublicKey>> {
+        if let Some(epoca) = self.keyring.peer_epoch(peer)? {
+            if self.identity.diffie_hellman(&epoca).is_ok() {
+                return Ok(Some(epoca));
+            }
+        }
+        Ok(self
+            .keyring
+            .peer_prekey(peer)?
+            .filter(|k| self.identity.diffie_hellman(k).is_ok()))
+    }
+
+    fn ricorda_epoca_del_peer(
+        &mut self,
+        peer: &PublicKey,
+        epoca: &PublicKey,
+        quando: i64,
+    ) -> Result<()> {
+        if self.identity.diffie_hellman(epoca).is_err() {
+            return Ok(());
+        }
+        if quando < self.keyring.seen_at(peer)? {
+            return Ok(());
+        }
+        self.keyring.set_seen_at(peer, quando)?;
+        self.keyring.set_peer_epoch(peer, epoca)
     }
 
     /// Apre un messaggio a epoca. Il terzo valore dice se l'abbiamo scritto noi.
@@ -883,7 +958,7 @@ impl<K: Keyring> Session<K> {
                 let aperto = if bootstrap {
                     baseline::open_epoch_bootstrap_as_sender(&self.identity, &candidato, parsed)
                 } else {
-                    let Some(sua) = self.keyring.peer_prekey(&candidato)? else {
+                    let Some(sua) = self.epoca_del_peer(&candidato)? else {
                         continue;
                     };
                     baseline::open_epoch_as_sender(&self.identity, &sua, parsed)
@@ -902,7 +977,7 @@ impl<K: Keyring> Session<K> {
         if bootstrap {
             let (sua_epoca, plaintext) =
                 baseline::open_epoch_bootstrap(&self.identity, &mittente, parsed)?;
-            self.ricorda_prekey(&mittente, &sua_epoca)?;
+            self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix())?;
             return Ok((mittente, plaintext, false));
         }
 
@@ -912,7 +987,7 @@ impl<K: Keyring> Session<K> {
         if let Some(segreto) = self.keyring.my_epoch(&mittente)? {
             let mia = keys::EphemeralSecret::from_bytes(segreto);
             if let Ok((sua_epoca, plaintext)) = baseline::open_epoch(&mia, &mittente, parsed) {
-                self.ricorda_prekey(&mittente, &sua_epoca)?;
+                self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix())?;
                 return Ok((mittente, plaintext, false));
             }
         }
@@ -929,9 +1004,14 @@ impl<K: Keyring> Session<K> {
             let Ok((sua_epoca, plaintext)) = baseline::open_epoch(&mia, &mittente, parsed) else {
                 continue;
             };
-            // Si adotta come epoca: da qui in avanti sta nel posto giusto.
+            // Si adotta come epoca, e si toglie dalla catena: da qui in avanti
+            // sta in UN posto solo. Lasciandolo in tutti e due,
+            // `drop_my_prekeys_older_than` ne avrebbe toccato uno, e un segreto
+            // che la forward secrecy dichiara distrutto sarebbe rimasto sul
+            // disco come epoca.
             self.keyring.set_my_epoch(&mittente, segreto)?;
-            self.ricorda_prekey(&mittente, &sua_epoca)?;
+            self.keyring.forget_my_prekey(&mittente, &segreto)?;
+            self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix())?;
             return Ok((mittente, plaintext, false));
         }
         Err(Error::Crypto)
@@ -1079,7 +1159,7 @@ impl<K: Keyring> Session<K> {
                 else {
                     continue;
                 };
-                self.ricorda_prekey(&candidato, &prossima)?;
+                self.ricorda_prekey(&candidato, &prossima, aperto.sent_at_unix)?;
                 self.keyring
                     .drop_my_prekeys_older_than(&candidato, &segreto)?;
                 return Ok((candidato, aperto));
@@ -1148,7 +1228,7 @@ impl<K: Keyring> Session<K> {
                 else {
                     continue;
                 };
-                self.ricorda_prekey(&candidato, &prossima)?;
+                self.ricorda_prekey(&candidato, &prossima, plaintext.sent_at_unix())?;
                 self.keyring
                     .drop_my_prekeys_older_than(&candidato, &segreto)?;
                 return Ok((candidato, plaintext));
@@ -1186,7 +1266,7 @@ impl<K: Keyring> Session<K> {
                     let aperto = if bootstrap {
                         baseline::open_epoch_bootstrap_as_sender(&self.identity, &candidato, &parsed)
                     } else {
-                        let Some(sua) = self.keyring.peer_prekey(&candidato)? else {
+                        let Some(sua) = self.epoca_del_peer(&candidato)? else {
                             continue;
                         };
                         baseline::open_epoch_as_sender(&self.identity, &sua, &parsed)
@@ -1356,6 +1436,38 @@ mod tests {
 
         fn my_epoch(&self, peer: &PublicKey) -> Result<Option<[u8; 32]>> {
             Ok(self.prekey.my_epoch(peer))
+        }
+
+        fn peer_epoch(&self, peer: &PublicKey) -> Result<Option<PublicKey>> {
+            Ok(self.prekey.peer_epoch(peer))
+        }
+
+        fn set_peer_epoch(&mut self, peer: &PublicKey, epoca: &PublicKey) -> Result<()> {
+            self.prekey.set_peer_epoch(peer, epoca);
+            Ok(())
+        }
+
+        fn seen_at(&self, peer: &PublicKey) -> Result<i64> {
+            Ok(self.prekey.seen_at(peer))
+        }
+
+        fn set_seen_at(&mut self, peer: &PublicKey, quando: i64) -> Result<()> {
+            self.prekey.set_seen_at(peer, quando);
+            Ok(())
+        }
+
+        fn burned_at(&self, peer: &PublicKey) -> Result<i64> {
+            Ok(self.prekey.burned_at(peer))
+        }
+
+        fn set_burned_at(&mut self, peer: &PublicKey, quando: i64) -> Result<()> {
+            self.prekey.set_burned_at(peer, quando);
+            Ok(())
+        }
+
+        fn forget_my_prekey(&mut self, peer: &PublicKey, secret: &[u8; 32]) -> Result<()> {
+            self.prekey.forget_my_prekey(peer, secret);
+            Ok(())
         }
 
         fn set_my_epoch(&mut self, peer: &PublicKey, secret: [u8; 32]) -> Result<()> {
@@ -1722,6 +1834,88 @@ mod tests {
             alice.encrypt_group(&[estraneo], b"ciao", 1, &mut rng(5)),
             Err(Error::UnknownPeer)
         ));
+    }
+
+    /// SONDA. Due persone con l'interruttore impostato in modo diverso — uno
+    /// lo lascia acceso (il default), l'altro lo spegne per avere la cronologia
+    /// — devono potersi scrivere in tutti e due i versi.
+    ///
+    /// Prima no: l'epoca del contatto finiva nello stesso campo della sua
+    /// prechiave, e chi cifrava con la forward secrecy accesa ci cifrava contro
+    /// come se fosse una prechiave. Chi riceveva cercava la privata fra le
+    /// proprie prekey — dove non c'e' — e ogni risposta era persa, per sempre,
+    /// con `Error::Crypto`: lo stesso errore di un blob rovinato.
+    #[test]
+    fn interruttori_diversi_si_parlano_lo_stesso() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity.public();
+        let chiave_bob = bob.identity.public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+        bob.set_current_peer(WHATSAPP, &chiave_alice).unwrap();
+
+        // Alice tiene la forward secrecy SPENTA: vuole la cronologia.
+        // Bob la tiene ACCESA, che e' il default.
+        for giro in 0..3i64 {
+            let da_alice = alice
+                .encrypt_for_app_with(WHATSAPP, b"da alice", 100 + giro, &mut rng(1), false)
+                .unwrap();
+            let IncomingItem::Message(letto) =
+                bob.handle_incoming_text(WHATSAPP, &da_alice, 101 + giro).unwrap()
+            else {
+                panic!("Bob non ha letto il messaggio di Alice al giro {giro}")
+            };
+            assert_eq!(letto.plaintext.as_bytes(), b"da alice");
+
+            let da_bob = bob
+                .encrypt_for_app_with(WHATSAPP, b"da bob", 102 + giro, &mut rng(2), true)
+                .unwrap();
+            // LA RIGA CHE CONTA: prima qui usciva Error::Crypto, ogni volta.
+            let esito = alice.handle_incoming_text(WHATSAPP, &da_bob, 103 + giro);
+            let IncomingItem::Message(risposta) = esito.unwrap() else {
+                panic!("Alice non ha letto la risposta di Bob al giro {giro}")
+            };
+            assert_eq!(risposta.plaintext.as_bytes(), b"da bob");
+        }
+    }
+
+    /// SONDA. Un rogo gia' onorato non si rifa': il blob resta valido per
+    /// sempre, e chi l'ha visto passare poteva reincollarlo per distruggere la
+    /// conversazione ripartita nel frattempo.
+    #[test]
+    fn un_rogo_ripubblicato_non_brucia_di_nuovo() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity.public();
+        let chiave_bob = bob.identity.public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+        bob.set_current_peer(WHATSAPP, &chiave_alice).unwrap();
+
+        let apertura = alice
+            .encrypt_for_app_with(WHATSAPP, b"ciao", 10, &mut rng(1), false)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &apertura, 11).unwrap();
+
+        let richiesta = alice.burn_conversation(&chiave_bob, 12, &mut rng(7)).unwrap();
+        // La prima volta si onora.
+        let esito = bob.handle_incoming_text(WHATSAPP, &richiesta, 13).unwrap();
+        assert!(matches!(esito, IncomingItem::Burned { .. }));
+
+        // La conversazione riparte.
+        let nuova = alice
+            .encrypt_for_app_with(WHATSAPP, b"ricominciamo", 20, &mut rng(3), false)
+            .unwrap();
+        bob.handle_incoming_text(WHATSAPP, &nuova, 21).unwrap();
+
+        // Lo stesso blob di rogo, reincollato: NON deve bruciare la
+        // conversazione nuova.
+        assert!(bob.handle_incoming_text(WHATSAPP, &richiesta, 22).is_err());
+        // E la conversazione nuova regge: si legge ancora.
+        assert!(bob.open_archived(&nuova).is_ok());
     }
 
     /// SONDA (decisione J). L'epoca non deve ruotare: e' cio' che fa esistere la
@@ -2123,7 +2317,7 @@ mod tests {
         alice.keyring.tofu_pin(&chiave_carla, 1).unwrap();
         carla.keyring.tofu_pin(&alice.identity().public(), 1).unwrap();
         carla.set_current_peer(WHATSAPP, &alice.identity().public()).unwrap();
-        alice.ricorda_prekey(&chiave_carla, &veleno).unwrap();
+        alice.ricorda_prekey(&chiave_carla, &veleno, 1).unwrap();
         assert!(alice.keyring.peer_prekey(&chiave_carla).unwrap().is_none());
     }
 
