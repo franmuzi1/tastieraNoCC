@@ -921,6 +921,43 @@ spazio a ogni messaggio, anche a quelli di due persone. Registrato come
 **scelta**, non come dimenticanza: chi un giorno volesse nasconderlo aggiunga
 slot fino a un numero fisso, e paghi.
 
+**K6, chiusa: nel gruppo l'autore NON e' autenticato, e non si mostra.**
+
+Il payload e' cifrato con la chiave di contenuto, che per costruzione ce l'hanno
+**tutti** i membri — e' il senso stesso di K1. Il suo AAD lega versione, kind,
+tier, flag, effimera e conteggio: niente che dica **chi ha scritto**. Quindi
+qualunque membro che abbia aperto il messaggio puo' cifrarne un altro con la
+stessa chiave, lo stesso nonce e lo stesso AAD, rimontare gli **slot originali
+byte per byte**, e ottenere un blob indistinguibile. Chi riceve attribuisce il
+testo al mittente originale, perche' il mittente si deduce da quale slot si apre
+— e gli slot non sono stati toccati. Anche il presunto autore, rileggendo, si
+vede attribuita una frase che non ha scritto.
+
+Non e' la negabilita' voluta dello schema statico-statico: li' chi puo'
+falsificare e' il solo destinatario e solo verso se stesso. **Qui la
+falsificazione e' verso terzi.**
+
+Le tre vie erano: firmare il payload (toglie la negabilita', che altrove il
+progetto tiene apposta), un MAC per destinatario (allarga ogni slot), oppure
+accettarlo e non mostrare l'autore. **Scelta la terza, esplicitamente.**
+
+Da qui la regola, che e' una condizione e non un consiglio: **l'interfaccia non
+mostra un autore per i messaggi di gruppo.** Niente nome, niente impronta,
+niente "verificato". Si mostra che e' un messaggio di gruppo, quante persone
+potevano leggerlo, e che chi l'ha scritto non e' stabilibile. Mostrare un nome
+accanto a un testo che qualunque membro puo' aver riscritto e' peggio che non
+mostrare niente: e' una garanzia inventata.
+
+**Cosa il campo `sender` significa ancora**, perche' resta ed e' utile: chi ha
+costruito **gli slot**. Aprire uno slot prova che chi l'ha fatto conosceva
+`DH(mittente, destinatario)`, quindi quel campo non e' falso — e' solo
+insufficiente ad attribuire il testo. Chi lo usa deve saperlo: serve a capire
+con chi si sta parlando, non a dire chi ha scritto.
+
+*Se un giorno il gruppo dovesse autenticare l'autore*, la via e' un MAC per
+destinatario dentro lo slot, e sarebbe `version = 3`. Non e' un'aggiunta
+compatibile.
+
 **K5, gruppi salvati E selezione al momento.** Si spuntano piu' contatti quando
 si sceglie il destinatario, e quella selezione si puo' salvare con un nome
 («Famiglia»). Il gruppo salvato e' un'etichetta locale sopra un insieme di

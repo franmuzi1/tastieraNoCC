@@ -72,6 +72,16 @@ pub enum SenderStatus {
 
 /// Esito di una decifratura riuscita.
 pub struct DecryptedMessage {
+    /// Chi ha costruito il messaggio.
+    ///
+    /// **Per un gruppo (`destinatari > 1`) questo NON e' l'autore del testo**,
+    /// ed e' una distinzione che l'interfaccia deve rispettare (decisione K6).
+    /// Aprire uno slot prova che chi l'ha fatto conosceva
+    /// `DH(mittente, destinatario)`, quindi il campo non e' falso: e' solo
+    /// insufficiente. Il payload e' cifrato con una chiave che tutti i membri
+    /// hanno, e chiunque di loro puo' riscriverlo tenendo gli slot originali.
+    ///
+    /// Serve a sapere con chi si sta parlando, non a dire chi ha scritto.
     pub sender: PublicKey,
     pub sender_status: SenderStatus,
     pub plaintext: Plaintext,
