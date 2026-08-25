@@ -47,7 +47,15 @@ const MAX_META_LEN: usize = 512;
 const LEN_FIELD: usize = 2;
 
 /// Nome e tipo di un file, dalla parte cifrata.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// **Niente `Debug`**, ed e' la stessa regola che tiene fuori dai log le chiavi
+/// private: questi due campi vengono da **dentro** il cifrato, quindi sono
+/// chiaro a tutti gli effetti. Il nome di un file e' il metadato piu' parlante
+/// che ci sia — la decisione G3 lo butta in uscita proprio per questo — e un
+/// `Debug` derivato basta a farlo ricomparire in un messaggio di panic o in una
+/// riga di log. Chi nei test vuole confrontarli usi i campi, come si fa gia'
+/// con `Backup`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct FileMeta {
     /// Nome originale. **Da trattare come ostile**: arriva da chi ha mandato il
     /// file, e chi lo salva deve ripulirlo — un nome puo' contenere `../`, un
@@ -57,6 +65,21 @@ pub struct FileMeta {
     /// vale esattamente quanto la parola di chi l'ha scritto: un `image/jpeg`
     /// non garantisce che dentro ci sia un'immagine.
     pub mime: String,
+}
+
+/// Il nome e il tipo spariscono dalla memoria quando la struttura muore.
+///
+/// `String` da sola non si azzera: lascia in heap l'allocazione con dentro il
+/// nome, fino al riuso. Si fa qui e non cambiando i campi in `Zeroizing<String>`
+/// perche' questi due campi li leggono tutte e tre le interfacce, e un tipo
+/// avvolto costringerebbe ognuna a scartarlo per farne qualcosa — un fastidio
+/// ripetuto tre volte, in cambio della stessa identica garanzia.
+impl Drop for FileMeta {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.name.zeroize();
+        self.mime.zeroize();
+    }
 }
 
 /// Un file decifrato.
@@ -290,7 +313,11 @@ mod tests {
         let parsed = parse_file(&blob).unwrap();
         let out = open_file(&bob, &alice.public(), &parsed).unwrap();
 
-        assert_eq!(out.meta, meta());
+        // Campo per campo, e non `assert_eq!` sulla struttura: `FileMeta` non
+        // ha `Debug` apposta, e reintrodurlo per comodita' di un test
+        // rimetterebbe il nome del file dentro i messaggi di panic.
+        assert_eq!(out.meta.name, meta().name);
+        assert_eq!(out.meta.mime, meta().mime);
         assert_eq!(out.content.as_slice(), content.as_slice());
         assert_eq!(out.sent_at_unix, 1_700_000_000);
     }

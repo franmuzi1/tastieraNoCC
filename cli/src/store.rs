@@ -95,17 +95,21 @@ impl FileKeyring {
     /// persona". Cancellare un contatto non e' come cancellare una riga da una
     /// rubrica.
     pub fn remove(&mut self, peer: &PublicKey) -> bool {
-        match self.position(peer) {
-            Some(indice) => {
-                self.peers.remove(indice);
-                // Anche le chiavi temporanee verso di lui: restare su disco
-                // dopo che l'utente ha cancellato il contatto sarebbe il
-                // contrario di quello che ha chiesto.
-                self.prekey.forget(peer);
-                true
-            }
-            None => false,
+        // `retain` e non `position` + `remove`: quello toglieva **il primo**
+        // che combaciava, e una chiave presente due volte farebbe ricomparire
+        // il contatto dopo che l'utente lo ha cancellato. Qui l'elenco arriva
+        // da un file di testo su disco, quindi il duplicato non e' un'ipotesi
+        // di scuola: basta una riga incollata due volte a mano.
+        let prima = self.peers.len();
+        self.peers.retain(|p| &p.public != peer);
+        if self.peers.len() == prima {
+            return false;
         }
+        // Anche le chiavi temporanee verso di lui: restare su disco dopo che
+        // l'utente ha cancellato il contatto sarebbe il contrario di quello
+        // che ha chiesto.
+        self.prekey.forget(peer);
+        true
     }
 }
 
@@ -142,7 +146,7 @@ impl Keyring for FileKeyring {
         Ok(())
     }
 
-    fn my_epoch(&self, peer: &PublicKey) -> Result<Option<[u8; KEY_LEN]>> {
+    fn my_epoch(&self, peer: &PublicKey) -> Result<Option<Zeroizing<[u8; KEY_LEN]>>> {
         Ok(self.prekey.my_epoch(peer))
     }
 
@@ -168,7 +172,7 @@ impl Keyring for FileKeyring {
         Ok(())
     }
 
-    fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<[u8; KEY_LEN]>> {
+    fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<Zeroizing<[u8; KEY_LEN]>>> {
         Ok(self.prekey.my_prekeys(peer))
     }
 
@@ -391,7 +395,7 @@ pub fn save(path: &Path, secret: &[u8; KEY_LEN], keyring: &FileKeyring) -> io::R
         });
         for segreto in mie.iter() {
             out.push(' ');
-            out.push_str(&encoding::encode(segreto));
+            out.push_str(&encoding::encode(&**segreto));
         }
         out.push('\n');
     }
@@ -482,7 +486,7 @@ fn parse(text: &str) -> Option<State> {
                     keyring.prekey.restore(PrekeyRecord {
                         peer: chi,
                         sua_prekey: loro,
-                        mie,
+                        mie: mie.into_iter().map(Zeroizing::new).collect(),
                         // Le altre righe arrivano a parte e possono venire
                         // prima o dopo questa: qui non si toccano.
                         mia_epoca: None,
@@ -551,6 +555,12 @@ fn parse(text: &str) -> Option<State> {
 mod tests {
     use super::*;
 
+    /// Le asserzioni confrontano array nudi: `Zeroizing` in mezzo le
+    /// renderebbe illeggibili senza dire niente di piu'.
+    fn nude(v: Vec<Zeroizing<[u8; KEY_LEN]>>) -> Vec<[u8; KEY_LEN]> {
+        v.into_iter().map(|k| *k).collect()
+    }
+
     fn secret() -> [u8; KEY_LEN] {
         [7u8; KEY_LEN]
     }
@@ -605,12 +615,12 @@ mod tests {
 
         assert_eq!(loaded.keyring.peer_prekey(&peer(1)).unwrap(), Some(peer(50)));
         assert_eq!(
-            loaded.keyring.my_prekeys(&peer(1)).unwrap(),
+            nude(loaded.keyring.my_prekeys(&peer(1)).unwrap()),
             vec![[11; KEY_LEN], [10; KEY_LEN]]
         );
         assert_eq!(loaded.keyring.peer_prekey(&peer(2)).unwrap(), None);
         assert_eq!(
-            loaded.keyring.my_prekeys(&peer(2)).unwrap(),
+            nude(loaded.keyring.my_prekeys(&peer(2)).unwrap()),
             vec![[20; KEY_LEN]]
         );
         let _ = std::fs::remove_dir_all(&dir);

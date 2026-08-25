@@ -12,6 +12,7 @@
 //! Il formato di questo blob NON e' il formato sul filo: e' storage locale, e
 //! puo' cambiare fra versioni dell'app senza rompere niente.
 
+use zeroize::Zeroizing;
 use keyboard_cipher_core::error::{Error, Result};
 use keyboard_cipher_core::keys::{PrekeyRecord, 
     Fingerprint, Keyring, LabelOutcome, PeerRecord, PinOutcome, PrekeyStore, PublicKey, KEY_LEN,
@@ -131,14 +132,14 @@ impl MemoryKeyring {
             let quante_mie = u8::try_from(mie.len()).unwrap_or(0);
             out.push(quante_mie);
             for segreto in mie.iter().take(usize::from(quante_mie)) {
-                out.extend_from_slice(segreto);
+                out.extend_from_slice(&**segreto);
             }
             // L'epoca in coda al record, con il suo byte di presenza: un
             // contatto puo' averla senza prekey e viceversa.
             match epoca {
                 Some(k) => {
                     out.push(1);
-                    out.extend_from_slice(k);
+                    out.extend_from_slice(&**k);
                 }
                 None => out.push(0),
             }
@@ -243,7 +244,7 @@ impl MemoryKeyring {
                 }
                 let mut mie = Vec::with_capacity(quante_mie);
                 for _ in 0..quante_mie {
-                    mie.push(prendi_chiave(&mut cursor)?);
+                    mie.push(Zeroizing::new(prendi_chiave(&mut cursor)?));
                 }
                 // Solo dalla 3 in poi: nella 2 qui finiva gia' il record.
                 let epoca = if version != STORAGE_VERSION_SENZA_EPOCA {
@@ -270,7 +271,7 @@ impl MemoryKeyring {
                     peer: chi,
                     sua_prekey: loro,
                     mie,
-                    mia_epoca: epoca,
+                    mia_epoca: epoca.map(Zeroizing::new),
                     sua_epoca,
                     visto_a,
                     rogo_a,
@@ -299,17 +300,25 @@ impl Keyring for MemoryKeyring {
     }
 
     fn forget(&mut self, peer: &PublicKey) -> Result<bool> {
-        match self.peers.iter().position(|p| &p.public == peer) {
-            Some(indice) => {
-                self.peers.remove(indice);
-                // Anche le chiavi temporanee: restare dopo che l'utente ha
-                // cancellato il contatto sarebbe il contrario di cio' che ha
-                // chiesto.
-                self.prekey.forget(peer);
-                Ok(true)
-            }
-            None => Ok(false),
+        // `retain` e non `position` + `remove`: quello toglieva **il primo**
+        // che combaciava, e se la stessa chiave comparisse due volte nella
+        // lista il contatto ricomparirebbe dopo che l'utente lo ha cancellato.
+        //
+        // Che un duplicato non dovrebbe esistere e' vero e non basta: la lista
+        // arriva anche da un blob importato — un backup, un file su disco —
+        // che questo codice non ha costruito e non puo' dare per corretto.
+        // Contro una promessa come "dimentica questo contatto" la difesa deve
+        // stare **qui**, dove la promessa viene mantenuta, non nella speranza
+        // che a monte non sia successo niente.
+        let prima = self.peers.len();
+        self.peers.retain(|p| &p.public != peer);
+        if self.peers.len() == prima {
+            return Ok(false);
         }
+        // Anche le chiavi temporanee: restare dopo che l'utente ha cancellato
+        // il contatto sarebbe il contrario di cio' che ha chiesto.
+        self.prekey.forget(peer);
+        Ok(true)
     }
 
     fn tofu_pin(&mut self, peer: &PublicKey, now_unix: i64) -> Result<PinOutcome> {
@@ -382,11 +391,11 @@ impl Keyring for MemoryKeyring {
         Ok(())
     }
 
-    fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<[u8; KEY_LEN]>> {
+    fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<Zeroizing<[u8; KEY_LEN]>>> {
         Ok(self.prekey.my_prekeys(peer))
     }
 
-    fn my_epoch(&self, peer: &PublicKey) -> Result<Option<[u8; KEY_LEN]>> {
+    fn my_epoch(&self, peer: &PublicKey) -> Result<Option<Zeroizing<[u8; KEY_LEN]>>> {
         Ok(self.prekey.my_epoch(peer))
     }
 
@@ -484,6 +493,12 @@ fn prendi_chiave(cursor: &mut impl Iterator<Item = u8>) -> Result<[u8; KEY_LEN]>
 mod tests {
     use super::*;
 
+    /// Le asserzioni confrontano array nudi: `Zeroizing` in mezzo le
+    /// renderebbe illeggibili senza dire niente di piu'.
+    fn nude(v: Vec<Zeroizing<[u8; KEY_LEN]>>) -> Vec<[u8; KEY_LEN]> {
+        v.into_iter().map(|k| *k).collect()
+    }
+
     fn key(seed: u8) -> PublicKey {
         PublicKey::from_bytes([seed; KEY_LEN])
     }
@@ -544,8 +559,8 @@ mod tests {
         keyring.set_peer_epoch(&key(1), &key(9)).unwrap();
 
         let riletto = MemoryKeyring::import(&keyring.export()).unwrap();
-        assert_eq!(riletto.my_epoch(&key(1)).unwrap(), Some(EPOCA));
-        assert_eq!(riletto.my_prekeys(&key(1)).unwrap(), vec![PREKEY]);
+        assert_eq!(riletto.my_epoch(&key(1)).unwrap().map(|k| *k), Some(EPOCA));
+        assert_eq!(nude(riletto.my_prekeys(&key(1)).unwrap()), vec![PREKEY]);
 
         // Un contatto con la sola epoca, senza prekey: e' il caso di chi usa la
         // modalita' bruciabile e basta, e senza il giro apposta in `dump` il suo
@@ -554,7 +569,7 @@ mod tests {
         solo_epoca.tofu_pin(&key(2), 100).unwrap();
         solo_epoca.set_my_epoch(&key(2), EPOCA).unwrap();
         let riletto = MemoryKeyring::import(&solo_epoca.export()).unwrap();
-        assert_eq!(riletto.my_epoch(&key(2)).unwrap(), Some(EPOCA));
+        assert_eq!(riletto.my_epoch(&key(2)).unwrap().map(|k| *k), Some(EPOCA));
 
         // Le versioni precedenti si rileggono ancora. Si costruiscono
         // togliendo dalla CODA del record i campi aggiunti dopo, che e' l'unico
@@ -573,9 +588,9 @@ mod tests {
             *primo = STORAGE_VERSION_SENZA_EPOCA_LORO;
         }
         let riletto = MemoryKeyring::import(&v3).unwrap();
-        assert_eq!(riletto.my_epoch(&key(1)).unwrap(), Some(EPOCA));
+        assert_eq!(riletto.my_epoch(&key(1)).unwrap().map(|k| *k), Some(EPOCA));
         assert_eq!(riletto.peer_epoch(&key(1)).unwrap(), None);
-        assert_eq!(riletto.my_prekeys(&key(1)).unwrap(), vec![PREKEY]);
+        assert_eq!(nude(riletto.my_prekeys(&key(1)).unwrap()), vec![PREKEY]);
 
         // Formato 2: anche senza la nostra epoca (1 + 32).
         let mut v2 = v3
@@ -586,8 +601,8 @@ mod tests {
             *primo = STORAGE_VERSION_SENZA_EPOCA;
         }
         let riletto = MemoryKeyring::import(&v2).unwrap();
-        assert_eq!(riletto.my_epoch(&key(1)).unwrap(), None);
-        assert_eq!(riletto.my_prekeys(&key(1)).unwrap(), vec![PREKEY]);
+        assert_eq!(riletto.my_epoch(&key(1)).unwrap().map(|k| *k), None);
+        assert_eq!(nude(riletto.my_prekeys(&key(1)).unwrap()), vec![PREKEY]);
     }
 
     /// L'epoca del peer e le due date fanno il giro su disco.
@@ -669,11 +684,11 @@ mod tests {
         let riletto = MemoryKeyring::import(&keyring.export()).unwrap();
         assert_eq!(riletto.peer_prekey(&key(1)).unwrap(), Some(key(50)));
         assert_eq!(
-            riletto.my_prekeys(&key(1)).unwrap(),
+            nude(riletto.my_prekeys(&key(1)).unwrap()),
             vec![[11; KEY_LEN], [10; KEY_LEN]]
         );
         assert_eq!(riletto.peer_prekey(&key(2)).unwrap(), None);
-        assert_eq!(riletto.my_prekeys(&key(2)).unwrap(), vec![[20; KEY_LEN]]);
+        assert_eq!(nude(riletto.my_prekeys(&key(2)).unwrap()), vec![[20; KEY_LEN]]);
         assert_eq!(riletto.catena().dump().len(), 2);
     }
 
@@ -689,7 +704,7 @@ mod tests {
         assert!(keyring.forget(&key(1)).unwrap());
         assert!(keyring.catena().dump().is_empty());
         let riletto = MemoryKeyring::import(&keyring.export()).unwrap();
-        assert!(riletto.my_prekeys(&key(1)).unwrap().is_empty());
+        assert!(nude(riletto.my_prekeys(&key(1)).unwrap()).is_empty());
     }
 
     /// Un blob corrotto deve fallire, non degradare a keyring vuoto.

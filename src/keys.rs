@@ -338,9 +338,9 @@ pub struct PrekeyRecord {
     /// La sua prechiave a rotazione (catena di forward secrecy).
     pub sua_prekey: Option<PublicKey>,
     /// Le nostre prechiavi, dalla piu' recente.
-    pub mie: Vec<[u8; KEY_LEN]>,
+    pub mie: Vec<Zeroizing<[u8; KEY_LEN]>>,
     /// La nostra epoca verso di lui. Privata.
-    pub mia_epoca: Option<[u8; KEY_LEN]>,
+    pub mia_epoca: Option<Zeroizing<[u8; KEY_LEN]>>,
     /// La sua epoca verso di noi. Pubblica.
     pub sua_epoca: Option<PublicKey>,
     /// Vedi `PrekeyStore::seen_at`.
@@ -428,11 +428,19 @@ impl PrekeyStore {
         }
     }
 
-    pub fn my_prekeys(&self, peer: &PublicKey) -> Vec<[u8; KEY_LEN]> {
+    /// Le chiavi temporanee escono dentro `Zeroizing`, non come array nudi.
+    ///
+    /// Prima ne uscivano copie non protette, e la piu' costosa era invisibile:
+    /// `dump()` chiama questa funzione per **ogni** contatto a ogni
+    /// salvataggio, quindi a ogni scrittura su disco si materializzava in heap
+    /// una copia integrale di tutte le chiavi temporanee, e nessuna veniva
+    /// azzerata. Lo stato dentro `PrekeyStore` era protetto; ad annullarlo
+    /// bastava il tipo di ritorno dell'accessore.
+    pub fn my_prekeys(&self, peer: &PublicKey) -> Vec<Zeroizing<[u8; KEY_LEN]>> {
         self.mie
             .iter()
             .find(|(p, _)| p == peer)
-            .map(|(_, v)| v.iter().map(|s| **s).collect())
+            .map(|(_, v)| v.clone())
             .unwrap_or_default()
     }
 
@@ -532,8 +540,11 @@ impl PrekeyStore {
     }
 
     /// La nostra epoca verso quel contatto, se ne esiste una.
-    pub fn my_epoch(&self, peer: &PublicKey) -> Option<[u8; KEY_LEN]> {
-        self.epoche.iter().find(|(p, _)| p == peer).map(|(_, k)| **k)
+    pub fn my_epoch(&self, peer: &PublicKey) -> Option<Zeroizing<[u8; KEY_LEN]>> {
+        self.epoche
+            .iter()
+            .find(|(p, _)| p == peer)
+            .map(|(_, k)| k.clone())
     }
 
     /// Ne tiene UNA sola per contatto: una seconda sarebbe una seconda
@@ -624,14 +635,13 @@ impl PrekeyStore {
             self.set_burned_at(peer, rogo_a);
         }
         if let Some(k) = epoca {
-            self.set_my_epoch(peer, k);
+            self.set_my_epoch(peer, *k);
         }
         if let Some(k) = loro {
             self.set_peer_prekey(peer, &k);
         }
         if !mie.is_empty() {
-            let mut v: Vec<Zeroizing<[u8; KEY_LEN]>> =
-                mie.into_iter().map(Zeroizing::new).collect();
+            let mut v: Vec<Zeroizing<[u8; KEY_LEN]>> = mie;
             v.truncate(MAX_PREKEY_MIE);
             match self.mie.iter_mut().find(|(p, _)| p == peer) {
                 Some((_, dentro)) => *dentro = v,
@@ -683,7 +693,7 @@ pub trait Keyring {
     /// Le nostre chiavi temporanee ancora valide verso quel peer, dalla piu'
     /// recente. Sono privatissime e vanno persistite: senza, un riavvio
     /// renderebbe illeggibili i messaggi gia' in viaggio.
-    fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<[u8; KEY_LEN]>>;
+    fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<Zeroizing<[u8; KEY_LEN]>>>;
 
     /// Aggiunge una nostra chiave temporanea, tenendo solo le ultime poche.
     fn push_my_prekey(&mut self, peer: &PublicKey, secret: [u8; KEY_LEN]) -> Result<()>;
@@ -694,7 +704,7 @@ pub trait Keyring {
     /// assomiglino: la catena e' fatta per ruotare e per essere buttata,
     /// l'epoca esiste perche' non ruota. Tenerle insieme faceva sparire la
     /// cronologia alla prima lettura di un messaggio a forward secrecy.
-    fn my_epoch(&self, peer: &PublicKey) -> Result<Option<[u8; KEY_LEN]>>;
+    fn my_epoch(&self, peer: &PublicKey) -> Result<Option<Zeroizing<[u8; KEY_LEN]>>>;
 
     /// L'epoca del contatto, con cui gli si scrive in modalita' bruciabile.
     ///
@@ -768,6 +778,12 @@ pub trait Keyring {
 mod tests {
     use super::*;
 
+    /// Le asserzioni confrontano array nudi: `Zeroizing` in mezzo le
+    /// renderebbe illeggibili senza dire niente di piu'.
+    fn nude(v: Vec<Zeroizing<[u8; KEY_LEN]>>) -> Vec<[u8; KEY_LEN]> {
+        v.into_iter().map(|k| *k).collect()
+    }
+
     fn peer(n: u8) -> PublicKey {
         PublicKey::from_bytes([n; KEY_LEN])
     }
@@ -783,13 +799,13 @@ mod tests {
         store.push_my_prekey(&peer(1), [12; KEY_LEN]);
 
         // La piu' recente per prima: e' l'ordine in cui si prova ad aprire.
-        assert_eq!(store.my_prekeys(&peer(1))[0], [12; KEY_LEN]);
+        assert_eq!(*store.my_prekeys(&peer(1))[0], [12; KEY_LEN]);
 
         // Arriva un messaggio cifrato con la penultima: cade solo cio' che e'
         // piu' vecchio di lei.
         store.drop_my_prekeys_older_than(&peer(1), &[11; KEY_LEN]);
         assert_eq!(
-            store.my_prekeys(&peer(1)),
+            nude(store.my_prekeys(&peer(1))),
             vec![[12; KEY_LEN], [11; KEY_LEN]]
         );
     }
@@ -801,7 +817,7 @@ mod tests {
         let mut store = PrekeyStore::default();
         store.push_my_prekey(&peer(1), [10; KEY_LEN]);
         store.drop_my_prekeys_older_than(&peer(1), &[99; KEY_LEN]);
-        assert_eq!(store.my_prekeys(&peer(1)), vec![[10; KEY_LEN]]);
+        assert_eq!(nude(store.my_prekeys(&peer(1))), vec![[10; KEY_LEN]]);
     }
 
     /// Il limite esiste solo perche' lo stato non cresca senza fine verso chi
@@ -818,7 +834,7 @@ mod tests {
         // La piu' recente resta in testa: e' l'ordine in cui si prova.
         assert_eq!(
             store.my_prekeys(&peer(1))[0],
-            [quante.saturating_sub(1); KEY_LEN]
+            Zeroizing::new([quante.saturating_sub(1); KEY_LEN])
         );
     }
 
@@ -858,13 +874,13 @@ mod tests {
 
         assert_eq!(riletto.peer_prekey(&peer(1)), Some(peer(50)));
         assert_eq!(
-            riletto.my_prekeys(&peer(1)),
+            nude(riletto.my_prekeys(&peer(1))),
             vec![[11; KEY_LEN], [10; KEY_LEN]]
         );
         assert_eq!(riletto.peer_prekey(&peer(2)), Some(peer(51)));
         assert!(riletto.my_prekeys(&peer(2)).is_empty());
         assert!(riletto.peer_prekey(&peer(3)).is_none());
-        assert_eq!(riletto.my_prekeys(&peer(3)), vec![[30; KEY_LEN]]);
+        assert_eq!(nude(riletto.my_prekeys(&peer(3))), vec![[30; KEY_LEN]]);
     }
 
     // - generate() con RNG a seme fisso e' riproducibile

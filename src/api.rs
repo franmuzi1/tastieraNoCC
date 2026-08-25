@@ -790,7 +790,7 @@ impl<K: Keyring> Session<K> {
         // rendendo illeggibile la conversazione bruciabile senza che nessuno
         // avesse bruciato. La sonda e' `leggere_un_messaggio_non_brucia_l_epoca`.
         if let Some(segreto) = self.keyring.my_epoch(peer)? {
-            return Ok(keys::EphemeralSecret::from_bytes(segreto));
+            return Ok(keys::EphemeralSecret::from_bytes(*segreto));
         }
         let nuova = keys::EphemeralSecret::from_bytes(nuovo_segreto(rng));
         self.keyring.set_my_epoch(peer, *nuova.to_bytes())?;
@@ -985,7 +985,7 @@ impl<K: Keyring> Session<K> {
         // della catena. **Non si butta niente**: qui la cronologia deve
         // restare, ed e' l'unica differenza operativa con la catena.
         if let Some(segreto) = self.keyring.my_epoch(&mittente)? {
-            let mia = keys::EphemeralSecret::from_bytes(segreto);
+            let mia = keys::EphemeralSecret::from_bytes(*segreto);
             if let Ok((sua_epoca, plaintext)) = baseline::open_epoch(&mia, &mittente, parsed) {
                 self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix())?;
                 return Ok((mittente, plaintext, false));
@@ -1000,7 +1000,7 @@ impl<K: Keyring> Session<K> {
         // chiavi che esistono comunque. Si esaurisce da solo quando le vecchie
         // prekey cadono.
         for segreto in self.keyring.my_prekeys(&mittente)? {
-            let mia = keys::EphemeralSecret::from_bytes(segreto);
+            let mia = keys::EphemeralSecret::from_bytes(*segreto);
             let Ok((sua_epoca, plaintext)) = baseline::open_epoch(&mia, &mittente, parsed) else {
                 continue;
             };
@@ -1009,7 +1009,7 @@ impl<K: Keyring> Session<K> {
             // `drop_my_prekeys_older_than` ne avrebbe toccato uno, e un segreto
             // che la forward secrecy dichiara distrutto sarebbe rimasto sul
             // disco come epoca.
-            self.keyring.set_my_epoch(&mittente, segreto)?;
+            self.keyring.set_my_epoch(&mittente, *segreto)?;
             self.keyring.forget_my_prekey(&mittente, &segreto)?;
             self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix())?;
             return Ok((mittente, plaintext, false));
@@ -1091,13 +1091,13 @@ impl<K: Keyring> Session<K> {
             // arrivo dopo l'aggiornamento non si aprirebbe, e un rogo che non
             // si apre e' una richiesta di distruzione che si perde in silenzio.
             if let Some(segreto) = self.keyring.my_epoch(&mittente)? {
-                let mia = keys::EphemeralSecret::from_bytes(segreto);
+                let mia = keys::EphemeralSecret::from_bytes(*segreto);
                 if let Ok((_, aperto)) = baseline::open_burn_epoch(&mia, &mittente, parsed) {
                     return Ok((mittente, aperto.sent_at_unix()));
                 }
             }
             for segreto in self.keyring.my_prekeys(&mittente)? {
-                let mia = keys::EphemeralSecret::from_bytes(segreto);
+                let mia = keys::EphemeralSecret::from_bytes(*segreto);
                 if let Ok((_, aperto)) = baseline::open_burn_epoch(&mia, &mittente, parsed) {
                     return Ok((mittente, aperto.sent_at_unix()));
                 }
@@ -1153,7 +1153,7 @@ impl<K: Keyring> Session<K> {
         let mio = self.identity.public();
         for candidato in self.keyring.peers()? {
             for segreto in self.keyring.my_prekeys(&candidato)? {
-                let prekey = keys::EphemeralSecret::from_bytes(segreto);
+                let prekey = keys::EphemeralSecret::from_bytes(*segreto);
                 let Ok((prossima, aperto)) =
                     file::open_file_forward(&prekey, &candidato, &mio, parsed)
                 else {
@@ -1222,7 +1222,7 @@ impl<K: Keyring> Session<K> {
         let mio = self.identity.public();
         for candidato in self.keyring.peers()? {
             for segreto in self.keyring.my_prekeys(&candidato)? {
-                let prekey = keys::EphemeralSecret::from_bytes(segreto);
+                let prekey = keys::EphemeralSecret::from_bytes(*segreto);
                 let Ok((prossima, plaintext)) =
                     baseline::open_forward(&prekey, &candidato, &mio, parsed)
                 else {
@@ -1292,7 +1292,7 @@ impl<K: Keyring> Session<K> {
             // separando l'epoca dalla catena si e' aggiornato chi legge un
             // messaggio in arrivo e non chi rilegge un archivio.
             if let Some(segreto) = self.keyring.my_epoch(&mittente)? {
-                let mia = keys::EphemeralSecret::from_bytes(segreto);
+                let mia = keys::EphemeralSecret::from_bytes(*segreto);
                 if let Ok((_, plaintext)) = baseline::open_epoch(&mia, &mittente, &parsed) {
                     return Ok((mittente, plaintext));
                 }
@@ -1300,7 +1300,7 @@ impl<K: Keyring> Session<K> {
             // Ripiego per lo stato salvato prima della separazione, come nella
             // via di lettura.
             for segreto in self.keyring.my_prekeys(&mittente)? {
-                let mia = keys::EphemeralSecret::from_bytes(segreto);
+                let mia = keys::EphemeralSecret::from_bytes(*segreto);
                 if let Ok((_, plaintext)) = baseline::open_epoch(&mia, &mittente, &parsed) {
                     return Ok((mittente, plaintext));
                 }
@@ -1321,7 +1321,7 @@ impl<K: Keyring> Session<K> {
             let mio = self.identity.public();
             for candidato in self.keyring.peers()? {
                 for segreto in self.keyring.my_prekeys(&candidato)? {
-                    let prekey = keys::EphemeralSecret::from_bytes(segreto);
+                    let prekey = keys::EphemeralSecret::from_bytes(*segreto);
                     if let Ok((_, plaintext)) =
                         baseline::open_forward(&prekey, &candidato, &mio, &parsed)
                     {
@@ -1430,11 +1430,11 @@ mod tests {
             Ok(())
         }
 
-        fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<[u8; 32]>> {
+        fn my_prekeys(&self, peer: &PublicKey) -> Result<Vec<zeroize::Zeroizing<[u8; 32]>>> {
             Ok(self.prekey.my_prekeys(peer))
         }
 
-        fn my_epoch(&self, peer: &PublicKey) -> Result<Option<[u8; 32]>> {
+        fn my_epoch(&self, peer: &PublicKey) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>> {
             Ok(self.prekey.my_epoch(peer))
         }
 

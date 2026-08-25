@@ -788,17 +788,42 @@ pub fn parse_file(bytes: &[u8]) -> Result<ParsedEnvelope<'_>> {
 /// sentinel: il primo byte estraneo la chiude. Sotto [`MIN_PAYLOAD_CHARS`] si
 /// considera una coincidenza dentro testo normale, non un blob.
 fn extract_payload(text: &str) -> Option<&str> {
-    let start = text.find(SENTINEL)?;
-    let after = text.get(start.checked_add(SENTINEL.len())?..)?;
-    let end = after
-        .bytes()
-        .position(|b| !encoding::is_alphabet_byte(b))
-        .unwrap_or(after.len());
-    let payload = after.get(..end)?;
-    if payload.len() < MIN_PAYLOAD_CHARS {
-        return None;
+    // Si provano **tutte** le occorrenze del sentinel, non solo la prima.
+    //
+    // Prima ci si fermava alla prima: se quella non era seguita da abbastanza
+    // caratteri dell'alfabeto, la funzione diceva "qui non c'e' niente di
+    // nostro" anche quando poco piu' avanti, nello stesso testo, c'era un blob
+    // intero. E non e' un caso di laboratorio: basta una citazione troncata
+    // dall'app di chat sopra al messaggio vero, o un "kc/" scritto a mano da
+    // qualcuno che spiega come funziona. L'utente vedrebbe "questo testo non e'
+    // cifrato" con il blob sotto gli occhi.
+    //
+    // Si prende la prima occorrenza **valida**, non la piu' lunga: e' la stessa
+    // semantica di prima — la prima cosa nostra che si incontra leggendo — solo
+    // senza fermarsi a un falso inizio.
+    //
+    // `match_indices` e non un ciclo su `find` con offset a mano: restituisce
+    // posizioni che sono per costruzione confini di carattere, mentre avanzare
+    // di un byte in un testo UTF-8 non lo e'.
+    for (start, _) in text.match_indices(SENTINEL) {
+        let Some(dopo) = start
+            .checked_add(SENTINEL.len())
+            .and_then(|inizio| text.get(inizio..))
+        else {
+            continue;
+        };
+        let end = dopo
+            .bytes()
+            .position(|b| !encoding::is_alphabet_byte(b))
+            .unwrap_or(dopo.len());
+        let Some(payload) = dopo.get(..end) else {
+            continue;
+        };
+        if payload.len() >= MIN_PAYLOAD_CHARS {
+            return Some(payload);
+        }
     }
-    Some(payload)
+    None
 }
 
 fn parse_message<'a>(mut cursor: Cursor<'a>) -> Result<ParsedEnvelope<'a>> {
@@ -1169,6 +1194,13 @@ mod tests {
             format!("guarda: {blob}"),
             format!("{blob} che ne dici?"),
             format!("[14:32] Marco:\n{blob}\n\n"),
+            // Un falso inizio prima di quello vero. Ci si fermava alla prima
+            // occorrenza del sentinel, quindi bastava una citazione troncata
+            // sopra al messaggio per far dire "questo testo non e' cifrato"
+            // con il blob sotto gli occhi.
+            format!("kc/ ecco quello di prima:\n{blob}"),
+            format!("> kc/ybndrf\n{blob}"),
+            format!("kc/\n{blob}\n"),
         ] {
             let mut buf = Vec::new();
             let ParsedBlob::Message(parsed) = parse(&testo, &mut buf).unwrap_or_else(|e| {
