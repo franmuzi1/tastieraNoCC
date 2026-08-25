@@ -83,6 +83,16 @@ mod code {
     /// La propria card, riaperta: non e' stato fissato nessun contatto.
     pub const ITEM_OWN_IDENTITY_CARD: jint = 6;
 
+    /// Esiti di `nativeBlobShape`. Descrivono la BUSTA, non l'esito.
+    pub const SHAPE_UNKNOWN: jint = 0;
+    pub const SHAPE_MESSAGE: jint = 1;
+    /// Messaggio che ha usato la catena: solo su questi «si apre una volta
+    /// sola» e' una spiegazione vera.
+    pub const SHAPE_MESSAGE_FS: jint = 2;
+    pub const SHAPE_GROUP: jint = 3;
+    pub const SHAPE_CARD: jint = 4;
+    pub const SHAPE_BURN: jint = 5;
+
     /// Esiti di `assignLabel`.
     pub const LABEL_ASSIGNED: jint = 0;
     /// L'etichetta appartiene gia' a un'altra chiave: "safety number changed".
@@ -779,6 +789,59 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeLooksLike
             Err(_) => return 0,
         };
         u8::from(keyboard_cipher_core::format::looks_like_blob(&testo))
+    })
+}
+
+/// Che **forma** ha questo blob, senza decifrarlo.
+///
+/// Guarda solo cio' che viaggia in chiaro — versione, kind, bit di flag — e non
+/// tocca il keyring, esattamente come `nativeLooksLikeOurBlob`. Non richiede una
+/// sessione.
+///
+/// # Perche' non e' un oracolo
+///
+/// La regola del progetto e' che un fallimento AEAD resti un `Error::Crypto`
+/// opaco, e questa funzione non la incrina: non dice **se** un blob si apre, ne'
+/// perche' non si e' aperto. Dice cosa c'e' scritto sopra la busta, che chiunque
+/// intercetti il messaggio legge comunque. Chi chiama la usa **dopo** un
+/// fallimento, per scegliere una frase vera invece di elencare ipotesi.
+///
+/// # A cosa serve davvero
+///
+/// Il messaggio d'errore diceva: «puo' essere diretto a qualcun altro, oppure
+/// gia' aperto una volta: con la forward secrecy accesa un messaggio si apre una
+/// volta sola». Due cause **indovinate**, e su un blob che non ha mai usato la
+/// forward secrecy la seconda e' semplicemente falsa. Su un messaggio di gruppo
+/// lo sono tutte e due. Chi legge si mette a cercare un guasto dove non e', o
+/// peggio conclude che il messaggio non era per lui.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeBlobShape(
+    mut env: JNIEnv,
+    _class: JClass,
+    text: JString,
+) -> jint {
+    guard(code::SHAPE_UNKNOWN, || {
+        let Ok(testo) = read_string(&mut env, &text) else {
+            return code::SHAPE_UNKNOWN;
+        };
+        let mut buf = Vec::new();
+        match keyboard_cipher_core::format::parse(&testo, &mut buf) {
+            Ok(keyboard_cipher_core::format::ParsedBlob::Message(parsed)) => {
+                if parsed
+                    .header
+                    .flags()
+                    .contains(keyboard_cipher_core::format::Flags::PREKEY)
+                {
+                    code::SHAPE_MESSAGE_FS
+                } else {
+                    code::SHAPE_MESSAGE
+                }
+            }
+            Ok(keyboard_cipher_core::format::ParsedBlob::Group(_)) => code::SHAPE_GROUP,
+            Ok(keyboard_cipher_core::format::ParsedBlob::IdentityCard(_)) => code::SHAPE_CARD,
+            Ok(keyboard_cipher_core::format::ParsedBlob::Burn(_)) => code::SHAPE_BURN,
+            Err(_) => code::SHAPE_UNKNOWN,
+        }
     })
 }
 
