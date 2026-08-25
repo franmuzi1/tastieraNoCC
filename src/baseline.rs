@@ -35,6 +35,26 @@ use crate::keys::{Ephemeral, EphemeralSecret, Identity, PublicKey, KEY_LEN};
 /// le chiavi derivate e rompe la compatibilita' con la versione 1.
 const KDF_DOMAIN: &[u8] = b"keyboard-cipher/v1/baseline";
 
+/// Dominio di derivazione degli **slot di gruppo**, separato da quello dei
+/// messaggi a due (decisione K1, condizione 1).
+///
+/// Serve perche' la chiave di uno slot nasce dagli **stessi identici byte di
+/// segreto** che produrrebbe un messaggio a due verso quella persona con quella
+/// effimera: `DH(effimera, destinatario) || DH(mittente, destinatario)`. A
+/// tenerli separati era finora una sola cosa, il byte di versione in testa
+/// all'AAD, che finisce dentro l'`info` della HKDF. Funzionava, ma era una
+/// proprieta' **emergente**: nessuna riga diceva "questi sono contesti
+/// diversi", e chi domani cambiasse il layout dell'AAD la romperebbe senza
+/// accorgersene.
+///
+/// Ora la separazione e' esplicita e locale — si legge qui — e non dipende piu'
+/// dall'ordine dei campi dell'AAD. Se un giorno due AAD collidessero, il
+/// dominio li terrebbe comunque separati.
+///
+/// **Cambiare questa stringa cambia le chiavi degli slot**, quindi rende
+/// illeggibili i blob di gruppo gia' mandati. Non e' un parametro da toccare.
+const KDF_DOMAIN_GROUP: &[u8] = b"keyboard-cipher/v2/group-slot";
+
 /// Lunghezza della chiave XChaCha20-Poly1305.
 const AEAD_KEY_LEN: usize = 32;
 
@@ -653,7 +673,7 @@ pub fn seal_group<R: RngCore + CryptoRng>(
         let indice = u8::try_from(i).map_err(|_| Error::Format("troppi destinatari"))?;
         let aad = format::build_group_aad(Kind::Message, &header, n_slot, Some(indice), None);
         let nonce_i = nonce_slot(&nonce, indice);
-        let chiave = derive_ephemeral_key(
+        let chiave = derive_group_slot_key(
             &*effimera.diffie_hellman(destinatario)?,
             &*sender.diffie_hellman(destinatario)?,
             &nonce_i,
@@ -726,7 +746,7 @@ pub fn open_group(
         let aad =
             format::build_group_aad(Kind::Message, &parsed.header, n_slot, Some(indice), None);
         let nonce_i = nonce_slot(&parsed.header.nonce, indice);
-        let chiave = derive_ephemeral_key(&dh_effimero, &dh_statico, &nonce_i, &aad, &mio)?;
+        let chiave = derive_group_slot_key(&dh_effimero, &dh_statico, &nonce_i, &aad, &mio)?;
         let Ok(contenuto) = XChaCha20Poly1305::new((&*chiave).into()).decrypt(
             XNonce::from_slice(&nonce_i),
             Payload {
@@ -771,7 +791,42 @@ pub fn open_group(
     Err(Error::Crypto)
 }
 
+/// Chiave di un messaggio a due con effimera (decisioni H e I).
 fn derive_ephemeral_key(
+    dh_effimero: &[u8; 32],
+    dh_statico: &[u8; 32],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    recipient: &PublicKey,
+) -> Result<Zeroizing<[u8; AEAD_KEY_LEN]>> {
+    derive_con_dominio(KDF_DOMAIN, dh_effimero, dh_statico, nonce, aad, recipient)
+}
+
+/// Chiave di uno **slot di gruppo** (decisione K2).
+///
+/// Due funzioni con nomi diversi e non una sola con un parametro «dominio»: un
+/// parametro si puo' passare sbagliato, e sbagliarlo qui vorrebbe dire far
+/// coincidere un contesto di gruppo con uno a due — cioe' proprio cio' che la
+/// condizione 1 di K1 vieta. Con due nomi il caso non e' esprimibile.
+fn derive_group_slot_key(
+    dh_effimero: &[u8; 32],
+    dh_statico: &[u8; 32],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    recipient: &PublicKey,
+) -> Result<Zeroizing<[u8; AEAD_KEY_LEN]>> {
+    derive_con_dominio(
+        KDF_DOMAIN_GROUP,
+        dh_effimero,
+        dh_statico,
+        nonce,
+        aad,
+        recipient,
+    )
+}
+
+fn derive_con_dominio(
+    dominio: &[u8],
     dh_effimero: &[u8; 32],
     dh_statico: &[u8; 32],
     nonce: &[u8; NONCE_LEN],
@@ -783,12 +838,12 @@ fn derive_ephemeral_key(
     materiale.extend_from_slice(dh_statico);
 
     let mut info = Vec::with_capacity(
-        KDF_DOMAIN
+        dominio
             .len()
             .saturating_add(aad.len())
             .saturating_add(recipient.as_bytes().len()),
     );
-    info.extend_from_slice(KDF_DOMAIN);
+    info.extend_from_slice(dominio);
     info.extend_from_slice(aad);
     info.extend_from_slice(recipient.as_bytes());
 
@@ -1554,6 +1609,56 @@ mod tests {
             format::parse(&normale, &mut buf).unwrap(),
             ParsedBlob::Message(_)
         ));
+    }
+
+    /// La condizione 1 della decisione K1: gli slot di gruppo e i messaggi a
+    /// due non devono poter finire nello stesso contesto di derivazione.
+    ///
+    /// Il test che la condizione chiedeva, e che per un pezzo non c'e' stato —
+    /// mentre il documento la dava per imposta.
+    ///
+    /// Si danno alle due derivazioni **gli stessi identici argomenti**: stessi
+    /// due segreti ECDH, stesso nonce, stesso AAD, stesso destinatario. E' la
+    /// condizione peggiore possibile, e non e' costruita ad arte: la chiave di
+    /// uno slot nasce davvero da `DH(effimera, dest) || DH(mittente, dest)`,
+    /// cioe' dagli stessi byte che produrrebbe un messaggio a due verso quella
+    /// persona con quella effimera. Se le due chiavi coincidessero, un cifrato
+    /// di un mondo si aprirebbe con la chiave dell'altro.
+    ///
+    /// Prima del dominio separato le due funzioni erano **la stessa funzione**,
+    /// e con questi argomenti avrebbero dato lo stesso risultato: a dividerle
+    /// restava solo il byte di versione dentro l'AAD, che qui e' tenuto uguale
+    /// apposta. Ora la separazione non dipende piu' da cosa c'e' scritto
+    /// nell'AAD.
+    #[test]
+    fn uno_slot_di_gruppo_non_condivide_il_contesto_con_un_messaggio_a_due() {
+        let mittente = identita(1);
+        let destinatario = identita(2);
+        let effimera = Ephemeral::generate(&mut rng(7)).unwrap();
+
+        let dh_effimero = effimera.diffie_hellman(&destinatario.public()).unwrap();
+        let dh_statico = mittente.diffie_hellman(&destinatario.public()).unwrap();
+        let nonce = [9u8; NONCE_LEN];
+        let aad = b"stesso aad per tutti e due";
+
+        let a_due = derive_ephemeral_key(
+            &dh_effimero,
+            &dh_statico,
+            &nonce,
+            aad,
+            &destinatario.public(),
+        )
+        .unwrap();
+        let slot = derive_group_slot_key(
+            &dh_effimero,
+            &dh_statico,
+            &nonce,
+            aad,
+            &destinatario.public(),
+        )
+        .unwrap();
+
+        assert_ne!(*a_due, *slot);
     }
 
     #[test]

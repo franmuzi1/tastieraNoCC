@@ -1813,6 +1813,69 @@ mod tests {
         assert!(matches!(riletto.sender_status, SenderStatus::Known { .. }));
     }
 
+    /// L'altra meta' della condizione 1 di K1: mandare e aprire un messaggio di
+    /// gruppo non deve toccare lo stato da cui dipende la forward secrecy a
+    /// due.
+    ///
+    /// E' la sostanza della condizione — «il gruppo non deve poter indebolire
+    /// il dialogo a due» — e senza test era affidata all'attenzione di chi
+    /// scriveva il codice, che e' esattamente cio' che la decisione diceva di
+    /// non fare.
+    ///
+    /// Se un giorno qualcuno provasse a dare forward secrecy ai gruppi
+    /// attaccandosi alle prechiavi esistenti (la via che K1 vieta, motivo 2:
+    /// non c'e' un distributore), questo test si accorgerebbe che la catena a
+    /// due si e' mossa.
+    #[test]
+    fn un_gruppo_non_tocca_la_catena_a_due() {
+        let mut alice = sessione(1);
+        let mut babbo = sessione(2);
+        let chiave_alice = alice.identity.public();
+        let chiave_babbo = babbo.identity.public();
+        alice.keyring.tofu_pin(&chiave_babbo, 1).unwrap();
+        babbo.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+
+        // Si costruisce prima uno stato a due vero: un messaggio con la catena
+        // accesa mette una prechiave nel keyring di chi manda.
+        alice.set_current_peer("app", &chiave_babbo).unwrap();
+        let a_due = alice
+            .encrypt_for_app_with("app", b"a due", 10, &mut rng(1), true)
+            .unwrap();
+        babbo.handle_incoming_text("app", &a_due, 11).unwrap();
+
+        let prima_alice = alice.keyring.my_prekeys(&chiave_babbo).unwrap();
+        let prima_babbo = babbo.keyring.my_prekeys(&chiave_alice).unwrap();
+        let epoca_prima = alice.keyring.my_epoch(&chiave_babbo).unwrap();
+        assert!(!prima_alice.is_empty(), "lo stato a due deve esistere");
+
+        // Ora il gruppo, fra le stesse persone.
+        let blob = alice
+            .encrypt_group(
+                std::slice::from_ref(&chiave_babbo),
+                b"di gruppo",
+                20,
+                &mut rng(2),
+            )
+            .unwrap();
+        babbo.handle_incoming_text("app", &blob, 21).unwrap();
+
+        assert_eq!(
+            alice.keyring.my_prekeys(&chiave_babbo).unwrap(),
+            prima_alice,
+            "cifrare un gruppo ha mosso la catena di chi manda"
+        );
+        assert_eq!(
+            babbo.keyring.my_prekeys(&chiave_alice).unwrap(),
+            prima_babbo,
+            "aprire un gruppo ha mosso la catena di chi legge"
+        );
+        assert_eq!(
+            alice.keyring.my_epoch(&chiave_babbo).unwrap(),
+            epoca_prima,
+            "il gruppo ha toccato la chiave d'epoca"
+        );
+    }
+
     /// Un gruppo da uno slot solo si presentava come un messaggio a due: un
     /// `version = 2` senza forward secrecy con la faccia di uno che ce l'ha.
     #[test]

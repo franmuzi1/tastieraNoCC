@@ -829,12 +829,48 @@ corrotto": un `kind` nuovo o un bit di flag darebbero `Error::Format`, che
 l'interfaccia mostra con la stessa frase di un blob rovinato.
 
 **Condizione 1 — il gruppo non deve poter indebolire il dialogo a due.** Gli
-slot di gruppo non toccano i segreti da cui dipende la forward secrecy a due:
-dominio di derivazione separato, e nessun materiale in comune oltre
-all'identita' pubblica. Va imposto per costruzione e coperto da un test, non
-lasciato all'attenzione di chi scrivera' il codice. Senza questa separazione la
-decisione si rovescia: un gruppo compromesso retrocederebbe conversazioni che
-avevano una garanzia piu' forte, e a quel punto meglio non avere i gruppi.
+slot di gruppo non toccano i segreti da cui dipende la forward secrecy a due.
+Senza questa separazione la decisione si rovescia: un gruppo compromesso
+retrocederebbe conversazioni che avevano una garanzia piu' forte, e a quel punto
+meglio non avere i gruppi.
+
+Regge su due cose, e vale la pena dire **esattamente** quali, perche' per un
+periodo questo paragrafo ne descriveva una che non esisteva:
+
+1. **Il dominio di derivazione e' separato davvero**, non per conseguenza:
+   `KDF_DOMAIN_GROUP = "keyboard-cipher/v2/group-slot"` contro
+   `KDF_DOMAIN = "keyboard-cipher/v1/baseline"`. Serve perche' «nessun materiale
+   in comune» **e' falso e va guardato in faccia**: la chiave di uno slot nasce
+   da `DH(effimera, dest) || DH(mittente, dest)`, cioe' dagli stessi identici
+   byte di segreto che produrrebbe un messaggio a due verso quella persona con
+   quella effimera. A separarli e' la derivazione, non l'ingrediente.
+   Meccanismo: `derive_ephemeral_key` e `derive_group_slot_key` sono **due
+   funzioni con nomi diversi**, non una con un parametro «dominio». Un parametro
+   si puo' passare sbagliato; qui il caso non e' esprimibile.
+2. **Gli slot usano l'identita', mai una prechiave ne' una chiave d'epoca.**
+   Cifrare o aprire un gruppo lascia la catena a due dov'era.
+
+*Storia, perche' non si ripeta.* Fino ad agosto 2026 il dominio separato **non
+c'era**: entrambi i mondi usavano `KDF_DOMAIN`, e a dividerli restava solo il
+byte di versione in testa all'AAD, che finisce dentro l'`info` della HKDF.
+Funzionava, ed era una proprieta' **emergente**: nessuna riga diceva «questi
+sono contesti diversi», e chiunque avesse cambiato il layout dell'AAD l'avrebbe
+rotta senza che niente lo segnalasse. Il documento intanto la dava per imposta,
+e mancava anche il test che questa stessa condizione richiede. Dominio e test
+sono stati aggiunti insieme; il byte di versione nell'AAD resta, ma ora e' la
+seconda difesa e non l'unica.
+
+*Prezzo pagato, una volta sola:* dare agli slot un dominio proprio ne cambia le
+chiavi, quindi i blob di gruppo prodotti prima non si aprono piu' — con
+`Error::Crypto`, indistinguibile da un blob rovinato. Deciso consapevolmente
+finche' i gruppi erano appena usciti e non c'era niente in circolazione da
+conservare. **Da qui in avanti quella stringa non si tocca**: cambiarla di nuovo
+costerebbe lo stesso, e allora non sarebbe piu' gratis. I messaggi a due non
+sono cambiati di un byte.
+
+*I test:* `uno_slot_di_gruppo_non_condivide_il_contesto_con_un_messaggio_a_due`
+(stessi identici argomenti alle due derivazioni, chiavi diverse) e
+`un_gruppo_non_tocca_la_catena_a_due`.
 
 **Condizione 2 — dirlo dove l'utente lo legge, non solo qui.** Un messaggio di
 gruppo si apre a chi ottenga l'identita' di **un qualsiasi** membro, e resta
