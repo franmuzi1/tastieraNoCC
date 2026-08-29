@@ -323,6 +323,46 @@ pub enum LabelOutcome {
 /// contatto che non risponde mai. 32 chiavi sono 1 KB per contatto.
 pub const MAX_PREKEY_MIE: usize = 32;
 
+/// Quante chiavi temporanee sopravvivono comunque a una lettura.
+///
+/// ## Il difetto che questa costante ripara
+///
+/// Aprire un messaggio butta le proprie chiavi piu' vecchie di quella usata. La
+/// frase con cui la decisione I lo racconta — «un messaggio si apre una volta
+/// sola» — si legge come "non puoi *ri*leggerlo", ed e' piu' mite del vero. Il
+/// comportamento era: **aprire un messaggio distrugge tutti i messaggi piu'
+/// vecchi di quella persona che non hai ancora aperto.**
+///
+/// Bastano due messaggi. Lei ne manda due, cifrati con due tue chiavi diverse;
+/// tu apri prima il secondo; il primo non si aprira' mai piu'. Non serve
+/// nessuna raffica: serve solo leggere in ordine diverso da quello di invio, che
+/// in un mezzo fatto di copia-incolla e' la norma — si scorre la chat e si apre
+/// il blob che capita sotto il dito.
+///
+/// Segnalato da un'utente reale: «a volte i suoi messaggi risultano
+/// illeggibili». Non era il prezzo noto della cronologia, ed era questo.
+///
+/// ## Cosa costa, detto per intero
+///
+/// Le otto chiavi piu' recenti non vengono piu' buttate leggendo. Quindi un
+/// telefono sequestrato apre fino a otto messaggi in piu' di prima, invece dei
+/// soli non ancora letti. **E' un indebolimento vero della forward secrecy, ed
+/// e' limitato per costruzione**: e' un numero fisso, non una finestra che
+/// cresce, e quelle otto scorrono via da sole man mano che se ne generano di
+/// nuove — ogni messaggio inviato ne spinge dentro una.
+///
+/// La scelta e' stata fatta guardando le due parti: da un lato otto messaggi
+/// in piu' leggibili da chi ti prende il telefono, dall'altro messaggi che non
+/// arrivano a destinazione **oggi, a tutti**. Una proprieta' di sicurezza che
+/// rende il sistema inaffidabile viene disattivata dagli utenti, e allora non
+/// protegge piu' niente.
+///
+/// Otto e non di piu': copre la lettura fuori ordine di una conversazione
+/// normale — qualche messaggio in sospeso — senza trasformare la catena in un
+/// archivio. Chi volesse alzarlo deve sapere che sta comprando comodita' con
+/// forward secrecy, uno a uno.
+pub const CODA_MINIMA: usize = 8;
+
 /// Una riga di [`PrekeyStore::dump`]: contatto, la sua ultima prekey pubblica,
 /// le nostre private dalla piu' recente, la nostra epoca.
 /// Una riga di [`PrekeyStore::dump`].
@@ -458,10 +498,13 @@ impl PrekeyStore {
     /// Vedi [`Keyring::drop_my_prekeys_older_than`]. Se la chiave indicata non
     /// c'e' piu' non si butta niente: significa che e' gia' caduta, e trattare
     /// "non trovata" come "buttale tutte" cancellerebbe anche le piu' recenti.
+    ///
+    /// **Non si scende mai sotto [`CODA_MINIMA`]**, e la ragione viene dall'uso
+    /// reale: vedi la costante.
     pub fn drop_my_prekeys_older_than(&mut self, peer: &PublicKey, secret: &[u8; KEY_LEN]) {
         if let Some((_, v)) = self.mie.iter_mut().find(|(p, _)| p == peer) {
             if let Some(i) = v.iter().position(|s| &**s == secret) {
-                v.truncate(i.saturating_add(1));
+                v.truncate(i.saturating_add(1).max(CODA_MINIMA));
             }
         }
     }
@@ -801,13 +844,28 @@ mod tests {
         // La piu' recente per prima: e' l'ordine in cui si prova ad aprire.
         assert_eq!(*store.my_prekeys(&peer(1))[0], [12; KEY_LEN]);
 
-        // Arriva un messaggio cifrato con la penultima: cade solo cio' che e'
-        // piu' vecchio di lei.
+        // Arriva un messaggio cifrato con la penultima. Con tre sole chiavi in
+        // lista non cade niente: sotto CODA_MINIMA non si taglia mai, ed e' la
+        // finestra che tiene in vita i messaggi letti fuori ordine.
         store.drop_my_prekeys_older_than(&peer(1), &[11; KEY_LEN]);
         assert_eq!(
             nude(store.my_prekeys(&peer(1))),
-            vec![[12; KEY_LEN], [11; KEY_LEN]]
+            vec![[12; KEY_LEN], [11; KEY_LEN], [10; KEY_LEN]]
         );
+
+        // Oltre la coda il taglio torna a farsi sentire: si riempie la lista e
+        // si usa una chiave abbastanza indietro.
+        for i in 13..30u8 {
+            store.push_my_prekey(&peer(1), [i; KEY_LEN]);
+        }
+        store.drop_my_prekeys_older_than(&peer(1), &[25; KEY_LEN]);
+        // Restano esattamente CODA_MINIMA: la usata piu' le piu' recenti, e
+        // poi si prosegue oltre di lei fino a otto. Le vecchie sono cadute.
+        let rimaste = nude(store.my_prekeys(&peer(1)));
+        assert_eq!(rimaste.len(), CODA_MINIMA);
+        assert_eq!(rimaste.first(), Some(&[29; KEY_LEN]));
+        assert!(rimaste.contains(&[25; KEY_LEN]));
+        assert!(!rimaste.contains(&[10; KEY_LEN]));
     }
 
     /// Se la chiave indicata e' gia' caduta non si butta niente: trattare "non

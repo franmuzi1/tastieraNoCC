@@ -33,3 +33,5 @@ fuzz/corpus
 jni/target/
 cli/target/
 gui/target/
+wasm/target/
+wasm/poc/target/

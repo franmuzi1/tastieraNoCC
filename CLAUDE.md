@@ -197,9 +197,36 @@ raccontava come "ogni risposta butta", e una sessione successiva ci si e'
 appoggiata invece di aprire il file, arrivando a proporre come lavoro da fare
 una proprieta' che il codice aveva gia'.
 
-Si butta il vecchio e non tutto: `truncate(i + 1)` tiene la chiave usata e le
-piu' recenti. Quindi un messaggio **resta rileggibile finche' non se ne apre uno
-piu' recente della stessa persona**, ed e' la frase da usare in interfaccia. La
+Si butta il vecchio e non tutto: `truncate` tiene la chiave usata e le piu'
+recenti — **e comunque mai meno di `CODA_MINIMA` = 8.**
+
+Quel minimo non c'era, e la sua assenza e' costata un difetto trovato sul campo,
+non in un test. La frase con cui questa decisione si raccontava — «un messaggio
+resta rileggibile finche' non se ne apre uno piu' recente della stessa persona» —
+descrive la *rilettura*, e per questo suonava mite. Il comportamento vero era
+piu' largo: **aprire un messaggio distruggeva tutti i messaggi piu' vecchi di
+quella persona che non erano ancora stati aperti.** Bastavano due messaggi letti
+in ordine diverso da quello di invio — e in un mezzo fatto di copia-incolla si
+apre il blob che capita sotto il dito, non il piu' vecchio. Un'utente lo
+riferiva come «a volte i suoi messaggi risultano illeggibili»; non era la
+cronologia, era questo. Test:
+`due_messaggi_letti_fuori_ordine_si_aprono_tutti_e_due`.
+
+**Cosa costa la coda, detto per intero.** Le otto chiavi piu' recenti
+sopravvivono a una lettura, quindi entro quella finestra un messaggio si riapre —
+anche uno gia' letto — e chi prende il telefono ne apre fino a otto in piu'. E'
+un indebolimento vero della forward secrecy, **limitato per costruzione**: e' un
+numero fisso, non una finestra che cresce, e scorre via da sola perche' ogni
+messaggio inviato spinge dentro una chiave nuova. Oltre l'ottava, la catena
+uccide come prima — `la_cronologia_non_si_rilegge` verifica entrambi i lati.
+
+La scelta e' stata fatta guardando le due parti: da un lato otto messaggi in piu'
+leggibili da chi ti sequestra il telefono, dall'altro messaggi che **non arrivano
+a destinazione oggi, a tutti**. Una proprieta' di sicurezza che rende il sistema
+inaffidabile viene spenta dagli utenti, e allora non protegge piu' niente.
+
+La frase da usare in interfaccia diventa quindi: *un messaggio si riapre finche'
+la conversazione non e' andata avanti di qualche messaggio*. La
 scelta e' deliberata: in un mezzo fatto di copia-incolla i messaggi arrivano in
 ordine sparso di continuo, e un messaggio che si rifiuta di riaprirsi sembra un
 guasto. Buttare anche la chiave appena usata — un messaggio si apre una volta

@@ -1826,6 +1826,53 @@ mod tests {
     /// attaccandosi alle prechiavi esistenti (la via che K1 vieta, motivo 2:
     /// non c'e' un distributore), questo test si accorgerebbe che la catena a
     /// due si e' mossa.
+    /// Il caso segnalato da un'utente reale, e bastano **due** messaggi.
+    ///
+    /// Lei ne manda due, cifrati con due prechiavi diverse di chi riceve. Lui
+    /// apre prima il secondo. Prima della coda minima il primo — mai aperto —
+    /// diventava illeggibile per sempre.
+    ///
+    /// Non serve nessuna raffica: serve solo leggere in ordine diverso da
+    /// quello di invio, che in un mezzo fatto di copia-incolla e' la norma.
+    #[test]
+    fn due_messaggi_letti_fuori_ordine_si_aprono_tutti_e_due() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let ka = alice.identity.public();
+        let kb = bob.identity.public();
+        alice.keyring.tofu_pin(&kb, 1).unwrap();
+        bob.keyring.tofu_pin(&ka, 1).unwrap();
+        alice.set_current_peer("app", &kb).unwrap();
+        bob.set_current_peer("app", &ka).unwrap();
+
+        // Bob scrive due volte: due prechiavi sue, la seconda piu' recente.
+        let b1 = bob
+            .encrypt_for_app_with("app", b"uno", 10, &mut rng(1), true)
+            .unwrap();
+        let b2 = bob
+            .encrypt_for_app_with("app", b"due", 11, &mut rng(2), true)
+            .unwrap();
+
+        // Alice legge il primo e risponde con la prechiave che ha appena visto.
+        alice.handle_incoming_text("app", &b1, 12).unwrap();
+        let a1 = alice
+            .encrypt_for_app_with("app", b"rispondo a uno", 13, &mut rng(3), true)
+            .unwrap();
+
+        // Poi legge il secondo e risponde di nuovo, con una piu' recente.
+        alice.handle_incoming_text("app", &b2, 14).unwrap();
+        let a2 = alice
+            .encrypt_for_app_with("app", b"rispondo a due", 15, &mut rng(4), true)
+            .unwrap();
+
+        // Bob apre prima la SECONDA risposta.
+        assert!(bob.handle_incoming_text("app", &a2, 16).is_ok());
+
+        // E poi la prima, che era arrivata prima ed e' ancora li'.
+        let esito = bob.handle_incoming_text("app", &a1, 17);
+        assert!(esito.is_ok(), "la prima risposta non si apre: {:?}", esito.err());
+    }
+
     #[test]
     fn un_gruppo_non_tocca_la_catena_a_due() {
         let mut alice = sessione(1);
@@ -2594,8 +2641,17 @@ mod tests {
         assert!(bob.handle_incoming_text(WHATSAPP, &tre, 15).is_ok());
     }
 
-    /// **Il prezzo accettato:** quando la catena avanza, i messaggi vecchi non
-    /// si riaprono piu' — nemmeno per chi li ha ricevuti.
+    /// **Il prezzo accettato:** quando la catena avanza *abbastanza*, i
+    /// messaggi vecchi non si riaprono piu' — nemmeno per chi li ha ricevuti.
+    ///
+    /// «Abbastanza» e' la parola nuova, ed e' [`keys::CODA_MINIMA`]: le otto
+    /// chiavi piu' recenti sopravvivono a una lettura, quindi entro quella
+    /// finestra un messaggio si riapre. Oltre, muore come prima.
+    ///
+    /// La finestra non e' un ripensamento sulla forward secrecy: e' il prezzo
+    /// pagato per un difetto peggiore, cioe' messaggi mai letti che
+    /// diventavano illeggibili perche' se ne era aperto uno piu' recente. Sta
+    /// scritto per esteso sulla costante.
     #[test]
     fn la_cronologia_non_si_rilegge() {
         let mut alice = sessione(1);
@@ -2632,11 +2688,33 @@ mod tests {
             .unwrap();
         bob.handle_incoming_text(WHATSAPP, &cinque, 19).unwrap();
 
-        // Il terzo messaggio, che Bob aveva gia' letto, ora non si riapre:
-        // la chiave con cui era stato cifrato non esiste piu'.
+        // Entro la coda minima il terzo si riapre ancora: e' la finestra, ed
+        // e' voluta.
+        assert!(bob.handle_incoming_text(WHATSAPP, &tre, 20).is_ok());
+
+        // Ma la finestra scorre, e a farla scorrere e' **Bob**: le chiavi in
+        // gioco sono le sue, e ne nasce una a ogni messaggio che manda lui.
+        let mut ultimo = String::new();
+        for i in 0..(crate::keys::CODA_MINIMA + 2) {
+            let n = i64::try_from(i).unwrap();
+            ultimo = bob
+                .encrypt_for_app_with(WHATSAPP, b"ancora", 30 + n, &mut rng(7), true)
+                .unwrap();
+        }
+        // Alice legge l'ultimo, cosi' impara la chiave piu' recente, e
+        // risponde usando quella.
+        alice.handle_incoming_text(WHATSAPP, &ultimo, 50).unwrap();
+        let recente = alice
+            .encrypt_for_app_with(WHATSAPP, b"con la nuova", 51, &mut rng(8), true)
+            .unwrap();
+        // Leggendola, Bob tiene la usata piu' le sette successive: la chiave
+        // del terzo e' ormai troppo indietro e cade.
+        bob.handle_incoming_text(WHATSAPP, &recente, 52).unwrap();
+
+        // Adesso e' morto, come prima.
         assert!(
-            bob.handle_incoming_text(WHATSAPP, &tre, 20).is_err(),
-            "la catena e' avanzata: quel messaggio doveva essere morto"
+            bob.handle_incoming_text(WHATSAPP, &tre, 60).is_err(),
+            "la catena e' avanzata oltre la coda: quel messaggio doveva morire"
         );
     }
 
