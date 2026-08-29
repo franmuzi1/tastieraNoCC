@@ -258,7 +258,7 @@ impl<K: Keyring> Session<K> {
                 if parsed.header.origin.uses_epoch()
                     || parsed.header.origin.is_epoch_bootstrap() =>
             {
-                let (peer, plaintext, nostro) = self.apri_a_epoca(&parsed)?;
+                let (peer, plaintext, nostro) = self.apri_a_epoca(&parsed, now_unix)?;
                 self.current_peer
                     .insert(app_package.to_owned(), peer.clone());
                 if nostro {
@@ -916,15 +916,42 @@ impl<K: Keyring> Session<K> {
             .filter(|k| self.identity.diffie_hellman(k).is_ok()))
     }
 
+    /// `quando` e' il timestamp **dichiarato dal mittente**; `adesso` e' il
+    /// nostro. Servono tutti e due, e il secondo mancava.
+    ///
+    /// Il confronto con `seen_at` esiste per impedire un ritorno indietro: un
+    /// blob vecchio ripubblicato non deve riportare in vita un'epoca che il
+    /// mittente ha gia' cambiato. E' la stessa famiglia di difese di `rogo_a`,
+    /// ed e' giusta.
+    ///
+    /// Ma il valore su cui si appoggiava veniva **solo** dall'orologio di chi
+    /// scrive, che la decisione C definisce «autenticato ma non verificabile» e
+    /// su cui vieta di prendere decisioni automatiche. Qui una decisione
+    /// automatica c'era, e il guasto che produceva era permanente: bastava un
+    /// messaggio datato nel futuro — un telefono con l'ora sbagliata, cosa che
+    /// capita — perche' `seen_at` saltasse in avanti di anni. Da quel momento
+    /// **ogni** epoca successiva veniva scartata in silenzio, chi scriveva
+    /// continuava a cifrare verso un'epoca morta, e i suoi messaggi non si
+    /// aprivano piu'. Nessuno aveva fatto niente, e non c'era modo di uscirne.
+    ///
+    /// La correzione e' prendere il minore dei due. Il ritorno indietro resta
+    /// bloccato — un blob vecchio ha una data vecchia comunque la si guardi —
+    /// mentre una data nel futuro non puo' piu' avvelenare lo stato, perche'
+    /// viene tagliata a quando l'abbiamo ricevuta davvero.
+    ///
+    /// Segnalato da un'utente reale, con la catena spenta: i suoi messaggi «a
+    /// volte» non si aprivano a chi li riceveva.
     fn ricorda_epoca_del_peer(
         &mut self,
         peer: &PublicKey,
         epoca: &PublicKey,
         quando: i64,
+        adesso: i64,
     ) -> Result<()> {
         if self.identity.diffie_hellman(epoca).is_err() {
             return Ok(());
         }
+        let quando = quando.min(adesso);
         if quando < self.keyring.seen_at(peer)? {
             return Ok(());
         }
@@ -940,6 +967,7 @@ impl<K: Keyring> Session<K> {
     fn apri_a_epoca(
         &mut self,
         parsed: &crate::format::ParsedEnvelope<'_>,
+        adesso: i64,
     ) -> Result<(PublicKey, Plaintext, bool)> {
         let mittente = parsed
             .header
@@ -977,7 +1005,7 @@ impl<K: Keyring> Session<K> {
         if bootstrap {
             let (sua_epoca, plaintext) =
                 baseline::open_epoch_bootstrap(&self.identity, &mittente, parsed)?;
-            self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix())?;
+            self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix(), adesso)?;
             return Ok((mittente, plaintext, false));
         }
 
@@ -987,7 +1015,7 @@ impl<K: Keyring> Session<K> {
         if let Some(segreto) = self.keyring.my_epoch(&mittente)? {
             let mia = keys::EphemeralSecret::from_bytes(*segreto);
             if let Ok((sua_epoca, plaintext)) = baseline::open_epoch(&mia, &mittente, parsed) {
-                self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix())?;
+                self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix(), adesso)?;
                 return Ok((mittente, plaintext, false));
             }
         }
@@ -1011,7 +1039,7 @@ impl<K: Keyring> Session<K> {
             // disco come epoca.
             self.keyring.set_my_epoch(&mittente, *segreto)?;
             self.keyring.forget_my_prekey(&mittente, &segreto)?;
-            self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix())?;
+            self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix(), adesso)?;
             return Ok((mittente, plaintext, false));
         }
         Err(Error::Crypto)
@@ -1871,6 +1899,97 @@ mod tests {
         // E poi la prima, che era arrivata prima ed e' ancora li'.
         let esito = bob.handle_incoming_text("app", &a1, 17);
         assert!(esito.is_ok(), "la prima risposta non si apre: {:?}", esito.err());
+    }
+
+    /// Un solo messaggio con l'orologio avanti avvelena lo stato **per
+    /// sempre**.
+    ///
+    /// `ricorda_epoca_del_peer` rifiuta le epoche piu' vecchie di `seen_at`, e
+    /// `seen_at` viene dal timestamp **dichiarato dal mittente**, che la
+    /// decisione C definisce autenticato ma non verificabile. Basta che un
+    /// messaggio arrivi datato nel futuro — un telefono con l'ora sbagliata, e
+    /// capita — e da li' in poi ogni epoca nuova viene ignorata in silenzio.
+    ///
+    /// Da fuori: i messaggi di chi scrive smettono di aprirsi a chi li riceve,
+    /// senza che nessuno abbia fatto niente.
+    #[test]
+    fn un_orologio_avanti_non_blocca_le_epoche_future() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let ka = alice.identity.public();
+        let kb = bob.identity.public();
+        alice.keyring.tofu_pin(&kb, 1).unwrap();
+        bob.keyring.tofu_pin(&ka, 1).unwrap();
+        alice.set_current_peer("app", &kb).unwrap();
+        bob.set_current_peer("app", &ka).unwrap();
+
+        // Bob scrive con l'orologio sballato: dice di essere nel 2050.
+        let futuro = 2_500_000_000;
+        let sballato = bob
+            .encrypt_for_app_with("app", b"ciao", futuro, &mut rng(1), false)
+            .unwrap();
+        alice.handle_incoming_text("app", &sballato, 100).unwrap();
+
+        // Bob rimette l'ora giusta e brucia la conversazione: epoca nuova.
+        bob.burn_conversation(&ka, 150, &mut rng(9)).unwrap();
+        let corretto = bob
+            .encrypt_for_app_with("app", b"di nuovo", 200, &mut rng(2), false)
+            .unwrap();
+        alice.handle_incoming_text("app", &corretto, 201).unwrap();
+
+        // Alice deve aver imparato l'epoca nuova: altrimenti cifra verso quella
+        // bruciata e Bob non apre piu' niente.
+        let risposta = alice
+            .encrypt_for_app_with("app", b"eccomi", 202, &mut rng(3), false)
+            .unwrap();
+        let esito = bob.handle_incoming_text("app", &risposta, 203);
+        assert!(esito.is_ok(), "Bob non apre la risposta: {:?}", esito.err());
+    }
+
+    /// Il contrappeso del test qui sopra: **un blob vecchio ripubblicato non
+    /// riporta indietro l'epoca**.
+    ///
+    /// E' la difesa che il confronto con `seen_at` esiste per dare, e la
+    /// correzione sull'orologio non deve averla tolta. Un messaggio vecchio ha
+    /// una data vecchia comunque la si guardi — prendendo il minore fra la data
+    /// dichiarata e la nostra, resta vecchia — quindi viene ancora scartato.
+    #[test]
+    fn un_messaggio_vecchio_ripubblicato_non_riporta_indietro_l_epoca() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let ka = alice.identity.public();
+        let kb = bob.identity.public();
+        alice.keyring.tofu_pin(&kb, 1).unwrap();
+        bob.keyring.tofu_pin(&ka, 1).unwrap();
+        alice.set_current_peer("app", &kb).unwrap();
+        bob.set_current_peer("app", &ka).unwrap();
+
+        // Un messaggio di Bob di molto tempo fa, che Alice si tiene da parte.
+        let vecchio = bob
+            .encrypt_for_app_with("app", b"antico", 100, &mut rng(1), false)
+            .unwrap();
+
+        // Bob cambia epoca e scrive di nuovo; Alice legge e impara la nuova.
+        bob.burn_conversation(&ka, 150, &mut rng(9)).unwrap();
+        let nuovo = bob
+            .encrypt_for_app_with("app", b"recente", 200, &mut rng(2), false)
+            .unwrap();
+        alice.handle_incoming_text("app", &nuovo, 201).unwrap();
+
+        // Ora qualcuno ripubblica quello vecchio. Alice lo apre — e' un blob
+        // valido — ma NON deve tornare all'epoca di allora.
+        let _ = alice.handle_incoming_text("app", &vecchio, 300);
+
+        // La prova: la sua risposta deve ancora aprirsi.
+        let risposta = alice
+            .encrypt_for_app_with("app", b"eccomi", 301, &mut rng(3), false)
+            .unwrap();
+        let esito = bob.handle_incoming_text("app", &risposta, 302);
+        assert!(
+            esito.is_ok(),
+            "l'epoca e' tornata indietro: {:?}",
+            esito.err()
+        );
     }
 
     #[test]

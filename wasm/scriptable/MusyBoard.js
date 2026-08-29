@@ -459,6 +459,21 @@ function callProducing(fn, ...args) {
   return bytes;
 }
 
+/** Come `callProducing`, ma `(ptr=0, len=0)` significa "nessun dato" e
+ * ritorna `null` invece di lanciare — per funzioni come `mb_current_peer`
+ * dove l'assenza non è un errore. Un `(ptr=0, len>0)` resta un errore vero. */
+function callProducingOptional(fn, ...args) {
+  const packed = fn(...args);
+  const { ptr, len } = unpackU64(packed);
+  if (ptr === 0 && len === 0) return null;
+  if (ptr === 0) {
+    throw new MusyBoardError(len);
+  }
+  const bytes = readMemory(ptr, len);
+  wasm.exports.mb_dealloc(ptr, len);
+  return bytes;
+}
+
 /** Chiama una funzione che ritorna solo un codice `u32` (0 = successo). */
 function callStatus(fn, ...args) {
   const code = fn(...args);
@@ -667,6 +682,12 @@ function setCurrentPeer(peerBytes) {
   }
 }
 
+/** Byte della chiave pubblica del destinatario corrente, o `null` se non
+ * ce n'è uno impostato. */
+function getCurrentPeer() {
+  return callProducingOptional(wasm.exports.mb_current_peer);
+}
+
 async function encryptText(text) {
   await seedRng();
   const { ptr, len } = writeStr(text);
@@ -719,6 +740,15 @@ function confirmKeyChange(oldBytes, newBytes) {
   } finally {
     wasm.exports.mb_dealloc(o.ptr, 32);
     wasm.exports.mb_dealloc(n.ptr, 32);
+  }
+}
+
+function forgetPeer(peerBytes) {
+  const { ptr } = writeBytes(peerBytes);
+  try {
+    callStatus(wasm.exports.mb_forget_peer, ptr);
+  } finally {
+    wasm.exports.mb_dealloc(ptr, 32);
   }
 }
 
@@ -900,6 +930,7 @@ async function contactDetail(contact) {
   a.addAction("Segna come verificato");
   a.addAction("Imposta come destinatario per Cifra");
   a.addAction("Brucia conversazione");
+  a.addDestructiveAction("Dimentica contatto");
   a.addCancelAction("Indietro");
   const choice = await a.present();
   if (choice === 0) {
@@ -910,7 +941,23 @@ async function contactDetail(contact) {
     await showMessage("Fatto", "Ora 'Cifra un messaggio' scriverà a " + (contact.label || "questo contatto") + ".");
   } else if (choice === 2) {
     await burnFlow(contact);
+  } else if (choice === 3) {
+    await forgetFlow(contact);
   }
+}
+
+async function forgetFlow(contact) {
+  const warn = new Alert();
+  warn.title = "Dimenticare questo contatto?";
+  warn.message =
+    "Perdi il nome e il pin di sicurezza di " +
+    (contact.label || "questo contatto") +
+    ". Se scrive di nuovo, tornerà a comparire come mittente mai visto e verrà fissato di nuovo in silenzio — indistinguibile da qualcuno che si spacciasse per lui. Non è recuperabile.";
+  warn.addDestructiveAction("Dimentica");
+  warn.addCancelAction("Annulla");
+  if ((await warn.present()) !== 0) return;
+  forgetPeer(contact.public);
+  persistAll();
 }
 
 async function screenContacts() {
@@ -990,10 +1037,38 @@ async function pickContact(title) {
   return idx === -1 ? null : contacts[idx];
 }
 
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function findContactByPublic(publicBytes) {
+  return listContacts().find((c) => bytesEqual(c.public, publicBytes)) || null;
+}
+
 async function screenEncrypt() {
-  const contact = await pickContact("Cifra per...");
-  if (!contact) return;
-  setCurrentPeer(contact.public);
+  let contact = null;
+  const currentPublic = getCurrentPeer();
+  if (currentPublic) {
+    const known = findContactByPublic(currentPublic);
+    if (known) {
+      const a = new Alert();
+      a.title = "Destinatario";
+      a.message = "Continui a scrivere a " + (known.label || "(senza nome)") + "?";
+      a.addAction("Sì, continua");
+      a.addAction("Scegli un altro contatto");
+      a.addCancelAction("Annulla");
+      const choice = await a.present();
+      if (choice === -1) return;
+      if (choice === 0) contact = known;
+    }
+  }
+  if (!contact) {
+    contact = await pickContact("Cifra per...");
+    if (!contact) return;
+    setCurrentPeer(contact.public);
+  }
 
   const a = new Alert();
   a.title = "Testo da cifrare";

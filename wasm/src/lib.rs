@@ -316,6 +316,22 @@ pub extern "C" fn mb_set_current_peer(peer_ptr: u32) -> u32 {
     }
 }
 
+/// Il destinatario corrente, se c'e' — per mostrarlo in UI prima di cifrare.
+///
+/// A differenza delle altre funzioni "producing", qui l'assenza di
+/// destinatario NON e' un errore: `Session::current_peer` (`src/api.rs:1362`)
+/// ritorna un `Option`, non un `Result`. Si usa `(ptr=0, len=0)` per
+/// distinguerlo da un vero errore, che avrebbe sempre `len > 0` (i codici
+/// stanno tutti in `1..=9` o `90..`, mai `0`).
+#[no_mangle]
+pub extern "C" fn mb_current_peer() -> u64 {
+    match with_session(|s| s.current_peer(APP).cloned()) {
+        Some(Some(peer)) => marshal::pack_ok(peer.as_bytes().to_vec()),
+        Some(None) => 0, // pack(0, 0): nessun destinatario, non e' un errore.
+        None => marshal::pack_err(marshal::ERR_NO_SESSION),
+    }
+}
+
 /// Cifra "a epoca" (decisione J, forward secrecy disattivata: `effimero =
 /// false`) verso il destinatario corrente. Consuma RNG.
 #[no_mangle]
@@ -395,6 +411,25 @@ pub extern "C" fn mb_confirm_key_change(old_ptr: u32, new_ptr: u32, now_unix: i6
     let new = PublicKey::from_bytes(*unsafe { marshal::read_key32(new_ptr) });
     match with_session(|s| s.confirm_key_change(&old, &new, now_unix)) {
         Some(Ok(())) => 0,
+        Some(Err(e)) => marshal::code_of(&e),
+        None => marshal::ERR_NO_SESSION,
+    }
+}
+
+/// Dimentica un contatto: toglie il pin TOFU e le chiavi temporanee verso di
+/// lui, e smette di usarlo come destinatario corrente. `Session::forget_peer`
+/// (`src/api.rs:1177`) fa gia' entrambe le cose insieme apposta — dimenticare
+/// solo dal keyring lascerebbe il destinatario corrente puntato a una chiave
+/// non piu' fissata, un guasto silenzioso che si scoprirebbe solo dall'altro
+/// lato. L'esito booleano ("c'era?") non serve a JS, che chiama sempre su un
+/// contatto gia' scelto da un elenco: si scarta, come per gli altri stati
+/// "solo esito".
+#[no_mangle]
+pub extern "C" fn mb_forget_peer(peer_ptr: u32) -> u32 {
+    // SAFETY: il chiamante garantisce 32 byte validi a `peer_ptr`.
+    let peer = PublicKey::from_bytes(*unsafe { marshal::read_key32(peer_ptr) });
+    match with_session(|s| s.forget_peer(&peer)) {
+        Some(Ok(_)) => 0,
         Some(Err(e)) => marshal::code_of(&e),
         None => marshal::ERR_NO_SESSION,
     }

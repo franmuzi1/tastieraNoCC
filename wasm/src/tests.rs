@@ -297,6 +297,38 @@ fn conversazione_completa_fra_due_identita() {
 }
 
 #[test]
+fn dimenticare_un_contatto_toglie_anche_il_destinatario_corrente() {
+    let alice_id = identita_di_prova(1);
+    let bob_id = identita_di_prova(2);
+    let mut alice = Session::new(alice_id, IosKeyring::default());
+    let bob = Session::new(bob_id, IosKeyring::default());
+    let bob_pub = bob.identity().public();
+
+    let card_bob = bob.identity_card(&mut rng_di_prova(70));
+    alice
+        .handle_incoming_text(APP, &card_bob, ORA)
+        .expect("card di bob valida, lo fissa");
+    alice
+        .set_current_peer(APP, &bob_pub)
+        .expect("bob e' fissato, puo' diventare destinatario corrente");
+    assert_eq!(alice.current_peer(APP), Some(&bob_pub));
+
+    let c_era = alice
+        .forget_peer(&bob_pub)
+        .expect("forget non fallisce su un peer fissato");
+    assert!(c_era);
+    // La parte che conta di piu': dimenticare toglie ANCHE il destinatario
+    // corrente, non solo il pin — altrimenti si continuerebbe a cifrare
+    // verso una chiave non piu' fissata (`src/api.rs:1171-1181`).
+    assert_eq!(alice.current_peer(APP), None);
+
+    let di_nuovo = alice
+        .forget_peer(&bob_pub)
+        .expect("forget su un peer assente non fallisce");
+    assert!(!di_nuovo);
+}
+
+#[test]
 fn own_identity_card_e_own_message_si_riconoscono() {
     let alice_id = identita_di_prova(1);
     let mut alice = Session::new(alice_id, IosKeyring::default());
