@@ -747,8 +747,16 @@ Se una sessione le trova aperte, si ferma e chiede. Non sceglie per conto
 proprio.
 
 C, D, E, F, **G** e **K** sono chiuse; le loro motivazioni stanno nelle sezioni
-sopra. Al momento non ce ne sono di aperte: questa sezione resta perche' la
-prossima ci finira'.
+sopra.
+
+**L** e' un caso a parte: non chiusa e non aperta, ma **prenotata**. Lo scambio
+ibrido post-quantistico non si implementa adesso; il posto nel formato
+(`tier = 2`) e' assegnato oggi perche' dopo non si potrebbe piu'. Chi la trova
+non deve implementarla di propria iniziativa, e nemmeno riusare quel numero: vedi
+la sezione in fondo.
+
+Al momento non ce ne sono di aperte: questa sezione resta perche' la prossima ci
+finira'.
 
 *(La decisione E su z-base-32 è chiusa: vedi sotto.)*
 
@@ -999,6 +1007,70 @@ si sceglie il destinatario, e quella selezione si puo' salvare con un nome
 («Famiglia»). Il gruppo salvato e' un'etichetta locale sopra un insieme di
 chiavi, esattamente come il nome di un contatto e' un'etichetta locale sopra
 una chiave: non viaggia, non entra nel cifrato, e non lo conosce nessun altro.
+
+### Decisione L — scambio ibrido post-quantistico. **SPAZIO RISERVATO**
+
+Non e' chiusa e non e' aperta: e' **prenotata**. Lo schema non si implementa
+adesso, ma il posto nel formato e' assegnato oggi, perche' dopo non si potrebbe
+piu'.
+
+**Perche' riguarda proprio questo progetto, e non fra vent'anni.** L'avversario
+dichiarato nel threat model e' lo scanning di massa **con ritenzione in blocco**:
+raccogli oggi, analizza domani. E' la definizione letterale di *harvest now,
+decrypt later*. X25519 non e' post-quantistico, e la forward secrecy non aiuta:
+difende da una chiave rubata domani, non dall'algoritmo rotto domani — anche le
+chiavi effimere sono X25519. Se arriva una macchina quantistica utile, tutto cio'
+che e' stato conservato si apre, comprese le conversazioni che la catena
+proteggeva. E' la debolezza piu' seria che il sistema ha oggi, non perche' sia
+imminente, ma perche' e' l'unica che il threat model rende rilevante **per
+costruzione**.
+
+**Il posto: `tier = 2`.** Non un bit di flag, non una versione nuova.
+
+Il byte `tier` esiste da sempre come "posto libero nel formato per uno schema
+futuro", sta nella parte autenticata (AAD, quindi niente downgrade forzato) e
+viene letto **per primo**, prima che il parser si impegni su qualunque layout.
+Questo e' cio' che serve a uno schema ibrido, che avra' un'intestazione diversa:
+la chiave incapsulata di ML-KEM-768 e' 1088 byte, non sta in un campo da 32 e non
+puo' vivere dentro il cifrato, perche' serve **per derivare** la chiave.
+
+Un bit di flag non andrebbe: i quattro bit alti liberi in `Flags::KNOWN` sembrano
+l'appiglio ovvio ed e' un errore da non fare, per la stessa ragione scritta in
+K3. Una versione nuova nemmeno: la versione distingue le **forme** di envelope
+(uno a uno, gruppo), e un ibrido deve poterle avere entrambe.
+
+**Cosa e' stato fatto oggi, ed e' l'unica parte collaudabile.** `Tier::from_byte`
+su un tier sconosciuto ritornava `Error::Format`, che l'interfaccia mostra con la
+**stessa frase di un blob rovinato**. Il posto libero c'era, ma la porta diceva
+la cosa sbagliata: il primo messaggio ibrido avrebbe fatto comparire "messaggio
+corrotto" su ogni installazione precedente, mandando a cercare un guasto
+inesistente o a sospettare del mittente. Ora ritorna `TierUnsupported`, cioe'
+"aggiorna l'app".
+
+**Ed e' per questo che si fa adesso.** Una porta d'uscita va aperta *prima* di
+averne bisogno: quando i messaggi ibridi cominceranno a circolare, le
+installazioni che dicono "corrotto" saranno gia' fuori, e nessuna correzione
+successiva le raggiungera'. Vale per le dieci persone che usano il sistema oggi.
+
+*Prezzo accettato:* un blob davvero corrotto il cui byte del tier finisca su un
+valore non definito dira' "aggiorna l'app" invece di "rovinato". E' il verso
+giusto in cui sbagliare — chi aggiorna e riprova scopre la verita', chi si sente
+dire "corrotto" su un messaggio valido non ha via d'uscita.
+
+*Resta ferma* la distinzione fra i due livelli per i tier **noti**:
+`ForwardSecret` si parsa senza lamentarsi ed e' l'esecuzione a rifiutarlo. "Non
+lo so leggere" e "non lo so eseguire" restano due cose diverse.
+
+**Cosa NON e' stato deciso**, e va deciso quando si aprira' davvero: la
+primitiva (ML-KEM-768 e' il candidato ovvio, non e' una scelta fatta), come i due
+segreti si combinano — la regola sana e' concatenarli e passarli alla HKDF, cosi'
+che serva rompere **entrambi** — e cosa succede alla dimensione del blob, che con
+1088 byte in piu' esce dai limiti di un campo di chat e potrebbe obbligare gli
+ibridi a viaggiare come allegato.
+
+**Chi implementera' non deve toccare `Baseline` ne' `ForwardSecret`**, e non deve
+riusare il numero 2 per altro. Il numero e' prenotato qui, e il test
+`il_tier_ibrido_dice_aggiorna_non_corrotto` lo difende.
 
 ## Regole di implementazione
 

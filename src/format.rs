@@ -162,14 +162,43 @@ pub enum Tier {
     /// Forward secrecy. RISERVATO: il parsing lo riconosce, l'esecuzione
     /// ritorna [`Error::TierUnsupported`].
     ForwardSecret = 1,
+    // **2 e' riservato allo scambio ibrido post-quantistico** (decisione L).
+    // Non e' una variante qui perche' non esiste ancora codice che la produca:
+    // il numero e' prenotato nel documento e difeso da `from_byte`, che su un
+    // tier sconosciuto dice "aggiorna l'app" invece di "corrotto".
 }
 
 impl Tier {
+    /// Un tier sconosciuto e' [`Error::TierUnsupported`], **non**
+    /// [`Error::Format`].
+    ///
+    /// La differenza e' tutta in cosa legge l'utente. `Format` l'interfaccia lo
+    /// mostra con la stessa frase di un blob rovinato; `TierUnsupported` con
+    /// "aggiorna l'app". Un messaggio prodotto da una versione futura non e'
+    /// rovinato: e' semplicemente piu' nuovo di chi lo riceve, e dirgli il
+    /// contrario manda a cercare un guasto che non c'e' — o, peggio, fa
+    /// sospettare del mittente.
+    ///
+    /// **E' questa riga che rende il byte `tier` un vero spazio riservato.**
+    /// Senza, il posto libero nel formato c'era ma la porta diceva la cosa
+    /// sbagliata, e chiunque avesse spedito un tier nuovo avrebbe fatto
+    /// comparire "messaggio corrotto" su tutte le installazioni precedenti.
+    ///
+    /// Il prezzo, accettato: un blob davvero corrotto il cui byte del tier
+    /// finisca su un valore non definito dira' "aggiorna l'app" invece di
+    /// "rovinato". E' il verso giusto in cui sbagliare — chi aggiorna e riprova
+    /// scopre la verita', mentre chi si sente dire "corrotto" su un messaggio
+    /// valido non ha nessuna via d'uscita.
+    ///
+    /// Resta ferma la distinzione fra i due livelli per i tier **noti**:
+    /// `ForwardSecret` si parsa senza lamentarsi ed e' l'esecuzione a
+    /// rifiutarlo. "Non lo so leggere" e "non lo so eseguire" restano due cose
+    /// diverse.
     pub fn from_byte(b: u8) -> Result<Self> {
         match b {
             0 => Ok(Tier::Baseline),
             1 => Ok(Tier::ForwardSecret),
-            _ => Err(Error::Format("tier sconosciuto")),
+            _ => Err(Error::TierUnsupported),
         }
     }
 }
@@ -1273,6 +1302,16 @@ mod tests {
         assert_eq!(parsed.header.tier, Tier::ForwardSecret);
     }
 
+    /// `kind` e `tier` sconosciuti danno errori **diversi**, ed e' voluto.
+    ///
+    /// Un `kind` che non esiste e' un blob malformato: i tipi sono chiusi, e
+    /// non c'e' nessuno spazio riservato per aggiungerne. `Format` e' giusto.
+    ///
+    /// Un `tier` che non esiste e' invece l'unico spazio del formato
+    /// esplicitamente tenuto libero per uno schema futuro (decisione L, lo
+    /// scambio ibrido post-quantistico). Chi lo riceve non ha davanti un blob
+    /// rovinato: ha un messaggio piu' nuovo di lui, e la frase da mostrare e'
+    /// "aggiorna l'app". Da qui `TierUnsupported`.
     #[test]
     fn kind_e_tier_sconosciuti() {
         let mut buf = Vec::new();
@@ -1285,7 +1324,24 @@ mod tests {
         let mut body = vec![PROTOCOL_VERSION, Kind::Message as u8, 42u8, 0u8];
         body.extend_from_slice(&[0u8; 64]);
         let text = format!("{SENTINEL}{}", encoding::encode(&body));
-        assert!(matches!(parse(&text, &mut buf), Err(Error::Format(_))));
+        assert!(matches!(parse(&text, &mut buf), Err(Error::TierUnsupported)));
+    }
+
+    /// Il tier **2** e' prenotato per lo scambio ibrido, e questo test difende
+    /// la prenotazione.
+    ///
+    /// Non verifica uno schema che non esiste: verifica che un messaggio che un
+    /// giorno lo usera' venga rifiutato **dicendo la cosa giusta**. E' l'unica
+    /// parte della riserva che si possa collaudare oggi, ed e' anche quella che
+    /// non si potrebbe piu' aggiungere dopo: una volta che i messaggi ibridi
+    /// circolano, le installazioni che dicono "corrotto" sono gia' li' fuori.
+    #[test]
+    fn il_tier_ibrido_dice_aggiorna_non_corrotto() {
+        let mut buf = Vec::new();
+        let mut body = vec![PROTOCOL_VERSION, Kind::Message as u8, 2u8, 0u8];
+        body.extend_from_slice(&[0u8; 64]);
+        let text = format!("{SENTINEL}{}", encoding::encode(&body));
+        assert!(matches!(parse(&text, &mut buf), Err(Error::TierUnsupported)));
     }
 
     #[test]
