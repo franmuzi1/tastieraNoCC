@@ -2201,5 +2201,68 @@ mod tests {
         assert_eq!(apri(&bob, KAT_BASELINE).unwrap().as_bytes(), b"kat");
     }
 
+    /// Ancore di regressione per il formato di **gruppo** (decisione K).
+    ///
+    /// Mancavano, e la mancanza e' costata: cambiando il dominio di derivazione
+    /// degli slot — una rottura di compatibilita' vera — l'intera suite passo'
+    /// senza battere ciglio. Nessun test guardava i byte sul filo di un gruppo,
+    /// quindi il formato poteva muoversi in silenzio. Con dieci persone che si
+    /// scambiano messaggi, «in silenzio» vuol dire che se ne accorgono loro,
+    /// mesi dopo, da un messaggio che non si apre.
+    ///
+    /// Cosa fissano, e perche' ognuna serve:
+    ///
+    /// - la **stringa esatta**, cioe' framing, ordine dei campi, derivazione
+    ///   delle chiavi degli slot e del payload, e anche il rimescolamento degli
+    ///   slot, che con un RNG fisso e' deterministico ed e' parte del formato;
+    /// - che **ogni destinatario** riapra il proprio slot;
+    /// - che lo riapra **anche il mittente**, dal nono slot (K2): senza, chi
+    ///   scrive non rilegge cio' che ha scritto, e in un formato che per scelta
+    ///   non ha forward secrecy sarebbe incoerente.
+    ///
+    /// Se uno di questi test si rompe, **non e' un refactor**: e' un
+    /// cambiamento di formato, e va trattato come tale — versione nuova, non
+    /// modifica della 2.
+    #[test]
+    fn kat_gruppo() {
+        let alice = Identity::from_secret_bytes([0x11; 32]).unwrap();
+        let bob = Identity::from_secret_bytes([0x22; 32]).unwrap();
+        let carla = Identity::from_secret_bytes([0x33; 32]).unwrap();
+
+        let blob = gruppo(&alice, &[bob.public(), carla.public()], b"kat", 0);
+        assert_eq!(blob, KAT_GRUPPO);
+
+        for chi in [&bob, &carla] {
+            assert_eq!(
+                apri_gruppo(KAT_GRUPPO, chi, &alice.public()).unwrap().as_bytes(),
+                b"kat",
+            );
+        }
+        // Il mittente rilegge dal proprio slot.
+        assert_eq!(
+            apri_gruppo(KAT_GRUPPO, &alice, &alice.public()).unwrap().as_bytes(),
+            b"kat",
+        );
+    }
+
+    /// Un gruppo con un solo destinatario: due slot in tutto, quello di chi
+    /// riceve e quello del mittente. Fissa il caso di confine di `n_slot`, che
+    /// e' un byte e da solo decide quanto si legge.
+    #[test]
+    fn kat_gruppo_minimo() {
+        let alice = Identity::from_secret_bytes([0x11; 32]).unwrap();
+        let bob = Identity::from_secret_bytes([0x22; 32]).unwrap();
+
+        let blob = gruppo(&alice, &[bob.public()], b"kat", 0);
+        assert_eq!(blob, KAT_GRUPPO_MINIMO);
+        assert_eq!(
+            apri_gruppo(KAT_GRUPPO_MINIMO, &bob, &alice.public()).unwrap().as_bytes(),
+            b"kat",
+        );
+    }
+
+    const KAT_GRUPPO: &str = "kc/yeyyyy4qekw7rqfim56orfye4tjzftohccp68mx4mamgmdazf6dp7r3hn751jab9zdcrwp5keqhxefeawrqc8b7spg3qh3cgyx64bytog9n76nrpz3h4zqdw36gqdg3jk4yzhqydhz8pwectbtqxepfpa49ydurmbz5fis5te598mdookzaba9dn8g833t5tbdb64o1chazw8558z1rj5thzcwko6s1bfsoqc6dsnb6o8zmcugrueotfdbgb9dn7p88wwgfukpgsnhkrhziceebd9u7cp6hau5ebr6imotc4z5kuq6f4d9mix66udth1c6wjdfbd6dsp5izcxpbr7f3oxgcutytop1jk86uit6tnk1wzk5cy";
+    const KAT_GRUPPO_MINIMO: &str = "kc/yeyyyyajxjmm6o5uq3pp1snuac9job74zmcwuz8r8344h3o6mhnoqjhsybeiq1rpqh1qyx7a5bfdq41dzd4bkgfbdubaxpujymzssqr4ditw3st1hrswoje8h1bgo5dhiypi9yesze1614jeu5whtnheag3x9b1szbqwdabbzu8z7z456ppu543sina5bp6cweu3pf3kahztf3kzf63cni9kdcnjcfyeyadurk9mqnys1quodb7q7afxoceggnj4phw8c3o4dm4y3yrffsuznkd7athmbs5dwxsgtcy";
+
     const KAT_BASELINE: &str = "kc/yryyyym5j4ejzxu993nce3pnrybz4arqhpcjxwa69f3xy95wtrsmb739np5mtafpwdau5rnymiiqkwhgzwwm5wo3znoe55e4w7jg53deymgkw548czgbcg9oe759w8g6shbp8mx46g5y";
 }

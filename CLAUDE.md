@@ -1019,6 +1019,25 @@ una chiave: non viaggia, non entra nel cifrato, e non lo conosce nessun altro.
 - Vettori noti delle **primitive**: presi dalle crate upstream, non riscritti.
 - Vettori del **nostro formato**: prodotti con RNG fisso e congelati come KAT.
   Un cambiamento che li rompe è un cambiamento di formato, non un refactor.
+
+  *Uno per ogni formato che esiste*, e per un periodo non è stato vero. C'erano
+  `kat_baseline`, `kat_formato` e `kat_fingerprint`; per il **gruppo** non c'era
+  niente. La conseguenza si è vista: cambiando il dominio di derivazione degli
+  slot — una rottura di compatibilità vera, che ha reso illeggibili messaggi già
+  scambiati fra utenti reali — l'intera suite è passata senza battere ciglio, e
+  i tre KAT esistenti passano tuttora con quel dominio alterato. Un formato non
+  coperto da un vettore può muoversi in silenzio, e in silenzio vuol dire che se
+  ne accorgono gli utenti, mesi dopo, da un messaggio che non si apre.
+
+  Ora ci sono `kat_gruppo` (due destinatari) e `kat_gruppo_minimo` (uno solo,
+  per il caso di confine di `n_slot`). Fissano la stringa esatta — framing,
+  derivazione degli slot e del payload, e anche il rimescolamento, che con RNG
+  fisso è deterministico ed è parte del formato — più la riapertura da ogni
+  destinatario **e dal mittente**, che legge dal proprio slot.
+
+  **Chi aggiunge un formato aggiunge il suo KAT nello stesso commit**, come per
+  i target di fuzzing. Vale la stessa regola e per lo stesso motivo: la riga
+  qui sopra deve restare vera, non diventare più larga della realtà.
 - Vettori z-base-32: presi dalla spec. **Non inventarli**: un vettore di test
   sbagliato è peggio di nessun vettore.
 - Test negativi obbligatori: bit flip nel ciphertext, nell'AAD, nel byte di
