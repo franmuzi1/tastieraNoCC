@@ -247,10 +247,27 @@ impl<K: Keyring> Session<K> {
                 // Si risponde `Crypto` e non un errore suo: distinguere direbbe
                 // a chi ripubblica che il blob era buono e che l'aveva gia'
                 // usato qualcun altro.
-                if sent_at_unix <= self.keyring.burned_at(&peer)? {
+                // Anche qui il confronto si fa sul **minore** fra la data
+                // dichiarata e la nostra, per la stessa ragione di
+                // `ricorda_prekey` e `ricorda_epoca_del_peer` — ed e' il caso
+                // in cui il difetto sarebbe stato peggiore.
+                //
+                // Una richiesta di rogo datata nel futuro avrebbe spinto
+                // `burned_at` avanti di anni, e da quel momento **ogni rogo
+                // successivo di quella persona sarebbe stato rifiutato**: la
+                // sola operazione distruttiva del sistema smetteva di
+                // funzionare, in silenzio, e con l'errore opaco che non
+                // distingue "gia' fatto" da "non valido". Chi avesse chiesto di
+                // bruciare una conversazione avrebbe creduto di averlo fatto.
+                //
+                // Tagliando a `now_unix` la difesa dal replay resta intera — un
+                // blob vecchio ha una data vecchia comunque la si guardi —
+                // mentre una data assurda non puo' piu' disattivare la funzione.
+                let quando = sent_at_unix.min(now_unix);
+                if quando <= self.keyring.burned_at(&peer)? {
                     return Err(Error::Crypto);
                 }
-                self.keyring.set_burned_at(&peer, sent_at_unix)?;
+                self.keyring.set_burned_at(&peer, quando)?;
                 self.keyring.burn_conversation(&peer)?;
                 Ok(IncomingItem::Burned { peer, sent_at_unix })
             }
@@ -279,7 +296,7 @@ impl<K: Keyring> Session<K> {
                 }))
             }
             ParsedBlob::Message(parsed) if parsed.header.origin.uses_prekey() => {
-                let (sender, plaintext) = self.prova_con_le_prekey(&parsed)?;
+                let (sender, plaintext) = self.prova_con_le_prekey(&parsed, now_unix)?;
                 let sender_status = self.pin_and_classify(&sender, now_unix)?;
                 self.current_peer
                     .insert(app_package.to_owned(), sender.clone());
@@ -298,7 +315,7 @@ impl<K: Keyring> Session<K> {
                 let (sender, prekey, plaintext) = self.prova_i_contatti(&parsed)?;
                 // Da qui in poi gli si puo' rispondere con la forward secrecy
                 // piena: la catena e' partita.
-                self.ricorda_prekey(&sender, &prekey, plaintext.sent_at_unix())?;
+                self.ricorda_prekey(&sender, &prekey, plaintext.sent_at_unix(), now_unix)?;
                 let sender_status = self.pin_and_classify(&sender, now_unix)?;
                 self.current_peer
                     .insert(app_package.to_owned(), sender.clone());
@@ -639,10 +656,10 @@ impl<K: Keyring> Session<K> {
         // non e' nel keyring resta sconosciuto, ed e' voluto — altrimenti
         // chiunque potrebbe farsi fissare spedendo un allegato.
         let (sender, decrypted) = if parsed.header.origin.uses_prekey() {
-            self.prova_le_prekey_sul_file(&parsed)?
+            self.prova_le_prekey_sul_file(&parsed, now_unix)?
         } else if parsed.header.origin.is_ephemeral() {
             let (chi, prekey, aperto) = self.prova_i_contatti_sul_file(&parsed)?;
-            self.ricorda_prekey(&chi, &prekey, aperto.sent_at_unix)?;
+            self.ricorda_prekey(&chi, &prekey, aperto.sent_at_unix, now_unix)?;
             (chi, aperto)
         } else {
             let sender = parsed
@@ -874,13 +891,28 @@ impl<K: Keyring> Session<K> {
     /// illeggibili senza che nessuno dei due potesse accorgersene.
     ///
     /// Non e' un giudizio sul suo orologio, che la decisione C vieta: e' un
-    /// confronto con cio' che avevamo gia' accettato da lui. Se il suo orologio
-    /// torna indietro, il peggio e' che il prossimo scambio venga ignorato
-    /// finche' non recupera.
-    fn ricorda_prekey(&mut self, peer: &PublicKey, prekey: &PublicKey, quando: i64) -> Result<()> {
+    /// confronto con cio' che avevamo gia' accettato da lui.
+    ///
+    /// **`adesso` e' il nostro orologio, e serve.** Il commento qui sopra aveva
+    /// considerato il caso dell'orologio che torna indietro — il peggio e' che
+    /// il prossimo scambio venga ignorato finche' non recupera — ma non quello
+    /// che va avanti, che e' molto peggio: una data nel futuro spinge `seen_at`
+    /// avanti di anni, e da li' in poi **tutto** viene scartato per sempre.
+    ///
+    /// `seen_at` e' in comune con [`Self::ricorda_epoca_del_peer`], quindi
+    /// avvelenarlo da qui avvelena anche le epoche. Correggere solo l'altra
+    /// funzione non sarebbe servito a niente.
+    fn ricorda_prekey(
+        &mut self,
+        peer: &PublicKey,
+        prekey: &PublicKey,
+        quando: i64,
+        adesso: i64,
+    ) -> Result<()> {
         if self.identity.diffie_hellman(prekey).is_err() {
             return Ok(());
         }
+        let quando = quando.min(adesso);
         if quando < self.keyring.seen_at(peer)? {
             return Ok(());
         }
@@ -1037,8 +1069,31 @@ impl<K: Keyring> Session<K> {
             // `drop_my_prekeys_older_than` ne avrebbe toccato uno, e un segreto
             // che la forward secrecy dichiara distrutto sarebbe rimasto sul
             // disco come epoca.
-            self.keyring.set_my_epoch(&mittente, *segreto)?;
-            self.keyring.forget_my_prekey(&mittente, &segreto)?;
+            //
+            // **Ma solo se un'epoca non c'e' gia'**, e la guardia mancava.
+            //
+            // Questo ripiego serve a migrare uno stato salvato prima che
+            // l'epoca avesse un posto suo: per definizione, li' un'epoca non
+            // c'e'. Senza la guardia bastava pero' un blob vecchio
+            // ripubblicato, cifrato verso una prechiave ancora in catena, per
+            // far fallire il percorso normale e finire qui — e
+            // `set_my_epoca` sovrascrive senza chiedere. L'epoca corrente
+            // veniva sostituita da una di mesi prima, in silenzio, e da quel
+            // momento tutti quelli che cifravano verso quella vera non
+            // venivano piu' letti.
+            //
+            // Stessa famiglia degli altri tre difetti corretti qui accanto: uno
+            // stato che degrada in modo irreversibile per colpa di un ingresso
+            // che non controlliamo. E la coda minima delle prechiavi, appena
+            // introdotta, lo rendeva **piu'** raggiungibile, non meno: tiene in
+            // vita piu' a lungo proprio le chiavi che questo ciclo prova.
+            //
+            // Il messaggio si legge lo stesso: aprirlo non fa danno, adottarlo
+            // si'.
+            if self.keyring.my_epoch(&mittente)?.is_none() {
+                self.keyring.set_my_epoch(&mittente, *segreto)?;
+                self.keyring.forget_my_prekey(&mittente, &segreto)?;
+            }
             self.ricorda_epoca_del_peer(&mittente, &sua_epoca, plaintext.sent_at_unix(), adesso)?;
             return Ok((mittente, plaintext, false));
         }
@@ -1177,6 +1232,7 @@ impl<K: Keyring> Session<K> {
     fn prova_le_prekey_sul_file(
         &mut self,
         parsed: &crate::format::ParsedEnvelope<'_>,
+        adesso: i64,
     ) -> Result<(PublicKey, file::DecryptedFile)> {
         let mio = self.identity.public();
         for candidato in self.keyring.peers()? {
@@ -1187,7 +1243,7 @@ impl<K: Keyring> Session<K> {
                 else {
                     continue;
                 };
-                self.ricorda_prekey(&candidato, &prossima, aperto.sent_at_unix)?;
+                self.ricorda_prekey(&candidato, &prossima, aperto.sent_at_unix, adesso)?;
                 self.keyring
                     .drop_my_prekeys_older_than(&candidato, &segreto)?;
                 return Ok((candidato, aperto));
@@ -1246,6 +1302,7 @@ impl<K: Keyring> Session<K> {
     fn prova_con_le_prekey(
         &mut self,
         parsed: &crate::format::ParsedEnvelope<'_>,
+        adesso: i64,
     ) -> Result<(PublicKey, Plaintext)> {
         let mio = self.identity.public();
         for candidato in self.keyring.peers()? {
@@ -1256,7 +1313,7 @@ impl<K: Keyring> Session<K> {
                 else {
                     continue;
                 };
-                self.ricorda_prekey(&candidato, &prossima, plaintext.sent_at_unix())?;
+                self.ricorda_prekey(&candidato, &prossima, plaintext.sent_at_unix(), adesso)?;
                 self.keyring
                     .drop_my_prekeys_older_than(&candidato, &segreto)?;
                 return Ok((candidato, plaintext));
@@ -1992,6 +2049,80 @@ mod tests {
         );
     }
 
+    /// Una richiesta di rogo datata nel futuro non deve **disattivare i roghi
+    /// futuri**.
+    ///
+    /// Terzo punto della stessa famiglia — `burned_at`, come `seen_at` — e il
+    /// piu' grave: qui a smettere di funzionare sarebbe la sola operazione
+    /// distruttiva del sistema, in silenzio, con l'errore opaco che non
+    /// distingue "gia' fatto" da "non valido". Chi chiede di bruciare una
+    /// conversazione crederebbe di averlo fatto.
+    #[test]
+    fn un_rogo_datato_nel_futuro_non_blocca_i_roghi_dopo() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let ka = alice.identity.public();
+        let kb = bob.identity.public();
+        alice.keyring.tofu_pin(&kb, 1).unwrap();
+        bob.keyring.tofu_pin(&ka, 1).unwrap();
+
+        // Bob brucia con l'orologio sballato.
+        let futuro = 2_500_000_000;
+        let primo = bob.burn_conversation(&ka, futuro, &mut rng(1)).unwrap();
+        assert!(matches!(
+            alice.handle_incoming_text("app", &primo, 100),
+            Ok(IncomingItem::Burned { .. })
+        ));
+
+        // Bob rimette l'ora e brucia di nuovo, piu' tardi. Deve essere onorato.
+        let secondo = bob.burn_conversation(&ka, 200, &mut rng(2)).unwrap();
+        assert!(
+            matches!(
+                alice.handle_incoming_text("app", &secondo, 201),
+                Ok(IncomingItem::Burned { .. })
+            ),
+            "il secondo rogo e' stato rifiutato: la funzione era disattivata"
+        );
+    }
+
+    /// Lo stesso avvelenamento, ma per la via delle **prechiavi**.
+    ///
+    /// `seen_at` e' in comune fra `ricorda_prekey` e `ricorda_epoca_del_peer`,
+    /// quindi correggere solo la seconda non sarebbe servito a niente: un
+    /// messaggio a catena datato nel futuro avvelenava anche le epoche.
+    #[test]
+    fn un_orologio_avanti_sulla_catena_non_avvelena_le_epoche() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let ka = alice.identity.public();
+        let kb = bob.identity.public();
+        alice.keyring.tofu_pin(&kb, 1).unwrap();
+        bob.keyring.tofu_pin(&ka, 1).unwrap();
+        alice.set_current_peer("app", &kb).unwrap();
+        bob.set_current_peer("app", &ka).unwrap();
+
+        // Bob scrive CON la catena e con l'orologio sballato: passa da
+        // `ricorda_prekey`, che e' l'altra porta su `seen_at`.
+        let futuro = 2_500_000_000;
+        let sballato = bob
+            .encrypt_for_app_with("app", b"ciao", futuro, &mut rng(1), true)
+            .unwrap();
+        alice.handle_incoming_text("app", &sballato, 100).unwrap();
+
+        // Poi cambia epoca e scrive senza catena, con l'ora giusta.
+        bob.burn_conversation(&ka, 150, &mut rng(9)).unwrap();
+        let corretto = bob
+            .encrypt_for_app_with("app", b"di nuovo", 200, &mut rng(2), false)
+            .unwrap();
+        alice.handle_incoming_text("app", &corretto, 201).unwrap();
+
+        let risposta = alice
+            .encrypt_for_app_with("app", b"eccomi", 202, &mut rng(3), false)
+            .unwrap();
+        let esito = bob.handle_incoming_text("app", &risposta, 203);
+        assert!(esito.is_ok(), "Bob non apre la risposta: {:?}", esito.err());
+    }
+
     #[test]
     fn un_gruppo_non_tocca_la_catena_a_due() {
         let mut alice = sessione(1);
@@ -2546,7 +2677,7 @@ mod tests {
         alice.keyring.tofu_pin(&chiave_carla, 1).unwrap();
         carla.keyring.tofu_pin(&alice.identity().public(), 1).unwrap();
         carla.set_current_peer(WHATSAPP, &alice.identity().public()).unwrap();
-        alice.ricorda_prekey(&chiave_carla, &veleno, 1).unwrap();
+        alice.ricorda_prekey(&chiave_carla, &veleno, 1, 1).unwrap();
         assert!(alice.keyring.peer_prekey(&chiave_carla).unwrap().is_none());
     }
 

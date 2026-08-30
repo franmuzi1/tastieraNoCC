@@ -1099,6 +1099,50 @@ ibridi a viaggiare come allegato.
 riusare il numero 2 per altro. Il numero e' prenotato qui, e il test
 `il_tier_ibrido_dice_aggiorna_non_corrotto` lo difende.
 
+### Una famiglia di difetti: lo stato che si avvelena da solo
+
+Non e' una decisione, e' un **criterio di revisione**, scritto qui perche' e'
+costato quattro difetti dello stesso stampo trovati in un pomeriggio — dopo che
+uno di essi era arrivato da un'utente reale.
+
+**La forma.** Uno stato che avanza in una sola direzione, e che avanza su un
+valore **che non controlliamo**: il timestamp dichiarato da chi scrive, o
+l'esistenza di un vecchio blob che chiunque puo' ripubblicare. Il danno non e'
+un errore: e' un guasto **permanente e silenzioso**, che si manifesta come
+"a volte non funziona" e non lascia via d'uscita.
+
+I quattro, tutti in `api.rs`:
+
+- `seen_at` avanzato dal timestamp del mittente per la via delle **prechiavi**;
+- lo stesso per la via delle **epoche** — e `seen_at` e' in comune, quindi
+  correggerne una sola non sarebbe servito a niente;
+- `burned_at`, dove il difetto era peggiore: una richiesta di rogo datata nel
+  futuro **disattivava tutti i roghi successivi**, cioe' la sola operazione
+  distruttiva del sistema, in silenzio e con l'errore opaco che non distingue
+  "gia' fatto" da "non valido";
+- il ripiego di migrazione dell'epoca, che adottava una vecchia prechiave come
+  epoca **sovrascrivendo quella corrente**: bastava un blob vecchio
+  ripubblicato.
+
+**La regola che li chiude tutti.** Un confronto di recenza si fa sul **minore
+fra la data dichiarata e la nostra**. La difesa dal ritorno indietro resta
+intera — un blob vecchio ha una data vecchia comunque la si guardi — mentre una
+data nel futuro viene tagliata a quando l'abbiamo ricevuta davvero, e non puo'
+piu' avvelenare niente. E uno stato che esiste per **migrare** si scrive solo
+quando il posto e' vuoto.
+
+**Perche' era sfuggito.** La decisione C dice gia' che il timestamp e'
+«autenticato ma non verificabile» e che non va usato per decisioni automatiche.
+Ogni singolo punto pero' sembrava un'eccezione ragionevole, con un commento che
+spiegava perche' li' andava bene. Nessuno dei quattro commenti era sbagliato sul
+proprio caso; tutti e quattro guardavano solo l'orologio che torna **indietro**,
+e nessuno quello che va **avanti**.
+
+**Cosa chiedersi, su ogni stato nuovo:** puo' andare solo in una direzione? Chi
+lo spinge? E se lo spinge troppo in la', cosa smette di funzionare — e l'utente
+se ne accorge? Se la risposta all'ultima e' "no", serve un taglio con un valore
+nostro.
+
 ## Regole di implementazione
 
 - `#![forbid(unsafe_code)]`.
