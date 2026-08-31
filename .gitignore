@@ -35,3 +35,5 @@ cli/target/
 gui/target/
 wasm/target/
 wasm/poc/target/
+
+# Il ponte iOS vive nel suo repo: ../MusyBoard-iOS
