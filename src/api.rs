@@ -103,6 +103,33 @@ pub struct DecryptedMessage {
     pub destinatari: usize,
 }
 
+/// Perche' un messaggio nostro a epoca non si e' riaperto.
+///
+/// La domanda che l'utente si fa e' «e allora il mio contatto dov'e' finito?»,
+/// e per anni la risposta e' stata quella sbagliata: il codice di errore era
+/// uno solo, e l'app lo traduceva con l'unica causa che quel codice aveva
+/// quando e' nato — «quel contatto non e' piu' nella tua lista». Nella via a
+/// epoca e' quasi sempre falso.
+///
+/// Le cause vere sono tre, e si distinguono con quello che si sa gia' qui,
+/// senza tentare nessuna decifratura in piu':
+///
+///  - **nessun contatto in rubrica**: allora si', non c'e' a chi. E' l'unico
+///    caso in cui il vecchio avviso diceva il vero;
+///  - **bootstrap**: il primo messaggio di una conversazione si riapre con le
+///    sole identita', che non cambiano e non scadono. Se fallisce per tutti i
+///    contatti, il destinatario non e' fra loro;
+///  - **tutto il resto**: si riapriva con la chiave d'epoca del destinatario,
+///    che e' una sola per contatto e viene sovrascritta — o cancellata da un
+///    rogo. Il contatto c'e' ancora, la chiave di allora no.
+fn perche_non_si_riapre(bootstrap: bool, contatti: usize) -> Error {
+    if contatti == 0 || bootstrap {
+        Error::OwnMessage
+    } else {
+        Error::OwnMessageKeyGone
+    }
+}
+
 /// Un segreto nuovo per una chiave temporanea.
 fn nuovo_segreto<R: RngCore + CryptoRng>(rng: &mut R) -> [u8; 32] {
     let mut bytes = [0u8; 32];
@@ -1014,7 +1041,9 @@ impl<K: Keyring> Session<K> {
         // con la sua identita'. Bruciando sparisce anche questa possibilita',
         // ed e' meta' del senso del gesto.
         if mittente == self.identity.public() {
+            let mut contatti = 0usize;
             for candidato in self.keyring.peers()? {
+                contatti = contatti.saturating_add(1);
                 let aperto = if bootstrap {
                     baseline::open_epoch_bootstrap_as_sender(&self.identity, &candidato, parsed)
                 } else {
@@ -1027,7 +1056,7 @@ impl<K: Keyring> Session<K> {
                     return Ok((candidato, plaintext, true));
                 }
             }
-            return Err(Error::OwnMessage);
+            return Err(perche_non_si_riapre(bootstrap, contatti));
         }
 
         // Il primo messaggio di una conversazione arriva cifrato verso la
@@ -1347,7 +1376,9 @@ impl<K: Keyring> Session<K> {
                 .cloned()
                 .ok_or(Error::Format("messaggio a epoca senza mittente"))?;
             if mittente == self.identity.public() {
+                let mut contatti = 0usize;
                 for candidato in self.keyring.peers()? {
+                    contatti = contatti.saturating_add(1);
                     let aperto = if bootstrap {
                         baseline::open_epoch_bootstrap_as_sender(&self.identity, &candidato, &parsed)
                     } else {
@@ -1360,7 +1391,7 @@ impl<K: Keyring> Session<K> {
                         return Ok((candidato, plaintext));
                     }
                 }
-                return Err(Error::OwnMessage);
+                return Err(perche_non_si_riapre(bootstrap, contatti));
             }
             if bootstrap {
                 let (_, plaintext) =
@@ -2586,6 +2617,110 @@ mod tests {
         assert!(matches!(
             alice.handle_incoming_text(WHATSAPP, &effimero, 13),
             Err(Error::Crypto)
+        ));
+    }
+
+    /// **Il caso segnalato da chi usa l'app**, e la ragione per cui esiste
+    /// [`Error::OwnMessageKeyGone`].
+    ///
+    /// Chi scrive ha la forward secrecy spenta, chi riceve ce l'ha accesa. Il
+    /// messaggio parte allora verso la **prechiave** del destinatario — e'
+    /// [`Session::epoca_del_peer`] che ripiega li' quando una chiave d'epoca
+    /// non c'e' — e quella prechiave avanza a ogni messaggio che lui manda.
+    /// Due sue risposte dopo, il mittente rilegge cio' che ha scritto e non si
+    /// riapre piu'.
+    ///
+    /// Fin qui e' il funzionamento previsto. Il difetto stava nell'avviso: il
+    /// core aveva un codice solo, e l'app lo traduceva con «quel contatto non
+    /// e' piu' nella tua lista» — mentre il contatto e' li', intatto, e
+    /// continua a ricevere i messaggi nuovi. Chi lo leggeva andava a cercare un
+    /// guasto nella rubrica.
+    #[test]
+    fn un_mio_messaggio_verso_una_prechiave_avanzata_non_incolpa_la_rubrica() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity().public();
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+        bob.set_current_peer(WHATSAPP, &chiave_alice).unwrap();
+
+        // Bob scrive per primo CON forward secrecy: Alice si segna la sua
+        // prechiave, che e' l'unica chiave effimera di Bob che conosce.
+        let da_bob = bob
+            .encrypt_for_app_with(WHATSAPP, b"ciao", 10, &mut rng(9), true)
+            .unwrap();
+        alice.handle_incoming_text(WHATSAPP, &da_bob, 11).unwrap();
+
+        // Alice risponde SENZA: cifra a epoca, e l'epoca del destinatario e'
+        // la prechiave di Bob, perche' un'epoca vera lui non l'ha mai mandata.
+        let mio = alice
+            .encrypt_for_app_with(WHATSAPP, b"la mia risposta", 12, &mut rng(8), false)
+            .unwrap();
+        // Appena scritto si rilegge ancora: la chiave e' quella di adesso.
+        assert!(matches!(
+            alice.handle_incoming_text(WHATSAPP, &mio, 13),
+            Ok(IncomingItem::OwnMessage { .. })
+        ));
+        assert!(bob.handle_incoming_text(WHATSAPP, &mio, 14).is_ok());
+
+        // Bob risponde ancora, e la sua catena avanza: Alice si segna la
+        // prechiave nuova al posto di quella verso cui aveva cifrato.
+        let ancora_bob = bob
+            .encrypt_for_app_with(WHATSAPP, b"e ancora", 15, &mut rng(7), true)
+            .unwrap();
+        alice.handle_incoming_text(WHATSAPP, &ancora_bob, 16).unwrap();
+
+        // Da qui il messaggio di Alice non si riapre. Deve dirlo per quello
+        // che e': il contatto c'e' ancora.
+        assert!(
+            alice.keyring.get(&chiave_bob).unwrap().is_some(),
+            "il contatto non e' stato toccato da niente"
+        );
+        assert!(matches!(
+            alice.handle_incoming_text(WHATSAPP, &mio, 17),
+            Err(Error::OwnMessageKeyGone)
+        ));
+        // E la stessa risposta dall'archivio, che ha una via sua e la
+        // sbagliava allo stesso modo.
+        assert!(matches!(
+            alice.open_archived(&mio),
+            Err(Error::OwnMessageKeyGone)
+        ));
+    }
+
+    /// L'altra meta': dove la rubrica **e'** la causa, l'avviso non deve
+    /// cambiare. Un messaggio di apertura si riapre con le sole identita', che
+    /// non scadono e non avanzano: se fallisce per tutti i contatti, il
+    /// destinatario non e' fra loro davvero.
+    #[test]
+    fn un_mio_messaggio_di_apertura_incolpa_la_rubrica_e_ha_ragione() {
+        let mut alice = sessione(1);
+        let bob = sessione(2);
+        let carol = sessione(3);
+        let chiave_bob = bob.identity().public();
+        let chiave_carol = carol.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+
+        // Primo messaggio della conversazione: bootstrap, cifrato verso
+        // l'identita' di Bob.
+        let mio = alice
+            .encrypt_for_app_with(WHATSAPP, b"apriamo", 10, &mut rng(9), false)
+            .unwrap();
+        assert!(matches!(
+            alice.handle_incoming_text(WHATSAPP, &mio, 11),
+            Ok(IncomingItem::OwnMessage { .. })
+        ));
+
+        // Alice dimentica Bob e tiene Carol: la rubrica non e' vuota, ma chi
+        // poteva aprirlo non c'e' piu'.
+        assert!(alice.forget_peer(&chiave_bob).unwrap());
+        alice.keyring.tofu_pin(&chiave_carol, 12).unwrap();
+        assert!(matches!(
+            alice.handle_incoming_text(WHATSAPP, &mio, 13),
+            Err(Error::OwnMessage)
         ));
     }
 

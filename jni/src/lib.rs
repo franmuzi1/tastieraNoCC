@@ -65,7 +65,13 @@ mod code {
     pub const INTERNAL: jint = 9;
     /// L'abbiamo scritto noi: puo' aprirlo solo il destinatario. Esito
     /// NORMALE, non un guasto — capita ricopiando un proprio messaggio.
+    ///
+    /// Qui la causa e' precisa: il destinatario non e' piu' nel keyring.
     pub const OWN_MESSAGE: jint = 10;
+    /// L'abbiamo scritto noi e il destinatario c'e' ancora, ma la chiave
+    /// effimera verso cui era cifrato e' stata sostituita o bruciata. Esito
+    /// NORMALE come il precedente: cambia solo cosa si dice a chi legge.
+    pub const OWN_MESSAGE_KEY_GONE: jint = 11;
 
     /// Esiti di `handleIncomingText`, quando il codice e' OK.
     pub const ITEM_MESSAGE: jint = 0;
@@ -109,6 +115,7 @@ fn code_of(error: &Error) -> jint {
         Error::UnknownPeer => code::UNKNOWN_PEER,
         Error::TierUnsupported => code::TIER_UNSUPPORTED,
         Error::OwnMessage => code::OWN_MESSAGE,
+        Error::OwnMessageKeyGone => code::OWN_MESSAGE_KEY_GONE,
         Error::Keyring => code::KEYRING,
     }
 }
