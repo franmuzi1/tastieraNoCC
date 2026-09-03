@@ -2620,6 +2620,61 @@ mod tests {
         ));
     }
 
+    /// **La finestra delle prechiavi contro i messaggi spezzati.**
+    ///
+    /// Da quando la tastiera taglia un messaggio troppo lungo in parti cifrate
+    /// una per una, «quanti messaggi di fila» ha smesso di coincidere con
+    /// «quante chiavi»: un solo messaggio lungo ne consuma fino a dodici. Con
+    /// il vecchio tetto di 32, tre messaggi lunghi di fila riempivano la
+    /// finestra e la risposta dell'altro — cifrata verso una chiave annunciata
+    /// prima — non si apriva piu'.
+    ///
+    /// Il test manda 36 messaggi senza che l'altro risponda, poi gli fa
+    /// leggere **solo il primo**: la sua risposta usa la chiave vista li', che
+    /// e' la piu' vecchia di tutte. Se cade, cade in silenzio e la
+    /// conversazione si rompe dal lato di chi aveva scritto tanto.
+    #[test]
+    fn tre_messaggi_spezzati_di_fila_non_chiudono_la_finestra() {
+        let mut alice = sessione(1);
+        let mut bob = sessione(2);
+        let chiave_alice = alice.identity().public();
+        let chiave_bob = bob.identity().public();
+        alice.keyring.tofu_pin(&chiave_bob, 1).unwrap();
+        bob.keyring.tofu_pin(&chiave_alice, 1).unwrap();
+        alice.set_current_peer(WHATSAPP, &chiave_bob).unwrap();
+        bob.set_current_peer(WHATSAPP, &chiave_alice).unwrap();
+
+        let mut prima: Option<String> = None;
+        for i in 0..36u8 {
+            let parte = alice
+                .encrypt_for_app_with(
+                    WHATSAPP,
+                    b"una parte",
+                    10 + i64::from(i),
+                    &mut rng(i),
+                    true,
+                )
+                .unwrap();
+            if prima.is_none() {
+                prima = Some(parte);
+            }
+        }
+
+        // Bob legge la prima parte e risponde: la sua risposta e' cifrata
+        // verso la chiave che Alice aveva annunciato li'.
+        let prima = prima.unwrap();
+        bob.handle_incoming_text(WHATSAPP, &prima, 100).unwrap();
+        let risposta = bob
+            .encrypt_for_app_with(WHATSAPP, b"ricevuto", 101, &mut rng(99), true)
+            .unwrap();
+
+        let letto = alice.handle_incoming_text(WHATSAPP, &risposta, 102).unwrap();
+        let IncomingItem::Message(m) = letto else {
+            panic!("la risposta doveva aprirsi: la chiave era ancora nella finestra")
+        };
+        assert_eq!(m.plaintext.as_bytes(), b"ricevuto");
+    }
+
     /// **Il caso segnalato da chi usa l'app**, e la ragione per cui esiste
     /// [`Error::OwnMessageKeyGone`].
     ///

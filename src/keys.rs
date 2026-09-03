@@ -320,8 +320,29 @@ pub enum LabelOutcome {
 /// conversazione normale la finestra si richiude da sola al primo scambio.
 ///
 /// Il limite serve solo a impedire che lo stato cresca senza fine verso un
-/// contatto che non risponde mai. 32 chiavi sono 1 KB per contatto.
-pub const MAX_PREKEY_MIE: usize = 32;
+/// contatto che non risponde mai. 64 chiavi sono 2 KB per contatto.
+///
+/// ## Perche' 64 e non piu' 32
+///
+/// Perche' «quanti messaggi di fila» ha smesso di coincidere con «quante
+/// chiavi». La tastiera adesso spezza un messaggio troppo lungo in parti
+/// cifrate una per una — fino a dodici — e ognuna consuma una chiave: con 32,
+/// **tre messaggi lunghi di fila** riempivano la finestra, e una risposta
+/// ancora in volo verso una chiave annunciata prima non si sarebbe piu'
+/// aperta. Il valore era dimensionato su un presupposto che non vale piu'.
+///
+/// ## Perche' non molto piu' di 64
+///
+/// Perche' il tetto e' anche il costo di **leggere**. Un messaggio a forward
+/// secrecy si apre provando le combinazioni contatto × nostra chiave, e ogni
+/// tentativo costa due Diffie-Hellman su curve25519 (vedi
+/// `baseline::apri_avanti`). Il caso peggiore — un blob che non si apre
+/// affatto — e' quindi contatti × questo numero × 2 DH, e su un telefono con
+/// una rubrica piena e' la differenza fra un'attesa che non si nota e una che
+/// si nota. Raddoppiare copre cinque messaggi spezzati di fila e raddoppia
+/// quel costo; moltiplicare per dodici, cioe' tenere la vecchia garanzia di 32
+/// messaggi qualunque sia la loro lunghezza, lo moltiplicherebbe per dodici.
+pub const MAX_PREKEY_MIE: usize = 64;
 
 /// Quante chiavi temporanee sopravvivono comunque a una lettura.
 ///
