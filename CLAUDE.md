@@ -1227,6 +1227,24 @@ nostro.
 
 ## Comandi
 
+**Prima di un commit che tocca il core, e sempre prima di una release:**
+
+```
+./verifica-tutto.sh            # core, jni/, cli/, gui/, ../MusyBoard-iOS, ../MusyBoard-Android
+./verifica-tutto.sh --rapido   # senza fuzz build e senza lint Android
+```
+
+`cargo test` qui compila il core e nient'altro: i consumatori sono cinque e
+nessuno viene toccato. E' costato due volte in due settimane — una variante di
+`Error` adeguata in `jni/` e non nel ponte iOS, che ha smesso di compilare; poi
+un cambiamento del core che ha lasciato vecchio il binario in
+`MusyBoard-iOS/dist/`, cioe' il file che finisce sull'iPhone. Lo script si
+ferma al primo guasto, esce con 2 se ha dovuto saltare un progetto (un verde
+che non ha guardato non e' un verde), e non corregge niente da solo. Non esegue
+i test strumentati Android, che vogliono un emulatore.
+
+I comandi dei singoli pezzi, per quando serve lavorare su uno solo:
+
 ```
 cargo test
 cargo clippy --all-targets -- -D warnings
