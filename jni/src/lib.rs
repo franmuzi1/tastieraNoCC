@@ -98,6 +98,14 @@ mod code {
     pub const SHAPE_GROUP: jint = 3;
     pub const SHAPE_CARD: jint = 4;
     pub const SHAPE_BURN: jint = 5;
+    /// Chiave effimera del mittente, nessuna chiave temporanea del
+    /// destinatario: il primo messaggio con la forward secrecy accesa. Chi
+    /// riceve lo riapre quando vuole; chi l'ha scritto no, mai.
+    pub const SHAPE_MESSAGE_EPHEMERAL: jint = 6;
+    /// Schema a epoca (decisione J): rileggibile da tutti e due finche' le
+    /// chiavi d'epoca esistono. Non si apre se la conversazione e' stata
+    /// bruciata, non perche' «si apre una volta sola».
+    pub const SHAPE_MESSAGE_EPOCH: jint = 7;
 
     /// Esiti di `assignLabel`.
     pub const LABEL_ASSIGNED: jint = 0;
@@ -834,15 +842,7 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeBlobShape
         let mut buf = Vec::new();
         match keyboard_cipher_core::format::parse(&testo, &mut buf) {
             Ok(keyboard_cipher_core::format::ParsedBlob::Message(parsed)) => {
-                if parsed
-                    .header
-                    .flags()
-                    .contains(keyboard_cipher_core::format::Flags::PREKEY)
-                {
-                    code::SHAPE_MESSAGE_FS
-                } else {
-                    code::SHAPE_MESSAGE
-                }
+                forma_del_messaggio(&parsed.header.origin)
             }
             Ok(keyboard_cipher_core::format::ParsedBlob::Group(_)) => code::SHAPE_GROUP,
             Ok(keyboard_cipher_core::format::ParsedBlob::IdentityCard(_)) => code::SHAPE_CARD,
@@ -850,6 +850,25 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeBlobShape
             Err(_) => code::SHAPE_UNKNOWN,
         }
     })
+}
+
+/// La forma di un messaggio a due, dall'origine dichiarata nella busta.
+///
+/// Si guarda l'origine e non il solo bit `PREKEY`, ed e' il difetto che c'era:
+/// quel bit lo portano **due** schemi opposti. Con la chiave effimera e' la
+/// catena, che si apre una volta sola; senza, e' lo schema a epoca, che si
+/// rilegge finche' la conversazione non viene bruciata. Leggerli insieme diceva
+/// «usava la forward secrecy» proprio a chi l'aveva spenta.
+fn forma_del_messaggio(origin: &keyboard_cipher_core::format::Origin) -> jint {
+    use keyboard_cipher_core::format::Origin;
+    match origin {
+        Origin::EffimeraConPrekey(_) => code::SHAPE_MESSAGE_FS,
+        Origin::Effimera(_) => code::SHAPE_MESSAGE_EPHEMERAL,
+        Origin::MittenteConPrekey(_) => code::SHAPE_MESSAGE_EPOCH,
+        Origin::Assente | Origin::Mittente(_) | Origin::MittenteConEpoca(_) => {
+            code::SHAPE_MESSAGE
+        }
+    }
 }
 
 /// Cifra verso il destinatario corrente dell'app. `null` se non c'e'.
@@ -1561,4 +1580,25 @@ pub extern "system" fn Java_helium314_keyboard_cipher_CipherCore_nativeAssignLab
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keyboard_cipher_core::format::Origin;
+    use keyboard_cipher_core::keys::PublicKey;
+
+    /// Il bit `PREKEY` sta su due schemi opposti: la catena e l'epoca. La
+    /// forma deve separarli, o un messaggio a forward secrecy spenta viene
+    /// spiegato come uno che l'aveva accesa.
+    #[test]
+    fn la_forma_separa_catena_epoca_ed_effimera() {
+        let k = PublicKey::from_bytes([7u8; 32]);
+        assert_eq!(forma_del_messaggio(&Origin::EffimeraConPrekey(k.clone())), code::SHAPE_MESSAGE_FS);
+        assert_eq!(forma_del_messaggio(&Origin::MittenteConPrekey(k.clone())), code::SHAPE_MESSAGE_EPOCH);
+        assert_eq!(forma_del_messaggio(&Origin::Effimera(k.clone())), code::SHAPE_MESSAGE_EPHEMERAL);
+        assert_eq!(forma_del_messaggio(&Origin::Mittente(k.clone())), code::SHAPE_MESSAGE);
+        assert_eq!(forma_del_messaggio(&Origin::MittenteConEpoca(k)), code::SHAPE_MESSAGE);
+        assert_eq!(forma_del_messaggio(&Origin::Assente), code::SHAPE_MESSAGE);
+    }
 }
