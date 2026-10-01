@@ -169,7 +169,8 @@ l'altro in passato, non da cosa dichiara il messaggio in arrivo.
 
 **Lo stato per contatto** vive in `Keyring` (`PrekeyStore` nel core: struttura
 dati, nessun I/O, cosi' le tre implementazioni non ne hanno tre versioni
-diverse). Se ne tengono `MAX_PREKEY_MIE` = **32**.
+diverse). Se ne tengono `MAX_PREKEY_MIE` = **64** (era 32 fino al commit
+f53d057: un messaggio lungo spezzato in parti consuma una chiave per parte).
 
 **Il numero NON e' un compromesso sulla forward secrecy, ed e' l'errore da non
 rifare.** Era 3, con la motivazione — sbagliata — che fosse "la finestra in cui
@@ -177,7 +178,9 @@ la forward secrecy non c'e' ancora". Non lo e': una nostra chiave apre solo i
 messaggi cifrati con quella, e le eccedenti non hanno mai aperto niente, perche'
 nessun messaggio le ha mai usate. Tenerne di piu' non allunga nessun passato
 apribile. Il tetto serve a una cosa sola, impedire che lo stato cresca verso chi
-non risponde mai: 32 chiavi sono 1 KB per contatto.
+non risponde mai: 64 chiavi sono 2 KB per contatto. Il tetto e' anche il
+costo di leggere: un blob a forward secrecy che non si apre costa nel caso
+peggiore contatti x 64 x 2 Diffie-Hellman.
 
 Tre erano poche per un motivo pratico trovato con una sonda, non a mente: chi
 risponde usa l'ultima chiave temporanea che **ha visto**, non l'ultima che
@@ -819,7 +822,7 @@ Cinque motivi, in ordine di peso. I primi due bastano da soli.
    il messaggio.
 
 2. **Le prechiavi monouso hanno bisogno di un distributore, e qui non c'e'.**
-   Sono per-contatto (`my_prekeys(&peer)`, `MAX_PREKEY_MIE = 32`) e si
+   Sono per-contatto (`my_prekeys(&peer)`, `MAX_PREKEY_MIE = 64`) e si
    ricaricano quando quel contatto scrive. Fra due persone il piggyback basta,
    perche' i turni si alternano e le parti sono due. In un gruppo no, e per due
    ragioni distinte:
