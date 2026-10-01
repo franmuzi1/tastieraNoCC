@@ -11,6 +11,7 @@
 [package]
 name = "keyboard-cipher-gui"
 version = "0.1.0"
+license = "GPL-3.0-only"
 edition = "2021"
 description = "App da scrivania per cifrare e decifrare i messaggi della tastiera"
 publish = false

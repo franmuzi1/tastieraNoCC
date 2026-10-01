@@ -136,4 +136,6 @@ Qualche esempio di cose che sembrano migliorabili e non lo sono:
 
 ## Licenza
 
-Vedi il repository dell'app.
+GPL-3.0-only: vedi [LICENSE](LICENSE). E' la stessa licenza dell'app
+Android che lo usa, e le dipendenze di terzi (MIT, Apache-2.0, BSD,
+Unlicense, Unicode-3.0) sono tutte compatibili.
