@@ -1255,7 +1255,10 @@ cargo build --target aarch64-linux-android --release
 
 # Crate JNI (cdylib per la JVM; fuori dal workspace del core perché usa unsafe)
 cd jni && cargo build --release
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o ../android/jniLibs build --release
+# Per l'app non serve: il build Gradle di MusyBoard compila il .so da qui con
+# cargo-ndk (task buildCipherCore). Nessun .so precompilato nel repo: F-Droid
+# li rifiuta, e un binario committato e' codice che nessuno ha visto compilare.
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o /tmp/jniLibs build --release
 
 # Fuzzing (nightly; il crate in fuzz/ è fuori dal workspace del core)
 cargo +nightly fuzz run decode    -- -max_total_time=150

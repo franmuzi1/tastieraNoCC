@@ -37,3 +37,6 @@ wasm/target/
 wasm/poc/target/
 
 # Il ponte iOS vive nel suo repo: ../MusyBoard-iOS
+
+# Binari JNI: li produce il build dell'app, non si committano (F-Droid).
+android/jniLibs/
